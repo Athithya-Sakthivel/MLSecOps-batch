@@ -3,7 +3,7 @@ set -euo pipefail
 
 SPARK_VERSION="${SPARK_VERSION:-4.0.2}"
 GITHUB_USER="${GITHUB_USER:-${GITHUB_REPOSITORY_OWNER:-athithya-sakthivel}}"
-REGISTRY_TYPE="${REGISTRY_TYPE:-ghcr}" # or ECR
+REGISTRY_TYPE="${REGISTRY_TYPE:-ghcr}" # or ecr
 REGISTRY="${REGISTRY:-ghcr.io}"
 IMAGE_REPO="${IMAGE_REPO:-spark}"
 IMAGE_TAG="${IMAGE_TAG:-${SPARK_VERSION}-multiarch}"
