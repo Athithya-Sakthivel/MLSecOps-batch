@@ -5,7 +5,7 @@ import sys
 import time
 import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 import pyarrow as pa
 import pandas as pd

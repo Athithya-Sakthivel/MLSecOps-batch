@@ -8,8 +8,7 @@ set-sa:
 tree:
 	tree -a -I '.git|.venv|.repos|__pycache__|venv'
 
-push-all:
-	ruff check . --fix
+push:
 	git add .
 	git commit -m "new"
 	gitleaks detect --source . --no-git --exit-code 1

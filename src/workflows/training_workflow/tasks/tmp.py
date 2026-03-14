@@ -3,7 +3,6 @@ import tempfile
 import logging
 from typing import Optional
 import boto3
-import botocore
 import pandas as pd
 from flytekit import task, Resources
 from flytekit.types.file import FlyteFile
