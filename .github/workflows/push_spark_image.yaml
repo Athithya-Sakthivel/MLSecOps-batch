@@ -91,7 +91,7 @@ jobs:
 
       - name: Run build script
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GIT_PAT }}
           SPARK_VERSION: ${{ env.SPARK_VERSION }}
           GITHUB_USER: ${{ env.GITHUB_USER }}
           REGISTRY_TYPE: ${{ env.REGISTRY_TYPE }}
