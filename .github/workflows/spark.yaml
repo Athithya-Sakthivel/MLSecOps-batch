@@ -29,7 +29,7 @@ env:
   IMAGE_NAME: flyte-elt-spark-base
   IMAGE_TAG: ${{ github.sha }}
   BUILD_CONTEXT: src/workflows/ELT
-  DOCKERFILE_PATH: src/workflows/ELT/image/Dockerfile.base
+  DOCKERFILE_PATH: src/workflows/ELT/Dockerfile.spark
 
   # Registry selector: ghcr | ecr
   REGISTRY_TYPE: ${{ vars.REGISTRY_TYPE || 'ghcr' }}
@@ -148,4 +148,4 @@ jobs:
           test -n "${ECR_IMAGE_REPO}"
 
       - name: Run Spark CI and push to ECR
-        run: bash src/workflows/ELT/CI.sh
+        run: bash src/workflows/ELT/spark_CI.sh
