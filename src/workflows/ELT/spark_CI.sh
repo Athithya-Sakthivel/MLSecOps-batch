@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+IFS=$'\n\t'
+umask 022
 
 log() { printf '\033[0;34m[INFO]\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33m[WARN]\033[0m %s\n' "$*" >&2; }
@@ -18,7 +20,6 @@ require_cmd tar
 
 repo_root="${GITHUB_WORKSPACE:-$(pwd)}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 cd "${repo_root}"
 
 IMAGE_NAME="${IMAGE_NAME:-flyte-elt-spark-base}"
@@ -29,8 +30,9 @@ PLATFORMS="${PLATFORMS:-linux/amd64}"
 REGISTRY_TYPE="${REGISTRY_TYPE:-ghcr}"
 
 GHCR_IMAGE_REPO="${GHCR_IMAGE_REPO:-}"
-GHCR_USERNAME="${GHCR_USERNAME:-athithya-sakthivel}"
+GHCR_USERNAME="${GHCR_USERNAME:-}"
 ECR_IMAGE_REPO="${ECR_IMAGE_REPO:-}"
+AWS_REGION="${AWS_REGION:-ap-south-1}"
 
 TRIVY_IMAGE="${TRIVY_IMAGE:-aquasec/trivy@sha256:3d1f862cb6c4fe13c1506f96f816096030d8d5ccdb2380a3069f7bf07daa86aa}"
 TRIVY_SCANNERS="${TRIVY_SCANNERS:-vuln,secret,misconfig,license}"
@@ -43,48 +45,40 @@ GITLEAKS_CONFIG="${GITLEAKS_CONFIG:-.gitleaks.toml}"
 
 PUSH_IMAGE="${PUSH_IMAGE:-true}"
 GIT_PAT="${GIT_PAT:-}"
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 
+ARTIFACT_DIR="${ARTIFACT_DIR:-${repo_root}/.spark-ci-artifacts}"
+TRIVY_CACHE_DIR="${TRIVY_CACHE_DIR:-${ARTIFACT_DIR}/trivy-cache}"
 TEMP_DIR="$(mktemp -d)"
 BUILDER_NAME="spark-ci-${GITHUB_RUN_ID:-local}"
 
+mkdir -p "${ARTIFACT_DIR}" "${TRIVY_CACHE_DIR}"
+rm -f "${ARTIFACT_DIR}"/*.sarif 2>/dev/null || true
+
+export PATH="${TEMP_DIR}:${PATH}"
+
 cleanup() {
-  docker buildx rm "${BUILDER_NAME}" >/dev/null 2>&1 || true
+  docker buildx rm -f "${BUILDER_NAME}" >/dev/null 2>&1 || true
   rm -rf "${TEMP_DIR}" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
-
-registry_repo() {
-  case "${REGISTRY_TYPE}" in
-    ghcr)
-      [ -n "${GHCR_IMAGE_REPO}" ] || die "GHCR_IMAGE_REPO is required for REGISTRY_TYPE=ghcr"
-      echo "${GHCR_IMAGE_REPO}"
-      ;;
-    ecr)
-      [ -n "${ECR_IMAGE_REPO}" ] || die "ECR_IMAGE_REPO is required for REGISTRY_TYPE=ecr"
-      echo "${ECR_IMAGE_REPO}"
-      ;;
-    *)
-      die "REGISTRY_TYPE must be ghcr or ecr"
-      ;;
-  esac
-}
+trap cleanup EXIT INT TERM
 
 resolve_gitleaks_config() {
-  local config_input="${GITLEAKS_CONFIG:-}"
+  local input="${GITLEAKS_CONFIG}"
   local candidates=()
   local candidate
 
-  if [ -n "${config_input}" ]; then
-    if [ -f "${config_input}" ]; then
-      printf '%s\n' "${config_input}"
-      return 0
-    fi
-    candidates+=("${repo_root}/${config_input}")
-    candidates+=("${script_dir}/${config_input}")
+  if [ -n "${input}" ]; then
+    case "${input}" in
+      /*) candidates+=("${input}") ;;
+      *) candidates+=("${repo_root}/${input}" "${script_dir}/${input}") ;;
+    esac
   fi
 
-  candidates+=("${repo_root}/.gitleaks.toml")
-  candidates+=("${script_dir}/.gitleaks.toml")
+  candidates+=(
+    "${repo_root}/.gitleaks.toml"
+    "${script_dir}/.gitleaks.toml"
+  )
 
   for candidate in "${candidates[@]}"; do
     if [ -f "${candidate}" ]; then
@@ -122,18 +116,65 @@ install_gitleaks() {
   [ "${expected_sha}" = "${actual_sha}" ] || die "checksum mismatch for ${asset}"
 
   tar -xzf "${tarball}" -C "${TEMP_DIR}"
-  install -m 0755 "${TEMP_DIR}/gitleaks" /usr/local/bin/gitleaks
+  chmod 0755 "${TEMP_DIR}/gitleaks"
   gitleaks version
 }
 
+ensure_builder() {
+  if docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
+    docker buildx rm -f "${BUILDER_NAME}" >/dev/null 2>&1 || true
+  fi
+
+  docker buildx create --name "${BUILDER_NAME}" --use >/dev/null
+  docker buildx inspect --bootstrap >/dev/null
+}
+
+validate_inputs() {
+  [ -d "${BUILD_CONTEXT}" ] || die "build context not found: ${BUILD_CONTEXT}"
+  [ -f "${DOCKERFILE_PATH}" ] || die "dockerfile not found: ${DOCKERFILE_PATH}"
+  [ -n "${PLATFORMS}" ] || die "PLATFORMS is empty"
+
+  case "${REGISTRY_TYPE}" in
+    ghcr|ecr) ;;
+    *) die "REGISTRY_TYPE must be ghcr or ecr" ;;
+  esac
+
+  if [ "${PUSH_IMAGE}" = "true" ]; then
+    case "${REGISTRY_TYPE}" in
+      ghcr)
+        [ -n "${GHCR_IMAGE_REPO}" ] || die "GHCR_IMAGE_REPO is required for REGISTRY_TYPE=ghcr when PUSH_IMAGE=true"
+        ;;
+      ecr)
+        [ -n "${ECR_IMAGE_REPO}" ] || die "ECR_IMAGE_REPO is required for REGISTRY_TYPE=ecr when PUSH_IMAGE=true"
+        [ -n "${AWS_REGION}" ] || die "AWS_REGION is required for REGISTRY_TYPE=ecr when PUSH_IMAGE=true"
+        ;;
+    esac
+  fi
+}
+
+registry_repo() {
+  case "${REGISTRY_TYPE}" in
+    ghcr)
+      echo "${GHCR_IMAGE_REPO}"
+      ;;
+    ecr)
+      echo "${ECR_IMAGE_REPO}"
+      ;;
+    *)
+      die "REGISTRY_TYPE must be ghcr or ecr"
+      ;;
+  esac
+}
+
 run_gitleaks() {
-  local report="${repo_root}/gitleaks.sarif"
+  local report="${ARTIFACT_DIR}/gitleaks.sarif"
   local config_path=""
 
+  log "Running Gitleaks"
   if config_path="$(resolve_gitleaks_config)"; then
     log "Running Gitleaks with config: ${config_path}"
     gitleaks detect \
-      --source . \
+      --source "${repo_root}" \
       --config "${config_path}" \
       --redact \
       --no-banner \
@@ -143,7 +184,7 @@ run_gitleaks() {
   else
     warn "No Gitleaks config found; running with default rules"
     gitleaks detect \
-      --source . \
+      --source "${repo_root}" \
       --redact \
       --no-banner \
       --report-format sarif \
@@ -153,32 +194,53 @@ run_gitleaks() {
 }
 
 run_trivy_fs() {
-  local report="${repo_root}/trivy-fs.sarif"
+  local report_name="trivy-fs.sarif"
+  local trivy_args=()
 
   log "Running Trivy filesystem scan"
+  trivy_args=(
+    fs
+    --cache-dir /root/.cache/trivy
+    --scanners "${TRIVY_SCANNERS}"
+    --severity "${TRIVY_SEVERITY}"
+    --timeout "${TRIVY_TIMEOUT}"
+    --exit-code 1
+    --format sarif
+    --output "/reports/${report_name}"
+    "${BUILD_CONTEXT}"
+  )
+
+  if [ "${TRIVY_IGNORE_UNFIXED}" = "true" ]; then
+    trivy_args=(fs
+      --cache-dir /root/.cache/trivy
+      --scanners "${TRIVY_SCANNERS}"
+      --severity "${TRIVY_SEVERITY}"
+      --ignore-unfixed
+      --timeout "${TRIVY_TIMEOUT}"
+      --exit-code 1
+      --format sarif
+      --output "/reports/${report_name}"
+      "${BUILD_CONTEXT}"
+    )
+  fi
+
   docker run --rm \
     -v "${repo_root}:/repo:ro" \
+    -v "${ARTIFACT_DIR}:/reports" \
+    -v "${TRIVY_CACHE_DIR}:/root/.cache/trivy" \
     -w /repo \
     "${TRIVY_IMAGE}" \
-    fs \
-    --scanners "${TRIVY_SCANNERS}" \
-    --severity "${TRIVY_SEVERITY}" \
-    $( [ "${TRIVY_IGNORE_UNFIXED}" = "true" ] && printf '%s ' '--ignore-unfixed' ) \
-    --timeout "${TRIVY_TIMEOUT}" \
-    --exit-code 1 \
-    --format sarif \
-    --output "${report}" \
-    "${BUILD_CONTEXT}"
+    "${trivy_args[@]}"
 }
 
 build_and_scan_platform() {
   local platform="$1"
-  local safe_platform temp_tag image_report
+  local safe_platform temp_tag image_report trivy_args=()
 
   safe_platform="${platform//\//_}"
   safe_platform="${safe_platform//,/__}"
   temp_tag="${IMAGE_NAME}:${IMAGE_TAG}-${safe_platform}"
-  image_report="${repo_root}/trivy-image-${safe_platform}.sarif"
+  image_report="trivy-image-${safe_platform}.sarif"
 
   log "Building local image for scan: ${temp_tag} (${platform})"
   docker buildx build \
@@ -193,32 +255,78 @@ build_and_scan_platform() {
     "${BUILD_CONTEXT}"
 
   log "Running Trivy image scan: ${temp_tag}"
+  trivy_args=(
+    image
+    --cache-dir /root/.cache/trivy
+    --scanners "${TRIVY_SCANNERS}"
+    --severity "${TRIVY_SEVERITY}"
+    --timeout "${TRIVY_TIMEOUT}"
+    --exit-code 1
+    --format sarif
+    --output "/reports/${image_report}"
+    "${temp_tag}"
+  )
+
+  if [ "${TRIVY_IGNORE_UNFIXED}" = "true" ]; then
+    trivy_args=(image
+      --cache-dir /root/.cache/trivy
+      --scanners "${TRIVY_SCANNERS}"
+      --severity "${TRIVY_SEVERITY}"
+      --ignore-unfixed
+      --timeout "${TRIVY_TIMEOUT}"
+      --exit-code 1
+      --format sarif
+      --output "/reports/${image_report}"
+      "${temp_tag}"
+    )
+  fi
+
   docker run --rm \
     -v /var/run/docker.sock:/var/run/docker.sock:ro \
-    -v "${repo_root}:/repo" \
+    -v "${ARTIFACT_DIR}:/reports" \
+    -v "${TRIVY_CACHE_DIR}:/root/.cache/trivy" \
     -w /repo \
     "${TRIVY_IMAGE}" \
-    image \
-    --scanners "${TRIVY_SCANNERS}" \
-    --severity "${TRIVY_SEVERITY}" \
-    $( [ "${TRIVY_IGNORE_UNFIXED}" = "true" ] && printf '%s ' '--ignore-unfixed' ) \
-    --timeout "${TRIVY_TIMEOUT}" \
-    --exit-code 1 \
-    --format sarif \
-    --output "${image_report}" \
-    "${temp_tag}"
+    "${trivy_args[@]}"
 }
 
 login_ghcr() {
-  [ -n "${GIT_PAT}" ] || die "GIT_PAT is required for GHCR push"
-  [ -n "${GHCR_USERNAME}" ] || die "GHCR_USERNAME is required for GHCR push"
-  log "Logging in to GHCR"
-  printf '%s\n' "${GIT_PAT}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin >/dev/null
+  local token username
+
+  if [ -n "${GIT_PAT}" ]; then
+    token="${GIT_PAT}"
+    username="${GHCR_USERNAME:-${GITHUB_ACTOR:-}}"
+  else
+    token="${GITHUB_TOKEN:-}"
+    username="${GHCR_USERNAME:-${GITHUB_ACTOR:-}}"
+  fi
+
+  [ -n "${token}" ] || die "GIT_PAT or GITHUB_TOKEN is required for GHCR push"
+  [ -n "${username}" ] || die "GHCR_USERNAME or GITHUB_ACTOR is required for GHCR push"
+
+  log "Logging in to GHCR as ${username}"
+  printf '%s\n' "${token}" | docker login ghcr.io -u "${username}" --password-stdin >/dev/null
+}
+
+login_ecr() {
+  local registry_host
+
+  [ -n "${ECR_IMAGE_REPO}" ] || die "ECR_IMAGE_REPO is required for ECR push"
+  [ -n "${AWS_REGION}" ] || die "AWS_REGION is required for ECR push"
+  command -v aws >/dev/null 2>&1 || die "aws CLI not found; required for ECR login"
+
+  registry_host="${ECR_IMAGE_REPO%%/*}"
+  [ "${registry_host}" != "${ECR_IMAGE_REPO}" ] || die "ECR_IMAGE_REPO must include a repository path, e.g. 123456789012.dkr.ecr.ap-south-1.amazonaws.com/repo-name"
+
+  log "Logging in to ECR registry ${registry_host}"
+  aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${registry_host}" >/dev/null
 }
 
 push_multiarch_manifest() {
   local image_repo
+
   image_repo="$(registry_repo)"
+  [ -n "${image_repo}" ] || die "registry repository is empty"
 
   log "Pushing multi-arch image: ${image_repo}:${IMAGE_TAG}"
   docker buildx build \
@@ -233,8 +341,8 @@ push_multiarch_manifest() {
 }
 
 main() {
-  [ -d "${BUILD_CONTEXT}" ] || die "build context not found: ${BUILD_CONTEXT}"
-  [ -f "${DOCKERFILE_PATH}" ] || die "dockerfile not found: ${DOCKERFILE_PATH}"
+  PLATFORMS="${PLATFORMS// /}"
+  validate_inputs
 
   log "IMAGE_NAME=${IMAGE_NAME}"
   log "IMAGE_TAG=${IMAGE_TAG}"
@@ -243,16 +351,18 @@ main() {
   log "PLATFORMS=${PLATFORMS}"
   log "REGISTRY_TYPE=${REGISTRY_TYPE}"
   log "PUSH_IMAGE=${PUSH_IMAGE}"
+  log "ARTIFACT_DIR=${ARTIFACT_DIR}"
+  log "TRIVY_CACHE_DIR=${TRIVY_CACHE_DIR}"
 
   install_gitleaks
-  docker buildx create --name "${BUILDER_NAME}" --use >/dev/null
-  docker buildx inspect --bootstrap >/dev/null
+  ensure_builder
 
   run_gitleaks
   run_trivy_fs
 
   IFS=',' read -r -a platform_list <<< "${PLATFORMS}"
   for platform in "${platform_list[@]}"; do
+    [ -n "${platform}" ] || continue
     build_and_scan_platform "${platform}"
   done
 
@@ -262,7 +372,10 @@ main() {
         login_ghcr
         ;;
       ecr)
-        warn "ECR login is expected from the workflow job before this script runs"
+        login_ecr
+        ;;
+      *)
+        die "REGISTRY_TYPE must be ghcr or ecr"
         ;;
     esac
     push_multiarch_manifest
