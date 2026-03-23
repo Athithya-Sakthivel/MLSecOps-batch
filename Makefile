@@ -12,7 +12,7 @@ tree:
 push:
 	git add .
 	git commit -m "new"
-	gitleaks detect --source . --no-git --exit-code 1
+	gitleaks detect --source . --exit-code 1
 	git push origin main --force
 
 clean:
