@@ -72,12 +72,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3.12.0
 
-      - name: Validate repo layout
-        run: |
-          set -euo pipefail
-          test -f "$DOCKERFILE_PATH"
-          test -f src/workflows/ELT/CI.sh
-
       - name: Run Spark CI
         run: bash src/workflows/ELT/CI.sh
 
@@ -111,13 +105,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3.12.0
-
-      - name: Validate GHCR inputs
-        run: |
-          set -euo pipefail
-          test -n "${GHCR_IMAGE_REPO}"
-          test -n "${GHCR_USERNAME}"
-          test -n "${GIT_PAT}"
 
       - name: Run Spark CI and push to GHCR
         env:

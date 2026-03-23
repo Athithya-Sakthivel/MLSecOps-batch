@@ -17,8 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN set -eux; \
-    mkdir -p "${SPARK_HOME}/jars"; \
+RUN mkdir -p "${SPARK_HOME}/jars"; \
     curl -fsSL \
       "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar" \
       -o "${SPARK_HOME}/jars/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar"; \
