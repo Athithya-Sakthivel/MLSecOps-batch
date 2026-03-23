@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-echo $GITHUB_TOKEN | docker login ghcr.io -u athithya-sakthivel --password-stdin
+echo $GIT_PAT | docker login ghcr.io -u athithya-sakthivel --password-stdin
 
 docker build -t ghcr.io/athithya-sakthivel/flyte-elt-spark-base:1.0.1 \
   -f src/workflows/ELT/image/Dockerfile.base .
