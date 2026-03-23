@@ -2,10 +2,10 @@
 
 echo $GITHUB_TOKEN | docker login ghcr.io -u athithya-sakthivel --password-stdin
 
-docker build -t ghcr.io/athithya-sakthivel/flyte-elt-spark-base:1.0.0 \
-  -f src/workflows/ELT/Dockerfile.base .
+docker build -t ghcr.io/athithya-sakthivel/flyte-elt-spark-base:1.0.1 \
+  -f src/workflows/ELT/image/Dockerfile.base .
 
-docker push ghcr.io/athithya-sakthivel/flyte-elt-spark-base:1.0.0
+docker push ghcr.io/athithya-sakthivel/flyte-elt-spark-base:1.0.1
 
 # https://github.com/users/<GH_USERNAME>/packages/container/package/flyte-elt-spark-base
 

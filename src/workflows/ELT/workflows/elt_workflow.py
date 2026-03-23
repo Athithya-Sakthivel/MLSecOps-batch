@@ -1,5 +1,3 @@
-# export PYTHONPATH=/workspace/src
-# kubectl -n default port-forward svc/iceberg-rest 19001:9001
 from typing import Dict
 
 from flytekit import workflow

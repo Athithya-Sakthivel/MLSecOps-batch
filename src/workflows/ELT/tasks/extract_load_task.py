@@ -7,7 +7,7 @@ import sys
 import uuid
 from typing import Dict
 
-from flytekit import current_context, task
+from flytekit import Resources, current_context, task
 from flytekitplugins.spark import Spark
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
@@ -18,6 +18,10 @@ handler.setFormatter(logging.Formatter("%(message)s"))
 LOG.handlers[:] = [handler]
 LOG.propagate = False
 
+TASK_IMAGE = os.environ.get("ELT_TASK_IMAGE")
+if not TASK_IMAGE:
+    raise RuntimeError("ELT_TASK_IMAGE must be set to the published ELT Spark image")
+
 CATALOG_NAME = os.environ.get("ICEBERG_CATALOG", "iceberg")
 NAMESPACE = os.environ.get("ICEBERG_NAMESPACE", "bronze")
 TABLE = os.environ.get("ICEBERG_TABLE", "yellow_tripdata_2023_01")
@@ -27,7 +31,7 @@ SOURCE_URI = os.environ.get(
 )
 ICEBERG_REST_URI = os.environ.get(
     "ICEBERG_REST_URI",
-    "http://iceberg-rest:9001/iceberg",
+    "http://iceberg-rest.default.svc.cluster.local:9001/iceberg",
 )
 ICEBERG_WAREHOUSE = os.environ.get(
     "ICEBERG_WAREHOUSE",
@@ -50,10 +54,13 @@ SPARK_SHUFFLE_PARTITIONS = os.environ.get(
     str(max(4, math.ceil(TARGET_ROWS / BATCH_SIZE))),
 )
 SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+AWS_SESSION_TOKEN = os.environ.get("AWS_SESSION_TOKEN", "")
 
 
 def jlog(**payload):
-    LOG.info(json.dumps(payload, default=str))
+    LOG.info(json.dumps(payload, default=str, sort_keys=True))
 
 
 def normalize_column_name(name: str) -> str:
@@ -102,28 +109,25 @@ def build_spark_conf() -> Dict[str, str]:
 
 
 def build_hadoop_conf() -> Dict[str, str]:
-    return {
+    conf = {
         "fs.s3a.endpoint.region": AWS_REGION,
         "fs.s3a.path.style.access": "false",
     }
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        conf["fs.s3a.access.key"] = AWS_ACCESS_KEY_ID
+        conf["fs.s3a.secret.key"] = AWS_SECRET_ACCESS_KEY
+    if AWS_SESSION_TOKEN:
+        conf["fs.s3a.session.token"] = AWS_SESSION_TOKEN
+    return conf
 
 
 def get_spark_session() -> SparkSession:
     try:
-        ctx = current_context()
-        spark = getattr(ctx, "spark_session", None)
-        if spark is not None:
-            return spark
-    except Exception:
-        pass
-
-    builder = SparkSession.builder.appName("flyte-elt-extract-load").master("local[*]")
-    for key, value in build_spark_conf().items():
-        builder = builder.config(key, value)
-    spark = builder.getOrCreate()
-    hconf = spark.sparkContext._jsc.hadoopConfiguration()
-    for key, value in build_hadoop_conf().items():
-        hconf.set(key, value)
+        spark = current_context().spark_session
+    except Exception as exc:
+        raise RuntimeError("Flyte did not provide a Spark session for this task") from exc
+    if spark is None:
+        raise RuntimeError("Flyte did not provide a Spark session for this task")
     return spark
 
 
@@ -132,9 +136,7 @@ def ensure_namespace(spark: SparkSession) -> None:
 
 
 def table_exists(spark: SparkSession) -> bool:
-    rows = spark.sql(
-        f"SHOW TABLES IN {CATALOG_NAME}.{NAMESPACE} LIKE '{TABLE}'"
-    ).limit(1).collect()
+    rows = spark.sql(f"SHOW TABLES IN {CATALOG_NAME}.{NAMESPACE} LIKE '{TABLE}'").limit(1).collect()
     return len(rows) > 0
 
 
@@ -175,7 +177,6 @@ def prepare_frame(source_df: DataFrame, source_uri: str, run_id: str) -> DataFra
 
     write_partitions = max(1, math.ceil(TARGET_ROWS / BATCH_SIZE))
     df = df.repartition(write_partitions, F.col("event_date"))
-
     return df
 
 
@@ -201,11 +202,7 @@ def write_to_iceberg(spark: SparkSession, df: DataFrame) -> str:
 
 
 def run_extract_load() -> Dict[str, str]:
-    run_id = (
-        os.environ.get("RUN_ID")
-        or os.environ.get("FLYTE_INTERNAL_EXECUTION_ID")
-        or uuid.uuid4().hex
-    )
+    run_id = os.environ.get("RUN_ID") or os.environ.get("FLYTE_INTERNAL_EXECUTION_ID") or uuid.uuid4().hex
 
     jlog(
         msg="job_start",
@@ -258,8 +255,11 @@ def run_extract_load() -> Dict[str, str]:
     task_config=Spark(
         spark_conf=build_spark_conf(),
         hadoop_conf=build_hadoop_conf(),
+        executor_path="/opt/venv/bin/python",
     ),
+    container_image=TASK_IMAGE,
     retries=2,
+    limits=Resources(mem="2000M"),
 )
 def extract_load_task() -> Dict[str, str]:
     return run_extract_load()
