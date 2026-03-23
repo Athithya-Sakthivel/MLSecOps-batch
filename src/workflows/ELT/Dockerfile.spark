@@ -1,12 +1,12 @@
-# FROM docker.io/apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
+# docker.io/apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
 FROM apache/spark@sha256:dbe5f3b3926b01fa0b818ae8463c2994bfd2945d8db96d2337e23dc62d6fa73d
 
 USER root
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG ICEBERG_VERSION=1.10.1
-ARG HADOOP_AWS_VERSION=3.4.2
-ARG AWS_SDK_BUNDLE_VERSION=2.35.4
+ARG HADOOP_AWS_VERSION=3.4.3
+ARG AWS_SDK_BUNDLE_VERSION=2.40.8
 
 ENV SPARK_HOME=/opt/spark \
     PYSPARK_PYTHON=python3 \
