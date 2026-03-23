@@ -13,7 +13,7 @@ docker push ghcr.io/athithya-sakthivel/flyte-elt-spark-base:1.0.1
 
 # Note: <GH_USERNAME> is case-insensitive, while the GHCR image repository name must be lowercase
 
-# Ensure the repository "flyte-elt-spark-base:1.0.0" is set to public visibility
+# Ensure the repository "flyte-elt-spark-base" is set to public visibility
 
 # docker pull ghcr.io/athithya-sakthivel/flyte-elt-spark-base@sha256:04ecd3631080e8627f0ae9308697ca0d96250c0b07a0b3a147fdcc22276585e5
 
