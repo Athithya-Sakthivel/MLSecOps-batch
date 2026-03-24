@@ -2,7 +2,7 @@
 set -euo pipefail
 
 GHCR_USER="${GHCR_USER:-athithya-sakthivel}"
-IMAGE_TAG="${IMAGE_TAG:-1.0.7}"
+IMAGE_TAG="${IMAGE_TAG:-1.0.8}"
 
 export ELT_TASK_IMAGE="${ELT_TASK_IMAGE:-ghcr.io/athithya-sakthivel/flyte-elt-task@sha256:91fabf5803e7a2aff5b312733e0738da47d6edd9aef46b3027e39f9aaf220c39}"
 export PYTHONPATH="/workspace/src:${PYTHONPATH:-}"
