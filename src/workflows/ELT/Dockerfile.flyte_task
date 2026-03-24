@@ -1,40 +1,61 @@
-# Python 3.12 slim image with OpenJDK 17, isolated virtualenv, and runtime configuration for Flyte Spark execution
-# Installs pinned Flytekit and PySpark dependencies and provisions Iceberg, Hadoop AWS, and AWS SDK JARs for S3 interoperability
-# Validates Spark runtime initialization and executes as a non-root user for secure container operation
+# Single runtime image for the ELT Flyte Spark task.
+# Contract:
+# - contains Spark + Iceberg + Hadoop AWS + Flytekit
+# - contains no application source code
+# - is used as the only runtime image by Flyte
+# apache/spark:4.0.2-scala2.13-java21-python3-r-ubuntu
 
+FROM apache/spark@sha256:f8935c04e65e9298c883167f07abdb0c8ed4d611987ea55dc973d3c3b7b3a109
 
-FROM python:3.12.3-slim-bookworm
+USER root
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG ICEBERG_VERSION=1.10.1
+ARG HADOOP_AWS_VERSION=3.4.3
+ARG AWS_SDK_BUNDLE_VERSION=2.42.19
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+ENV SPARK_HOME=/opt/spark \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
-    JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
     PYSPARK_PYTHON=/opt/venv/bin/python \
-    PYSPARK_DRIVER_PYTHON=/opt/venv/bin/python
+    PYSPARK_DRIVER_PYTHON=/opt/venv/bin/python \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    openjdk-17-jre-headless \
+    curl \
+    python3 \
+    python3-pip \
+    python3-venv \
     tini \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m venv /opt/venv && \
-    pip install --upgrade \
+RUN python3 -m venv /opt/venv && \
+    /opt/venv/bin/pip install --upgrade \
       pip==26.0.1 \
       wheel==0.46.3 && \
-    pip install \
+    /opt/venv/bin/pip install \
       flytekit==1.16.15 \
       flytekitplugins-spark==1.16.15 \
-      pyspark==3.5.8 \
-      cloudpickle==3.1.1
+      pyspark==4.0.2 \
+      cloudpickle==3.1.2
 
-RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin flyte
+RUN mkdir -p "${SPARK_HOME}/jars" "${SPARK_HOME}/work-dir" && \
+    curl -fsSL \
+      "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.0_2.13/${ICEBERG_VERSION}/iceberg-spark-runtime-4.0_2.13-${ICEBERG_VERSION}.jar" \
+      -o "${SPARK_HOME}/jars/iceberg-spark-runtime-4.0_2.13-${ICEBERG_VERSION}.jar" && \
+    curl -fsSL \
+      "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
+      -o "${SPARK_HOME}/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
+    curl -fsSL \
+      "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
+      -o "${SPARK_HOME}/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" && \
+    chmod -R a+rX "${SPARK_HOME}/jars" "${SPARK_HOME}/work-dir" && \
+    chown -R 185:0 "${SPARK_HOME}" /opt/venv
 
-USER 10001
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
-WORKDIR /home/flyte
+USER 185:0
+
+WORKDIR /opt/spark/work-dir

@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-echo $GIT_PAT | docker login ghcr.io -u athithya-sakthivel --password-stdin
+: "${GIT_PAT:?GIT_PAT is required}"
 
-docker build -t ghcr.io/athithya-sakthivel/flyte-elt-spark-base:1.0.1 \
-  -f src/workflows/ELT/image/Dockerfile.base .
+GHCR_USER="${GHCR_USER:-athithya-sakthivel}"
+IMAGE_TAG="${IMAGE_TAG:-1.0.7}"
+ELT_TASK_IMAGE="${ELT_TASK_IMAGE:-ghcr.io/${GHCR_USER}/flyte-elt-task:${IMAGE_TAG}}"
 
-docker push ghcr.io/athithya-sakthivel/flyte-elt-spark-base:1.0.1
+echo "${GIT_PAT}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
 
-# https://github.com/users/<GH_USERNAME>/packages/container/package/flyte-elt-spark-base
+docker build \
+  -t "${ELT_TASK_IMAGE}" \
+  -f src/workflows/ELT/Dockerfile.flyte_task \
+  .
 
-# GitHub Container Registry package URL for the image (replace <GH_USERNAME> with your account)
+docker push "${ELT_TASK_IMAGE}"
 
-# Note: <GH_USERNAME> is case-insensitive, while the GHCR image repository name must be lowercase
-
-# Ensure the repository "flyte-elt-spark-base" is set to public visibility
-
-# docker pull ghcr.io/athithya-sakthivel/flyte-elt-spark-base@sha256:04ecd3631080e8627f0ae9308697ca0d96250c0b07a0b3a147fdcc22276585e5
-
+echo "Pushed:"
+echo "  ${ELT_TASK_IMAGE}"
