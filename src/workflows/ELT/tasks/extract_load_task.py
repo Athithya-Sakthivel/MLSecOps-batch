@@ -18,11 +18,12 @@ handler.setFormatter(logging.Formatter("%(message)s"))
 LOG.handlers[:] = [handler]
 LOG.propagate = False
 
-TASK_IMAGE = os.environ.get("ELT_TASK_IMAGE", "").strip()
+TASK_IMAGE = os.environ.get(
+    "ELT_TASK_IMAGE",
+    "ghcr.io/athithya-sakthivel/flyte-elt-task@sha256:91fabf5803e7a2aff5b312733e0738da47d6edd9aef46b3027e39f9aaf220c39",
+).strip()
 if not TASK_IMAGE:
-    raise RuntimeError(
-        "ELT_TASK_IMAGE must be set to the published ELT task image before importing this module"
-    )
+    raise RuntimeError("ELT_TASK_IMAGE must be set to the published ELT task image before importing this module")
 
 CATALOG_NAME = os.environ.get("ICEBERG_CATALOG", "iceberg")
 NAMESPACE = os.environ.get("ICEBERG_NAMESPACE", "bronze")
@@ -138,9 +139,7 @@ def ensure_namespace(spark: SparkSession) -> None:
 
 
 def table_exists(spark: SparkSession) -> bool:
-    rows = spark.sql(
-        f"SHOW TABLES IN {CATALOG_NAME}.{NAMESPACE} LIKE '{TABLE}'"
-    ).limit(1).collect()
+    rows = spark.sql(f"SHOW TABLES IN {CATALOG_NAME}.{NAMESPACE} LIKE '{TABLE}'").limit(1).collect()
     return len(rows) > 0
 
 
@@ -172,16 +171,8 @@ def prepare_frame(source_df: DataFrame, source_uri: str, run_id: str) -> DataFra
     if "tpep_pickup_datetime" not in df.columns and "tpep_dropoff_datetime" not in df.columns:
         raise RuntimeError("expected tpep_pickup_datetime or tpep_dropoff_datetime in source schema")
 
-    pickup_ts = (
-        F.to_timestamp(F.col("tpep_pickup_datetime"))
-        if "tpep_pickup_datetime" in df.columns
-        else F.lit(None)
-    )
-    dropoff_ts = (
-        F.to_timestamp(F.col("tpep_dropoff_datetime"))
-        if "tpep_dropoff_datetime" in df.columns
-        else F.lit(None)
-    )
+    pickup_ts = F.to_timestamp(F.col("tpep_pickup_datetime")) if "tpep_pickup_datetime" in df.columns else F.lit(None)
+    dropoff_ts = F.to_timestamp(F.col("tpep_dropoff_datetime")) if "tpep_dropoff_datetime" in df.columns else F.lit(None)
 
     df = df.withColumn("source_file", F.input_file_name())
     df = df.withColumn("event_date", F.to_date(F.coalesce(pickup_ts, dropoff_ts)))

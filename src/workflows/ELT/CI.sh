@@ -18,3 +18,9 @@ docker push "${ELT_TASK_IMAGE}"
 
 echo "Pushed:"
 echo "  ${ELT_TASK_IMAGE}"
+
+
+
+
+
+  

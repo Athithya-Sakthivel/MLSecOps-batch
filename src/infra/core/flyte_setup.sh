@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Bootstraps a full Flyte deployment on Kubernetes using Helm with deterministic configuration.
 # Discovers CNPG Postgres credentials, ensures required databases exist, and wires Flyte services to them.
-# Creates Kubernetes Secrets for DB password and AWS storage credentials if USE_IAM=false, avoiding any secrets in values.yaml.
+# Creates Kubernetes Secrets for DB password and, when USE_IAM=false, AWS credentials for task pods in execution namespaces.
 # Dynamically renders a storage-aware Helm values file (S3/GCS/Azure) and applies it via `helm upgrade --install`.
 # Waits for all deployments to become ready and outputs access details along with cluster diagnostics on failure.
 
-#!/usr/bin/env bash
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -38,6 +37,7 @@ S3_PREFIX="${S3_PREFIX:-}"
 S3_ENDPOINT="${S3_ENDPOINT:-}"
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
+AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}"
 AWS_ROLE_ARN="${AWS_ROLE_ARN:-}"
 
 GCP_PROJECT="${GCP_PROJECT:-}"
@@ -76,6 +76,11 @@ READY_TIMEOUT="${READY_TIMEOUT:-1200}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-1200s}"
 FLYTE_ATOMIC="${FLYTE_ATOMIC:-false}"
 
+# Namespaces where Flyte task pods will run and where the task AWS secret must exist.
+# Default matches the namespace used in the current ELT workflow.
+FLYTE_TASK_NAMESPACES="${FLYTE_TASK_NAMESPACES:-flytesnacks-development}"
+TASK_AWS_SECRET_NAME="${TASK_AWS_SECRET_NAME:-flyte-aws-credentials}"
+
 mkdir -p "${MANIFEST_DIR}"
 
 log() { printf '[%s] [flyte] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
@@ -107,6 +112,69 @@ detect_storage_provider() {
       fatal "unsupported STORAGE_PROVIDER=${STORAGE_PROVIDER}"
       ;;
   esac
+}
+
+split_namespaces() {
+  printf '%s' "${FLYTE_TASK_NAMESPACES}" | tr ',; ' '\n\n\n' | awk 'NF'
+}
+
+ensure_namespace() {
+  local namespace="$1"
+  kubectl create namespace "${namespace}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl label namespace "${namespace}" app.kubernetes.io/part-of=flyte --overwrite >/dev/null 2>&1 || true
+}
+
+ensure_task_aws_secret() {
+  local namespace="$1"
+  ensure_namespace "${namespace}"
+
+  local -a cmd=(kubectl -n "${namespace}" create secret generic "${TASK_AWS_SECRET_NAME}")
+
+  cmd+=(--from-literal="AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}")
+  cmd+=(--from-literal="AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}")
+  cmd+=(--from-literal="AWS_DEFAULT_REGION=${AWS_REGION}")
+  cmd+=(--from-literal="AWS_REGION=${AWS_REGION}")
+  cmd+=(--from-literal="FLYTE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}")
+  cmd+=(--from-literal="FLYTE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}")
+  cmd+=(--from-literal="FLYTE_AWS_ENDPOINT=${S3_ENDPOINT}")
+  cmd+=(--dry-run=client -o yaml)
+
+  if [[ -n "${AWS_SESSION_TOKEN}" ]]; then
+    cmd=(kubectl -n "${namespace}" create secret generic "${TASK_AWS_SECRET_NAME}" \
+      --from-literal="AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
+      --from-literal="AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
+      --from-literal="AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}" \
+      --from-literal="AWS_DEFAULT_REGION=${AWS_REGION}" \
+      --from-literal="AWS_REGION=${AWS_REGION}" \
+      --from-literal="FLYTE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
+      --from-literal="FLYTE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
+      --from-literal="FLYTE_AWS_ENDPOINT=${S3_ENDPOINT}" \
+      --dry-run=client -o yaml)
+  fi
+
+  if [[ -z "${S3_ENDPOINT}" ]]; then
+    cmd=(kubectl -n "${namespace}" create secret generic "${TASK_AWS_SECRET_NAME}" \
+      --from-literal="AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
+      --from-literal="AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
+      --from-literal="AWS_DEFAULT_REGION=${AWS_REGION}" \
+      --from-literal="AWS_REGION=${AWS_REGION}" \
+      --from-literal="FLYTE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
+      --from-literal="FLYTE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
+      --dry-run=client -o yaml)
+    if [[ -n "${AWS_SESSION_TOKEN}" ]]; then
+      cmd=(kubectl -n "${namespace}" create secret generic "${TASK_AWS_SECRET_NAME}" \
+        --from-literal="AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
+        --from-literal="AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
+        --from-literal="AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}" \
+        --from-literal="AWS_DEFAULT_REGION=${AWS_REGION}" \
+        --from-literal="AWS_REGION=${AWS_REGION}" \
+        --from-literal="FLYTE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
+        --from-literal="FLYTE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
+        --dry-run=client -o yaml)
+    fi
+  fi
+
+  "${cmd[@]}" | kubectl apply -f - >/dev/null
 }
 
 find_app_secret_name() {
@@ -279,6 +347,34 @@ EOF
   esac
 }
 
+render_k8s_block() {
+  local provider="$1"
+  if [[ "${provider}" == "aws" && "${USE_IAM}" == "false" ]]; then
+    cat <<EOF
+k8s:
+  plugins:
+    k8s:
+      default-cpus: "100m"
+      default-memory: "200Mi"
+      default-env-from-configmaps: []
+      default-env-from-secrets:
+        - ${TASK_AWS_SECRET_NAME}
+      default-env-vars: []
+EOF
+  else
+    cat <<EOF
+k8s:
+  plugins:
+    k8s:
+      default-cpus: "100m"
+      default-memory: "200Mi"
+      default-env-from-configmaps: []
+      default-env-from-secrets: []
+      default-env-vars: []
+EOF
+  fi
+}
+
 render_values_file() {
   local provider="$1"
   local admin_sa scheduler_sa datacatalog_sa propeller_sa console_sa webhook_sa raw_prefix remote_scheme
@@ -436,6 +532,7 @@ configmap:
         logs:
           kubernetes-enabled: true
           cloudwatch-enabled: false
+  $(render_k8s_block "${provider}" | sed 's/^/  /')
 
 workflow_scheduler:
   enabled: $(yaml_bool "${FLYTE_WORKFLOW_SCHEDULER_ENABLED}")
@@ -472,7 +569,7 @@ require_prereqs() {
   kubectl cluster-info >/dev/null 2>&1 || fatal "kubectl cannot reach cluster"
 }
 
-ensure_namespace() {
+ensure_release_namespace() {
   kubectl create namespace "${TARGET_NS}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   kubectl label namespace "${TARGET_NS}" app.kubernetes.io/part-of=flyte --overwrite >/dev/null 2>&1 || true
 }
@@ -516,11 +613,13 @@ print_summary() {
   printf 'DB host: %s\n' "${DB_HOST}"
   printf 'DB access mode: %s\n' "${DB_ACCESS_MODE}"
   printf 'Rendered values file: %s\n' "${VALUES_FILE}"
+  printf 'Task AWS secret name: %s\n' "${TASK_AWS_SECRET_NAME}"
+  printf 'Task namespaces: %s\n' "${FLYTE_TASK_NAMESPACES}"
 }
 
 main() {
   require_prereqs
-  ensure_namespace
+  ensure_release_namespace
 
   local app_secret app_user app_password app_port provider
   app_secret="$(find_app_secret_name)"
@@ -549,6 +648,9 @@ main() {
         [[ -n "${AWS_ACCESS_KEY_ID}" && -n "${AWS_SECRET_ACCESS_KEY}" ]] || fatal "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required when USE_IAM=false"
         SERVICE_ANNOTATION_KEY=""
         SERVICE_ANNOTATION_VALUE=""
+        for ns in $(split_namespaces); do
+          ensure_task_aws_secret "${ns}"
+        done
       fi
       ;;
     gcs)
@@ -616,6 +718,9 @@ delete_all() {
   kubectl -n "${TARGET_NS}" delete deployment "${RELEASE_NAME}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "${TARGET_NS}" delete secret "${DB_SECRET_NAME}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "${TARGET_NS}" delete secret "${AUTH_SECRET_NAME}" --ignore-not-found >/dev/null 2>&1 || true
+  for ns in $(split_namespaces); do
+    kubectl -n "${ns}" delete secret "${TASK_AWS_SECRET_NAME}" --ignore-not-found >/dev/null 2>&1 || true
+  done
   helm uninstall "${RELEASE_NAME}" -n "${TARGET_NS}" >/dev/null 2>&1 || true
   log "deleted Flyte release and secrets"
 }
@@ -635,9 +740,11 @@ case "${1:---rollout}" in
 Usage: $0 [--rollout|--delete]
 
 Environment variables:
-  DB_ACCESS_MODE=rw|pooler     Default: rw
+  DB_ACCESS_MODE=rw|pooler
   STORAGE_PROVIDER=auto|aws|gcs|azure
   USE_IAM=true|false
+  FLYTE_TASK_NAMESPACES=flytesnacks-development[,other-namespace]
+  TASK_AWS_SECRET_NAME=flyte-aws-credentials
   FLYTE_SPARK_OPERATOR_ENABLED=true|false
   FLYTE_ATOMIC=true|false
 EOF
