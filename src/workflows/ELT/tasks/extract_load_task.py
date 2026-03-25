@@ -20,7 +20,7 @@ LOG.propagate = False
 
 TASK_IMAGE = os.environ.get(
     "ELT_TASK_IMAGE",
-    "ghcr.io/athithya-sakthivel/flyte-elt-task@sha256:91fabf5803e7a2aff5b312733e0738da47d6edd9aef46b3027e39f9aaf220c39",
+    "ghcr.io/athithya-sakthivel/flyte-elt-task:1.0.8",
 ).strip()
 if not TASK_IMAGE:
     raise RuntimeError("ELT_TASK_IMAGE must be set to the published ELT task image before importing this module")

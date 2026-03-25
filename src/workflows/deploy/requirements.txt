@@ -1,0 +1,18 @@
+fastapi==0.135.1
+uvicorn==0.41.0
+slowapi==0.1.9
+ray[serve]==2.54.0
+onnxruntime==1.24.4
+
+opentelemetry-api==1.40.0
+opentelemetry-sdk==1.40.0
+opentelemetry-exporter-otlp==1.40.0
+opentelemetry-instrumentation==0.61b0
+opentelemetry-instrumentation-fastapi==0.61b0
+opentelemetry-instrumentation-logging==0.61b0
+opentelemetry-instrumentation-asgi==0.61b0
+opentelemetry-instrumentation-threading==0.61b0
+
+# optional
+opentelemetry-instrumentation-httpx==0.61b0
+httpx==0.28.1

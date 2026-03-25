@@ -286,3 +286,5 @@ Git SHA  → code version
 ```
 
 This separation is the core design constraint and should not be violated.
+
+
