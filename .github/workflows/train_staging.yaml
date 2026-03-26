@@ -47,8 +47,8 @@ jobs:
 
       - name: Run Train CI
         env:
-          PUSH_IMAGE: 'false'
-        run: bash src/workflows/train/CI.sh
+          PUSH_IMAGE: 'true'
+        run: bash src/workflows/train/CI_staging.sh
 
   build:
     name: train-build-publish
