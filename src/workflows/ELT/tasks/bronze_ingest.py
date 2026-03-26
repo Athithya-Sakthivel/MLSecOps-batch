@@ -1,6 +1,3 @@
-
-
-
 from __future__ import annotations
 
 import json
@@ -47,6 +44,7 @@ AWS_SESSION_TOKEN = os.environ.get("AWS_SESSION_TOKEN", "")
 
 BRONZE_NAMESPACE = os.environ.get("BRONZE_NAMESPACE", "bronze")
 SILVER_NAMESPACE = os.environ.get("SILVER_NAMESPACE", "silver")
+GOLD_NAMESPACE = os.environ.get("GOLD_NAMESPACE", "gold")
 
 BRONZE_TRIPS_TABLE = os.environ.get(
     "BRONZE_TRIPS_TABLE",
@@ -58,7 +56,15 @@ BRONZE_TAXI_ZONE_TABLE = os.environ.get(
 )
 SILVER_TRIPS_TABLE = os.environ.get(
     "SILVER_TRIPS_TABLE",
-    f"{CATALOG_NAME}.silver.trip_features",
+    f"{CATALOG_NAME}.silver.trip_canonical",
+)
+GOLD_TRAINING_TABLE = os.environ.get(
+    "GOLD_TRAINING_TABLE",
+    f"{CATALOG_NAME}.gold.trip_training_matrix",
+)
+GOLD_CONTRACT_TABLE = os.environ.get(
+    "GOLD_CONTRACT_TABLE",
+    f"{CATALOG_NAME}.gold.trip_training_contracts",
 )
 
 TRIPS_DATASET_ID = os.environ.get("TRIPS_DATASET_ID", "koorukuroo/yellow_tripdata")
@@ -76,7 +82,6 @@ HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 MAX_ROWS_TO_EXTRACT_FROM_DATASETS = int(os.environ.get("MAX_ROWS_TO_EXTRACT_FROM_DATASETS", "0"))
 BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "10000"))
 BRONZE_ROWS_PER_PARTITION = int(os.environ.get("BRONZE_ROWS_PER_PARTITION", "50000"))
-SILVER_ROWS_PER_PARTITION = int(os.environ.get("SILVER_ROWS_PER_PARTITION", "50000"))
 
 ICEBERG_TARGET_FILE_SIZE_BYTES = os.environ.get("ICEBERG_TARGET_FILE_SIZE_BYTES", "268435456")
 SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "2g")
@@ -514,6 +519,7 @@ def bronze_ingest() -> BronzeIngestResult:
 
         ensure_namespace(spark, CATALOG_NAME, BRONZE_NAMESPACE)
         ensure_namespace(spark, CATALOG_NAME, SILVER_NAMESPACE)
+        ensure_namespace(spark, CATALOG_NAME, GOLD_NAMESPACE)
 
         trips_df = spark.read.parquet(str(trips_parquet))
         trips_df = add_trip_bronze_columns(trips_df, run_id=run_id, source_ref=trips_source_ref)

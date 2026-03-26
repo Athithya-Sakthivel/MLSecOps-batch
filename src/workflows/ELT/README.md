@@ -1,131 +1,159 @@
-## End-to-end runtime model (control plane vs data plane)
-Below is the rewritten plan for the 4-file Flyte ELT setup.
+# Medallion Lakehouse (Bronze → Silver → Gold) + ML Feature Store–like contract + Flyte orchestration
+## End-to-end runtime model
 
 ```text
 Control plane (Flyte) ───────► orchestration only
-Data plane (Spark)   ───────► all data movement + joins + maintenance
+Data plane (Spark)   ───────► all data movement, joins, feature generation, and Iceberg maintenance
 Storage (Iceberg)    ───────► table state, snapshots, transactions
 Object store (S3)    ───────► immutable data files
-Catalog DB            ───────► Iceberg metadata/state
+Catalog DB           ───────► Iceberg metadata/state
 ```
 
-Flyte tasks run in their own Kubernetes pods, and the Spark task plugin is what gives the task access to a Spark session and the Spark infrastructure it needs. `pyflyte run --remote` is the supported way to package the workflow code, register it, and launch it on the remote Flyte backend. Tasks are versioned and are typically aligned with the git SHA, which matches your lineage model. ([Flyte][1])
+Flyte tasks run in Kubernetes pods. The Spark task plugin provides the Spark session and Spark runtime the task needs. `pyflyte run --remote` packages the workflow code locally, registers it, and launches a remote execution on the Flyte backend. Task code is versioned separately from the runtime image, and execution names are derived deterministically from the git SHA plus a UTC timestamp.
 
 ## 1) Core contracts
 
-**Single runtime image**
+### Single runtime image
+One shared runtime image is used by all task files.
 
-* One shared runtime image for all 4 files.
-* It contains the Python runtime, Flytekit, Spark, Iceberg jars, Hadoop S3 support, and any Python libraries needed by the bronze extractor.
-* It does not contain application source code.
+It contains:
+- Python runtime
+- Flytekit
+- Spark
+- Iceberg jars
+- Hadoop S3 support
+- Python libraries needed by the bronze extractor and downstream Spark tasks
 
-**Code delivery**
+It does not contain application source code.
 
-* Workflow code is shipped by Flyte at execution time, not baked into the image.
-* The image is runtime; the repo snapshot is code.
+### Code delivery
+Workflow code is shipped by Flyte at execution time, not baked into the image.
 
-**Versioning**
+The image is the runtime; the repository snapshot is the code.
 
-* Image version is separate from code version.
-* Execution name deterministcally derieved using git SHA (7 chars) and current timestamp
-
-This matches Flyte’s model of registered workflows and remote execution, while keeping task code and runtime concerns separate. ([Flyte][2])
-
-Implementation note: because `bronze_ingest.py` now uses `datasets`, the runtime image must be rebuilt once to include `datasets` and its direct runtime dependencies. The other three files can then reuse that same image.
+### Versioning
+- Image version is separate from code version.
+- Code lineage is tracked by git SHA.
+- Execution names are generated from git SHA + timestamp for traceability.
 
 ## 2) Final file-by-file plan
 
-| File                      | Responsibility                                                                         | Inputs                                 | Outputs                        | Bottleneck rule                                             |
-| ------------------------- | -------------------------------------------------------------------------------------- | -------------------------------------- | ------------------------------ | ----------------------------------------------------------- |
-| `bronze_ingest.py`        | Pull the two validated sources, normalize minimally, land raw Bronze tables in Iceberg | remote trip dataset + taxi zone lookup | `iceberg.bronze.*` tables      | This is the only stage that touches external datasets       |
-| `silver_transform.py`     | Join, clean, and feature-engineer model-ready data                                     | Bronze tables                          | `iceberg.silver.trip_features` | All enrichment happens in Spark, not in Flyte control logic |
-| `maintenance_optimize.py` | Compact files, expire snapshots, remove orphan files                                   | Bronze + Silver Iceberg tables         | no business-data output        | Runs on its own cadence; never blocks ingestion             |
-| `elt_workflow.py`         | Orchestrate the 3 tasks                                                                | task outputs                           | execution result               | Keep it thin; no transformation logic here                  |
+| File | Responsibility | Inputs | Outputs | Bottleneck rule |
+|---|---|---|---|---|
+| `bronze_ingest.py` | Pull validated sources, normalize minimally, and land raw Bronze tables in Iceberg | Remote trip dataset + taxi zone lookup | `iceberg.bronze.*` tables | This is the only stage that touches external datasets |
+| `silver_transform.py` | Build the canonical, cleaned trip fact table by joining Bronze facts and dimensions | Bronze tables | `iceberg.silver.trip_canonical` | All enrichment happens in Spark, not in Flyte control logic |
+| `gold_features.py` | Build the frozen, model-ready training matrix and contract artifacts for LightGBM / ONNX | Silver table | `iceberg.gold.trip_training_matrix` and `iceberg.gold.trip_training_contracts` | Features must be point-in-time safe and deterministic |
+| `maintenance_optimize.py` | Maintain Iceberg health with snapshot expiration, orphan cleanup, and optional compaction | Bronze, Silver, Gold tables | No business-data output | Runs on its own cadence; never blocks ingestion |
+| `elt_workflow.py` | Orchestrate Bronze → Silver → Gold | Task outputs | Execution result | Keep it thin; no transformation logic here |
+| `iceberg_maintenance_workflow.py` | Orchestrate Iceberg maintenance only | None or table config | Maintenance result | Keep it detached from the ELT hot path |
+| `launch_plans.py` | Define launch plans for manual and scheduled execution | Workflows | Launch plans | Keep schedules and fixed inputs in one place |
 
-## 3) Data contract for the two source datasets
+## 3) Data contract for the source datasets
 
-Your validation test already proved the datasets are joinable:
+The source datasets are treated as a fact/dimension pair:
 
-* trips table contains `PULocationID` and `DOLocationID`
-* taxi zone lookup contains `LocationID`
+- trips table contains `PULocationID` and `DOLocationID`
+- taxi zone lookup contains `LocationID`
 
-That means the silver layer should treat them as a fact/dimension pair:
+Join rules:
+- `trips.PULocationID -> zones.LocationID`
+- `trips.DOLocationID -> zones.LocationID`
 
-* `trips.PULocationID -> zones.LocationID`
-* `trips.DOLocationID -> zones.LocationID`
-
-So the silver table should be a trip-level feature table, not an analytics aggregate. Keep pickup/dropoff zone fields explicit and deterministic.
+The Silver table must be a **trip-level canonical table**, not an analytics aggregate.
 
 ## 4) Exact behavior of each task
 
 ### `bronze_ingest.py`
-
 Purpose: land raw data with minimal transformation.
 
 Rules:
+- validate the source URIs before Spark work begins
+- extract the two datasets once
+- write them to Iceberg Bronze tables with idempotent semantics
+- preserve lineage metadata such as `run_id`, `ingestion_ts`, `source_uri`, `source_revision`, `source_kind`, and `source_file`
+- only normalize column names and do the smallest required type cleanup
 
-* validate the source URIs before Spark work begins
-* extract the two datasets once
-* write them to Iceberg Bronze tables with idempotent semantics
-* preserve source metadata such as `run_id`, `ingestion_ts`, `source_uri`, and `source_file`
-* only normalize column names and do the smallest required type cleanup
-
-This task should fail fast if the raw source is inaccessible. It should not contain joins, feature logic, or maintenance logic.
+This task should fail fast if the raw source is inaccessible. It must not contain joins, feature logic, or maintenance logic.
 
 ### `silver_transform.py`
-
-Purpose: produce the model-ready dataset.
+Purpose: produce the canonical trip dataset.
 
 Rules:
+- read only from Bronze Iceberg tables
+- join the trips table to the taxi zone lookup twice:
+  - pickup enrichment via `PULocationID`
+  - dropoff enrichment via `DOLocationID`
+- produce stable canonical columns such as:
+  - trip duration
+  - pickup hour
+  - day-of-week
+  - distance
+  - fare/tip/total amounts
+  - pickup/dropoff borough and zone fields
+- write deterministically so retries do not duplicate or corrupt the table
 
-* read only from Bronze Iceberg tables
-* join the trips table to the taxi zone lookup twice:
+This is the canonical MLOps dataset. It should stay narrow, reproducible, and schema-stable.
 
-  * pickup enrichment via `PULocationID`
-  * dropoff enrichment via `DOLocationID`
-* produce stable feature columns such as:
+### `gold_features.py`
+Purpose: produce the frozen model-ready matrix and the contract artifacts used by training and ONNX inference.
 
-  * trip duration
-  * pickup hour
-  * day-of-week
-  * distance
-  * fare/tip/total amounts
-  * pickup/dropoff borough and zone fields
-* write deterministically so retries do not duplicate or corrupt the table
+Rules:
+- read only from Silver Iceberg tables
+- enforce a fixed column order, dtypes, and null policy
+- use point-in-time-safe aggregates only
+- convert categorical values to stable integer IDs
+- keep the label explicit and singular for the dataset version
+- write both the training matrix and the contract table
+- include schema hash, encoding mappings, feature spec, and label spec
 
-This is the main MLOps dataset. It should stay narrow, reproducible, and schema-stable.
+Gold must be the exact feature matrix that training and ONNX inference consume identically.
 
 ### `maintenance_optimize.py`
-
 Purpose: keep Iceberg healthy.
 
-Iceberg snapshots accumulate with each write/update/delete/compaction. The current Iceberg docs recommend expiring old snapshots regularly because it removes unneeded data files and keeps metadata small. Iceberg also documents `deleteOrphanFiles` for cleaning files left behind by task/job failures, and `rewrite_data_files` for compacting small files into larger ones. `deleteOrphanFiles` can be expensive and should be run periodically; `rewrite_data_files` is the Spark procedure that combines small files and can also remove dangling deletes. ([Apache Iceberg][3])
+Iceberg snapshots accumulate with each write/update/delete/compaction. Regular snapshot expiration removes unneeded data files and keeps metadata small. `remove_orphan_files` cleans up files left behind by failed tasks or aborted jobs. `rewrite_data_files` compacts small files into larger ones and can remove dangling deletes.
 
 Use these maintenance actions:
+- `CALL ... system.expire_snapshots(...)`
+- `CALL ... system.remove_orphan_files(...)`
+- `CALL ... system.rewrite_data_files(...)`
 
-* `CALL ... system.expire_snapshots(...)`
-* `CALL ... system.rewrite_data_files(...)`
-* `CALL ... system.delete_orphan_files(...)`
-
-Iceberg’s Spark procedures are exposed through the `system` namespace when Iceberg SQL extensions are enabled. ([Apache Iceberg][4])
+Compaction is opt-in per table and should only run when a table-specific predicate is supplied.
 
 ### `elt_workflow.py`
-
-Purpose: be the thin orchestration layer.
+Purpose: be the thin orchestration layer for the ELT hot path.
 
 Recommended flow:
-
 1. `bronze_ingest`
 2. `silver_transform`
-3. `maintenance_optimize`
+3. `gold_features`
 
-If you want to avoid maintenance becoming an ingestion bottleneck, keep it logically separate in cadence even if it lives in the same repo. The workflow file should only wire task dependencies and inputs/outputs.
+If maintenance needs to run on a separate cadence, it should not be embedded in this workflow.
+
+### `iceberg_maintenance_workflow.py`
+Purpose: be the thin orchestration layer for Iceberg housekeeping only.
+
+Recommended flow:
+1. `maintenance_optimize`
+
+This should be scheduled independently from ELT so compaction never becomes part of the ingestion critical path.
+
+### `launch_plans.py`
+Purpose: centralize launch-plan definitions.
+
+Recommended launch plans:
+- one manual launch plan for `elt_workflow`
+- one daily maintenance launch plan for snapshot expiration and orphan cleanup
+- one weekly maintenance launch plan for selected compaction jobs
 
 ## 5) Runtime and execution model
 
-Use the Spark task pattern Flyte documents: task config carries Spark settings, and `hadoop_conf` is the place to inject S3 access details for Spark-side I/O. Flyte’s Spark plugin is explicitly designed to provide the Spark infrastructure the task needs by the time the task function runs. ([Flyte][5])
+Use the Spark task pattern Flyte documents:
+- task config carries Spark settings
+- `hadoop_conf` injects S3 access details for Spark-side I/O
+- the Spark plugin provides the Spark infrastructure the task needs by the time the task function runs
 
-That gives you this runtime shape:
+That gives this runtime shape:
 
 ```text
 Flyte workflow
@@ -133,37 +161,69 @@ Flyte workflow
   -> Spark work for bronze
   -> Silver task pod
   -> Spark work for silver
+  -> Gold task pod
+  -> Spark work for training matrix generation
+```
+
+Maintenance runs separately:
+
+```text
+Flyte maintenance workflow
   -> Maintenance task pod
-  -> Spark work for lifecycle ops
+  -> Spark work for Iceberg lifecycle operations
 ```
 
 ## 6) Bottleneck rules
 
-* Only `bronze_ingest.py` talks to external raw datasets.
-* Only `silver_transform.py` does dataset joins and feature engineering.
-* Only `maintenance_optimize.py` does table hygiene.
-* The workflow file must stay thin.
-* Rebuild the shared image only when task dependencies change, not for workflow wiring changes.
-* Keep Spark jobs bounded and task-scoped; do not move long-running table cleanup into the critical ingestion path.
+- Only `bronze_ingest.py` talks to external raw datasets.
+- Only `silver_transform.py` does dataset joins and canonicalization.
+- Only `gold_features.py` does ML feature engineering and contract freezing.
+- Only `maintenance_optimize.py` does table hygiene.
+- The workflow files must stay thin.
+- Rebuild the shared image only when task dependencies change, not for workflow wiring changes.
+- Keep Spark jobs bounded and task-scoped.
+- Do not move long-running table cleanup into the ingestion path.
+- Do not use maintenance as a dependency of the ELT workflow if it can be scheduled separately.
 
 ## 7) Final invariants
 
 These should always hold:
 
-* Flyte orchestrates.
-* Spark executes.
-* Iceberg owns table state.
-* S3 stores immutable files.
-* Bronze is raw landing.
-* Silver is model-ready curation.
-* Maintenance is file/snapshot hygiene.
-* The runtime image is shared.
-* Application code is external and versioned by git SHA.
+- Flyte orchestrates.
+- Spark executes.
+- Iceberg owns table state.
+- S3 stores immutable files.
+- Bronze is raw landing.
+- Silver is canonical curation.
+- Gold is the frozen model matrix.
+- Maintenance is file/snapshot hygiene.
+- The runtime image is shared.
+- Application code is external and versioned by git SHA.
 
-If you want the next step, I can turn this into a concrete per-file contract with table names, function names, Spark write modes, and the exact Iceberg procedures to call in `maintenance_optimize.py`.
+## 8) Local submission model
 
-[1]: https://docs-legacy.flyte.org/en/v1.12.0/user_guide/basics/tasks.html "Tasks"
-[2]: https://docs-legacy.flyte.org/en/v1.15.0/user_guide/getting_started_with_workflow_development/running_a_workflow_locally.html "Running a workflow locally"
-[3]: https://iceberg.apache.org/docs/latest/maintenance/ "Maintenance - Apache Iceberg™"
-[4]: https://iceberg.apache.org/docs/latest/spark-procedures/ "Procedures - Apache Iceberg™"
-[5]: https://docs-legacy.flyte.org/en/latest/flytesnacks/examples/k8s_spark_plugin/pyspark_pi.html "Running a Spark Task"
+`run.sh` is a local operator script.
+
+It should:
+- activate `.venv_elt`
+- lint the ELT tree with Ruff before submit
+- start the Flyte Admin port-forward
+- initialize `flytectl`
+- submit the selected workflow remotely with `pyflyte run --remote`
+
+The local virtual environment is used only for submission-time packaging and linting. The runtime dependencies needed inside Flyte task pods must be present in the task image.
+
+## 9) Operational recommendation
+
+Use two separate execution modes:
+
+- **ELT workflow**
+  - manual or on a business schedule
+  - Bronze → Silver → Gold
+
+- **Maintenance workflow**
+  - separate daily and weekly launch plans
+  - daily: snapshot expiration + orphan cleanup
+  - weekly: optional compaction for selected tables only
+
+This keeps the ELT path fast and stable while preserving Iceberg health on a separate cadence.

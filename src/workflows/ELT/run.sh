@@ -1,46 +1,51 @@
 #!/usr/bin/env bash
-# Provides a unified CLI for Flyte workflow lifecycle: submit, diagnose, and delete
-# Establishes and manages a local port-forward to Flyte Admin with cleanup guarantees
-# Generates deterministic execution ID using git repo SHA (7 chars) and UTC timestamp
-# Initializes Flyte CLI context dynamically for idempotent remote interactions
-# Submits workflows via pyflyte with explicit execution naming for traceability
-# Performs deep diagnosis by correlating Flyte execution state with Kubernetes pods, logs, and events
-# Safely deletes only execution resources without affecting registered workflows or launch plans
-
-# bash src/workflows/ELT/run.sh --submit
-# bash src/workflows/ELT/run.sh --diagnose <execution_id>
-# bash src/workflows/ELT/run.sh --delete <execution_id>
-# REMOTE_PROJECT=flytesnacks REMOTE_DOMAIN=development bash src/workflows/ELT/run.sh --submit
-# TASK_NAMESPACE=flytesnacks-development bash src/workflows/ELT/run.sh --diagnose <execution_id>
-# IMAGE_TAG=1.0.9 bash src/workflows/ELT/run.sh --submit
-# ELT_TASK_IMAGE=ghcr.io/<user>/flyte-elt-task:<tag> bash src/workflows/ELT/run.sh --submit
-# kubectl -n flyte port-forward svc/flyteadmin "${PORT_FORWARD_PORT}:81"
-
-# find latest exec id: 
-# kubectl get pods -n flytesnacks-development --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.labels.execution-id}'
+# Unified CLI for the ELT stack:
+#   - submit: lint, port-forward Flyte Admin, and launch the ELT workflow remotely
+#   - diagnose: inspect a prior Flyte execution and the related Kubernetes pods/events
+#   - delete: delete a Flyte execution only
+#
+# This script is intended for local operator use.
+# The workflow itself runs remotely in Flyte-managed pods.
+#
+# Examples:
+#   bash src/workflows/ELT/run.sh --submit
+#   bash src/workflows/ELT/run.sh --diagnose <execution_id>
+#   bash src/workflows/ELT/run.sh --delete <execution_id>
+#   bash src/workflows/ELT/run.sh --lint
+#
+# Recommended environment overrides:
+#   REMOTE_PROJECT=flytesnacks
+#   REMOTE_DOMAIN=development
+#   TASK_NAMESPACE=flytesnacks-development
+#   VENV_DIR=.venv_elt
+#   WORKFLOW_FILE=src/workflows/ELT/workflows/elt_workflow.py
+#   WORKFLOW_NAME=elt_workflow
+#   WORKFLOW_PACKAGE_DIR=src/workflows/ELT
+#   ELT_TASK_IMAGE=ghcr.io/<user>/flyte-elt-task:<tag>
 
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-cd "${ROOT_DIR}"
+
+export ELT_TASK_IMAGE="ghcr.io/athithya-sakthivel/flyte-elt-task:1.0.9"
 
 REMOTE_PROJECT="${REMOTE_PROJECT:-flytesnacks}"
 REMOTE_DOMAIN="${REMOTE_DOMAIN:-development}"
 TASK_NAMESPACE="${TASK_NAMESPACE:-${REMOTE_PROJECT}-${REMOTE_DOMAIN}}"
-
+PYTHONPATH="/workspace/src:${PYTHONPATH:-}"
 PORT_FORWARD_PID_FILE="${PORT_FORWARD_PID_FILE:-/tmp/flyteadmin-portforward.pid}"
 PORT_FORWARD_LOG="${PORT_FORWARD_LOG:-/tmp/flyteadmin-portforward.log}"
 PORT_FORWARD_HOST="${PORT_FORWARD_HOST:-127.0.0.1}"
 PORT_FORWARD_PORT="${PORT_FORWARD_PORT:-30081}"
-
 WORKFLOW_FILE="${WORKFLOW_FILE:-src/workflows/ELT/workflows/elt_workflow.py}"
 WORKFLOW_NAME="${WORKFLOW_NAME:-elt_workflow}"
+WORKFLOW_PACKAGE_DIR="${WORKFLOW_PACKAGE_DIR:-src/workflows/ELT}"
 
-GHCR_USER="${GHCR_USER:-athithya-sakthivel}"
-IMAGE_TAG="${IMAGE_TAG:-1.0.9}"
 
-export ELT_TASK_IMAGE="${ELT_TASK_IMAGE:-ghcr.io/${GHCR_USER}/flyte-elt-task:${IMAGE_TAG}}"
-export PYTHONPATH="/workspace/src:${PYTHONPATH:-}"
+VENV_DIR="${VENV_DIR:-.venv_elt}"
+if [[ ! -f "${VENV_DIR}/bin/activate" && -f ".venv/bin/activate" ]]; then
+  VENV_DIR=".venv"
+fi
+
 
 log() { printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
 fatal() { log "FATAL: $*"; exit 1; }
@@ -49,7 +54,16 @@ require_bin() {
   command -v "$1" >/dev/null 2>&1 || fatal "$1 not found in PATH"
 }
 
-require_prereqs() {
+activate_venv_if_present() {
+  if [[ -f "${VENV_DIR}/bin/activate" ]]; then
+    # shellcheck disable=SC1090
+    source "${VENV_DIR}/bin/activate"
+  else
+    fatal "virtual environment not found: ${VENV_DIR}"
+  fi
+}
+
+require_common_prereqs() {
   require_bin kubectl
   require_bin flytectl
   require_bin pyflyte
@@ -57,6 +71,10 @@ require_prereqs() {
   require_bin awk
   require_bin grep
   require_bin sed
+}
+
+require_submit_prereqs() {
+  require_bin ruff
 }
 
 cleanup() {
@@ -72,11 +90,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-activate_venv_if_present() {
-  if [[ -f .venv/bin/activate ]]; then
-    # shellcheck disable=SC1091
-    source .venv/bin/activate
-  fi
+lint_sources() {
+  log "Running Ruff fix pass"
+  ruff check src/workflows/ELT --fix --no-unsafe-fixes
 }
 
 start_port_forward() {
@@ -199,9 +215,9 @@ diagnose_execution() {
 }
 
 submit_execution() {
+  lint_sources
   start_port_forward
   init_flytectl
-  activate_venv_if_present
 
   local short_sha git_sha exec_name
   if [[ -d .git ]]; then
@@ -241,6 +257,7 @@ Usage:
   $0 --submit
   $0 --diagnose <exec_id>
   $0 --delete <exec_id>
+  $0 --lint
 
 Optional environment variables:
   REMOTE_PROJECT=${REMOTE_PROJECT}
@@ -248,29 +265,34 @@ Optional environment variables:
   TASK_NAMESPACE=${TASK_NAMESPACE}
   WORKFLOW_FILE=${WORKFLOW_FILE}
   WORKFLOW_NAME=${WORKFLOW_NAME}
+  WORKFLOW_PACKAGE_DIR=${WORKFLOW_PACKAGE_DIR}
   GHCR_USER=${GHCR_USER}
   IMAGE_TAG=${IMAGE_TAG}
   ELT_TASK_IMAGE=${ELT_TASK_IMAGE}
+  VENV_DIR=${VENV_DIR}
 EOF
 }
 
 main() {
-  require_prereqs
+  activate_venv_if_present
+  require_common_prereqs
 
   case "${1:-}" in
     --submit)
-      source .venv/bin/activate
+      require_submit_prereqs
       submit_execution
       ;;
     --diagnose)
-      source .venv/bin/activate
       [[ $# -ge 2 ]] || fatal "--diagnose requires an execution id"
       diagnose_execution "$2"
       ;;
     --delete)
-      source .venv/bin/activate
       [[ $# -ge 2 ]] || fatal "--delete requires an execution id"
       delete_execution "$2"
+      ;;
+    --lint)
+      require_submit_prereqs
+      lint_sources
       ;;
     -h|--help|help|"")
       usage

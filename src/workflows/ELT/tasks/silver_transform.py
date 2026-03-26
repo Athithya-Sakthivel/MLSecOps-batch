@@ -13,6 +13,7 @@ from pyspark.sql import DataFrame, functions as F
 from pyspark.sql.functions import broadcast
 
 from workflows.ELT.tasks.bronze_ingest import (
+    BRONZE_TAXI_ZONE_TABLE,
     CATALOG_NAME,
     ICEBERG_TARGET_FILE_SIZE_BYTES,
     SILVER_NAMESPACE,
@@ -70,7 +71,7 @@ def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_colu
     return "create"
 
 
-def build_feature_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str) -> DataFrame:
+def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str) -> DataFrame:
     require_columns(
         trips_df,
         (
@@ -90,7 +91,7 @@ def build_feature_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str) -
         "bronze taxi zone table",
     )
 
-    zones_df = zones_df.dropDuplicates(["location_id"]).select(
+    zone_lookup = zones_df.dropDuplicates(["location_id"]).select(
         F.col("location_id").cast("long").alias("location_id"),
         F.col("borough").cast("string").alias("borough"),
         F.col("zone").cast("string").alias("zone"),
@@ -98,7 +99,7 @@ def build_feature_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str) -
     )
 
     pickup_lookup = broadcast(
-        zones_df.select(
+        zone_lookup.select(
             F.col("location_id").alias("pickup_location_id_join"),
             F.col("borough").alias("pickup_borough"),
             F.col("zone").alias("pickup_zone"),
@@ -106,7 +107,7 @@ def build_feature_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str) -
         )
     )
     dropoff_lookup = broadcast(
-        zones_df.select(
+        zone_lookup.select(
             F.col("location_id").alias("dropoff_location_id_join"),
             F.col("borough").alias("dropoff_borough"),
             F.col("zone").alias("dropoff_zone"),
@@ -128,127 +129,68 @@ def build_feature_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str) -
         )
     )
 
-    pickup_ts = F.col("pickup_ts")
-    dropoff_ts = F.col("dropoff_ts")
-    trip_duration_seconds = (F.unix_timestamp(dropoff_ts) - F.unix_timestamp(pickup_ts)).cast("long")
-    trip_duration_minutes = F.round(trip_duration_seconds / F.lit(60.0), 3)
+    canonical = joined.select(
+        *[F.col(f"t.{c}") for c in trips_df.columns],
+        F.col("pickup_borough"),
+        F.col("pickup_zone"),
+        F.col("pickup_service_zone"),
+        F.col("dropoff_borough"),
+        F.col("dropoff_zone"),
+        F.col("dropoff_service_zone"),
+    )
 
-    feature_df = (
-        joined.withColumn(
+    canonical = (
+        canonical.withColumn(
             "trip_key",
             F.sha2(
                 F.concat_ws(
                     "||",
-                    F.coalesce(pickup_ts.cast("string"), F.lit("")),
-                    F.coalesce(dropoff_ts.cast("string"), F.lit("")),
+                    F.coalesce(F.col("pickup_ts").cast("string"), F.lit("")),
+                    F.coalesce(F.col("dropoff_ts").cast("string"), F.lit("")),
                     F.coalesce(F.col("pickup_location_id").cast("string"), F.lit("")),
                     F.coalesce(F.col("dropoff_location_id").cast("string"), F.lit("")),
-                    F.coalesce(F.col("passenger_count").cast("string"), F.lit("")),
-                    F.coalesce(F.col("trip_distance").cast("string"), F.lit("")),
-                    F.coalesce(F.col("total_amount").cast("string"), F.lit("")),
+                    F.coalesce(F.col("run_id").cast("string"), F.lit("")),
+                    F.coalesce(F.col("source_revision").cast("string"), F.lit("")),
                 ),
                 256,
             ),
         )
-        .withColumn("pickup_date", F.to_date(pickup_ts))
-        .withColumn("pickup_hour", F.hour(pickup_ts))
-        .withColumn("pickup_day_of_week", F.dayofweek(pickup_ts))
-        .withColumn("pickup_month", F.month(pickup_ts))
-        .withColumn("is_weekend", F.dayofweek(pickup_ts).isin(1, 7))
-        .withColumn("trip_duration_seconds", trip_duration_seconds)
-        .withColumn("trip_duration_minutes", trip_duration_minutes)
+        .withColumn("pickup_date", F.to_date(F.col("pickup_ts")))
         .withColumn(
-            "trip_speed_mph",
-            F.when(
-                trip_duration_seconds > 0,
-                F.round(F.col("trip_distance") / (trip_duration_seconds / F.lit(3600.0)), 3),
-            ),
+            "trip_duration_seconds",
+            (F.unix_timestamp("dropoff_ts") - F.unix_timestamp("pickup_ts")).cast("long"),
         )
         .withColumn(
-            "fare_per_mile",
-            F.when(
-                F.col("trip_distance") > 0,
-                F.round(F.col("fare_amount") / F.col("trip_distance"), 3),
-            ),
+            "trip_duration_minutes",
+            F.round(F.col("trip_duration_seconds") / F.lit(60.0), 3),
         )
-        .withColumn(
-            "route_pair",
-            F.concat_ws(
-                "->",
-                F.coalesce(F.col("pickup_zone"), F.lit("unknown_pickup_zone")),
-                F.coalesce(F.col("dropoff_zone"), F.lit("unknown_dropoff_zone")),
-            ),
-        )
-        .withColumn("run_id", F.lit(run_id))
     )
 
-    selected_columns = [
+    required = {
         "trip_key",
-        "run_id",
-        "source_uri",
-        "source_revision",
-        "source_kind",
-        "source_file",
-        "ingestion_ts",
         "pickup_ts",
         "dropoff_ts",
-        "pickup_date",
-        "pickup_hour",
-        "pickup_day_of_week",
-        "pickup_month",
-        "is_weekend",
         "pickup_location_id",
         "dropoff_location_id",
         "pickup_borough",
         "pickup_zone",
-        "pickup_service_zone",
         "dropoff_borough",
         "dropoff_zone",
-        "dropoff_service_zone",
-        "vendor_id",
-        "ratecode_id",
-        "store_and_fwd_flag",
-        "passenger_count",
-        "trip_distance",
-        "fare_amount",
-        "extra",
-        "mta_tax",
-        "tip_amount",
-        "tolls_amount",
-        "ehail_fee",
-        "improvement_surcharge",
-        "total_amount",
-        "payment_type",
-        "trip_type",
-        "congestion_surcharge",
-        "cbd_congestion_fee",
-        "trip_duration_seconds",
-        "trip_duration_minutes",
-        "trip_speed_mph",
-        "fare_per_mile",
-        "route_pair",
-    ]
+        "pickup_date",
+    }
+    missing = required - set(canonical.columns)
+    if missing:
+        raise RuntimeError(f"silver canonical dataframe is missing required columns: {sorted(missing)}")
 
-    existing_selected = [c for c in selected_columns if c in feature_df.columns]
-    feature_df = feature_df.select(*existing_selected)
-
-    require_columns(
-        feature_df,
-        (
-            "trip_key",
-            "pickup_date",
-            "pickup_location_id",
-            "dropoff_location_id",
-            "trip_duration_seconds",
-            "fare_per_mile",
-        ),
-        "silver feature dataframe",
-    )
-    return feature_df.filter(
+    return canonical.filter(
         F.col("pickup_ts").isNotNull()
         & F.col("dropoff_ts").isNotNull()
+        & F.col("pickup_location_id").isNotNull()
+        & F.col("dropoff_location_id").isNotNull()
         & (F.col("trip_duration_seconds") > 0)
         & (F.col("trip_distance") >= 0)
+        & (F.col("fare_amount") >= 0)
+        & (F.col("total_amount") >= 0)
     )
 
 
@@ -283,13 +225,13 @@ def silver_transform(bronze: BronzeIngestResult) -> SilverTransformResult:
     trips_df = spark.table(bronze_trips_table)
     zones_df = spark.table(bronze_taxi_zone_table)
 
-    feature_df = build_feature_frame(trips_df, zones_df, bronze.run_id)
+    canonical_df = build_canonical_frame(trips_df, zones_df, bronze.run_id)
 
     target_partitions = max(1, math.ceil(bronze.trips_rows / SILVER_ROWS_PER_PARTITION))
-    feature_df = feature_df.repartition(target_partitions, F.col("pickup_date"))
+    canonical_df = canonical_df.repartition(target_partitions, F.col("pickup_date"))
 
     write_mode = write_partitioned_iceberg_table(
-        feature_df,
+        canonical_df,
         silver_table,
         "pickup_date",
     )

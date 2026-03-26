@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 
 sudo apt update && sudo apt upgrade -y
@@ -72,19 +71,25 @@ curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.
 echo 'export PATH=$HOME/.local/bin:$PATH' >> ~/.bashrc
 source ~/.bashrc
 
-python3 -m venv .venv_elt && source .venv_elt/bin/activate && pip install --upgrade pip==26.0.1 wheel==0.46.3
-
-python3.12 -m pip install \
-  datasets==4.7.0 \
+python3 -m venv .venv_elt
+.venv_elt/bin/python -m pip install --upgrade pip wheel setuptools
+.venv_elt/bin/python -m pip install \
   flytekit==1.16.15 \
   flytekitplugins-spark==1.16.15 \
   pyspark==4.1.1 \
   cloudpickle==3.1.2
 
-python3 -m venv .venv_train && source .venv_train/bin/activate && pip install --upgrade pip==26.0.1 wheel==0.46.3
+python3 -m venv .venv_train
+.venv_train/bin/python -m pip install --upgrade pip wheel setuptools
+.venv_train/bin/python -m pip install \
+  flytekit==1.16.15 \
+  flyteplugins-ray==2.0.6 \
+  numpy==1.26.4 \
+  pandas==2.2.3
 
-
-
+python3 -m venv .venv_deploy
+.venv_deploy/bin/python -m pip install --upgrade pip wheel setuptools
+.venv_deploy/bin/python -m pip install -r src/workflows/deploy/requirements.txt
 
 
 curl -sL https://ctl.flyte.org/install | sudo bash -s -- -b /usr/local/bin v0.9.8
@@ -102,3 +107,4 @@ aws --version
 ruff version
 kubectl version
 tofu version
+flytectl version
