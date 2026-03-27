@@ -18,10 +18,19 @@ spec:
       serviceAccountName: iceberg-rest-sa
       securityContext:
         runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: grav
           image: ghcr.io/athithya-sakthivel/iceberg-rest-gravitino-postgres@sha256:bb2ac1c0328a94b65834aa0bae9e863baf8aaee7557810e7b79c71f3537d13ea
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: http
               containerPort: 9001
@@ -54,6 +63,12 @@ spec:
               value: ""
             - name: GRAVITINO_S3_PATH_STYLE_ACCESS
               value: "false"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: tmp
+              mountPath: /var/tmp
+
           resources:
             requests:
               cpu: 250m
@@ -61,3 +76,7 @@ spec:
             limits:
               cpu: 1000m
               memory: 1Gi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
