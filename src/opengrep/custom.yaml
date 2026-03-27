@@ -1,0 +1,34 @@
+rules:
+  - id: python-unsafe-pickle-and-joblib-load
+    message: "Avoid loading pickle/joblib data from untrusted sources."
+    languages: [python]
+    severity: ERROR
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+      - pattern: joblib.load(...)
+
+  - id: python-unsafe-yaml-load
+    message: "Use yaml.safe_load() instead of yaml.load()."
+    languages: [python]
+    severity: ERROR
+    pattern: yaml.load(...)
+
+  - id: python-subprocess-shell-true
+    message: "Avoid subprocess calls with shell=True."
+    languages: [python]
+    severity: ERROR
+    pattern-either:
+      - pattern: subprocess.run(..., shell=True, ...)
+      - pattern: subprocess.Popen(..., shell=True, ...)
+      - pattern: subprocess.call(..., shell=True, ...)
+
+  - id: python-requests-no-verify-false
+    message: "Avoid disabling TLS verification in requests."
+    languages: [python]
+    severity: WARNING
+    pattern-either:
+      - pattern: requests.get(..., verify=False, ...)
+      - pattern: requests.post(..., verify=False, ...)
+      - pattern: requests.put(..., verify=False, ...)
+      - pattern: requests.delete(..., verify=False, ...)

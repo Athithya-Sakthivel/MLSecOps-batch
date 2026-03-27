@@ -18,7 +18,7 @@ locals {
 ############################
 resource "aws_ecr_repository" "agentops_frontend" {
   name                 = "agentops-frontend"
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "IMMUTABLE"
 
   image_scanning_configuration {
     scan_on_push = true
@@ -57,7 +57,7 @@ resource "aws_ecr_lifecycle_policy" "agentops_frontend" {
 ############################
 resource "aws_ecr_repository" "agentops_inference" {
   name                 = "agentops-inference"
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "IMMUTABLE"
 
   image_scanning_configuration {
     scan_on_push = true
@@ -96,7 +96,7 @@ resource "aws_ecr_lifecycle_policy" "agentops_inference" {
 ############################
 resource "aws_ecr_repository" "agentops_auth" {
   name                 = "agentops-auth"
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "IMMUTABLE"
 
   image_scanning_configuration {
     scan_on_push = true
@@ -135,7 +135,7 @@ resource "aws_ecr_lifecycle_policy" "agentops_auth" {
 ############################
 resource "aws_ecr_repository" "agentops_cloudnativepg" {
   name                 = "agentops-cloudnativepg"
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "IMMUTABLE"
 
   image_scanning_configuration {
     scan_on_push = true
@@ -174,7 +174,7 @@ resource "aws_ecr_lifecycle_policy" "agentops_cloudnativepg" {
 ############################
 resource "aws_ecr_repository" "agentops_postgresql" {
   name                 = "agentops-postgresql"
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "IMMUTABLE"
 
   image_scanning_configuration {
     scan_on_push = true
@@ -213,7 +213,7 @@ resource "aws_ecr_lifecycle_policy" "agentops_postgresql" {
 ############################
 resource "aws_ecr_repository" "agentops_cloudflared" {
   name                 = "agentops-cloudflared"
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "IMMUTABLE"
 
   image_scanning_configuration {
     scan_on_push = true

@@ -82,17 +82,23 @@ TAXI_ZONE_LOOKUP_URL = os.environ.get(
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or None
 
 MAX_ROWS_TO_EXTRACT_FROM_DATASETS = int(os.environ.get("MAX_ROWS_TO_EXTRACT_FROM_DATASETS", "0"))
-BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "5000"))
-BRONZE_ROWS_PER_PARTITION = int(os.environ.get("BRONZE_ROWS_PER_PARTITION", "50000"))
+BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "2000"))
+BRONZE_ROWS_PER_PARTITION = int(os.environ.get("BRONZE_ROWS_PER_PARTITION", "25000"))
 
 ICEBERG_TARGET_FILE_SIZE_BYTES = os.environ.get("ICEBERG_TARGET_FILE_SIZE_BYTES", "268435456")
-SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
-SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
+
+# Conservative Spark defaults to reduce memory pressure in the Spark driver/executor pods.
+SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark")
+SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "2g")
+SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "2g")
+SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "512m")
+SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "512m")
 SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
 SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
 SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
-SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8")
+SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
 SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
+SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "256m")
 
 PARQUET_COMPRESSION = os.environ.get("PARQUET_COMPRESSION", "snappy")
 
@@ -202,13 +208,19 @@ def build_spark_conf() -> dict[str, str]:
         "spark.sql.shuffle.partitions": SPARK_SHUFFLE_PARTITIONS,
         "spark.sql.files.maxPartitionBytes": SPARK_MAX_PARTITION_BYTES,
         "spark.sql.adaptive.enabled": "true",
+        "spark.sql.adaptive.coalescePartitions.enabled": "true",
         "spark.sql.session.timeZone": "UTC",
         "spark.sql.sources.partitionOverwriteMode": "dynamic",
         "spark.driver.memory": SPARK_DRIVER_MEMORY,
+        "spark.driver.memoryOverhead": SPARK_DRIVER_MEMORY_OVERHEAD,
         "spark.executor.memory": SPARK_EXECUTOR_MEMORY,
+        "spark.executor.memoryOverhead": SPARK_EXECUTOR_MEMORY_OVERHEAD,
         "spark.executor.cores": SPARK_EXECUTOR_CORES,
         "spark.executor.instances": SPARK_EXECUTOR_INSTANCES,
         "spark.driver.cores": SPARK_DRIVER_CORES,
+        "spark.driver.maxResultSize": SPARK_MAX_RESULT_SIZE,
+        "spark.kubernetes.authenticate.driver.serviceAccountName": SPARK_SERVICE_ACCOUNT,
+        "spark.kubernetes.authenticate.executor.serviceAccountName": SPARK_SERVICE_ACCOUNT,
     }
     if ICEBERG_REST_AUTH_TYPE:
         conf[f"spark.sql.catalog.{CATALOG_NAME}.rest.auth.type"] = ICEBERG_REST_AUTH_TYPE
@@ -489,7 +501,7 @@ def write_replace_iceberg_table(df: DataFrame, table_id: str) -> str:
         executor_path="/opt/venv/bin/python",
     ),
     container_image=TASK_IMAGE,
-    retries=2,
+    retries=0,
     limits=Resources(cpu="1000m", mem="3500M"),
 )
 def bronze_ingest() -> BronzeIngestResult:
