@@ -2,18 +2,16 @@ name: spark-image-ci
 
 on:
   workflow_dispatch:
+
   push:
     branches: [main]
     paths:
-      - src/workflows/ELT/**
-      - .github/workflows/spark.yaml
-      - .gitleaks.toml
+      - src/workflows/ELT/Dockerfile.flyte_task
+
   pull_request:
     paths:
-      - src/workflows/ELT/**
-      - .github/workflows/spark.yaml
-      - .gitleaks.toml
-
+      - src/workflows/ELT/Dockerfile.flyte_task
+      
 permissions:
   contents: read
 
