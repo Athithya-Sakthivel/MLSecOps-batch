@@ -1,7 +1,7 @@
 lc:
 	kind delete cluster --name local-cluster || true && kind create cluster --name local-cluster && bash src/infra/core/default_storage_class.sh && sleep 15 && \
 	bash src/infra/core/postgres_cluster.sh --rollout && bash src/infra/iceberg/iceberg.sh --rollout && bash src/infra/core/spark_operator.sh --rollout && \
-	bash src/infra/core/flyte_setup.sh --rollout && source .venv/bin/activate && bash src/workflows/ELT/run.sh --submit && sleep 500 && kubectl get pods -A
+	bash src/infra/core/flyte_setup.sh --rollout && bash src/workflows/ELT/run.sh --submit && sleep 700 && kubectl get pods -A
 
 set-sa:
 	bash src/core/default_storage_class.sh

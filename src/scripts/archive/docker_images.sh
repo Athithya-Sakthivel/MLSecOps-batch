@@ -1,14 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================
+# Required env
+# =========================
+: "${GIT_PAT:?GIT_PAT is required}"
+: "${GHCR_USER:=athithya-sakthivel}"
 
-SOURCE_IMAGES="${SOURCE_IMAGES:-ghcr.io/cloudnative-pg/postgresql:18.3-minimal-trixie,docker.io/aquasec/trivy:0.68.2, ghcr.io/cloudnative-pg/cloudnative-pg:1.28.1}"
-DOCKER_USERNAME="${DOCKER_USERNAME:=athithya5354}"
-DOCKER_PASSWORD="${DOCKER_PASSWORD:?Set DOCKER_PASSWORD}"
-TARGET_PREFIX="${TARGET_PREFIX:-$DOCKER_USERNAME}"
-PUSH="${PUSH:-true}"
+# =========================
+# Config
+# =========================
+SOURCE_IMAGES="${SOURCE_IMAGES:-ghcr.io/cloudnative-pg/postgresql:18.3-minimal-trixie,ghcr.io/cloudnative-pg/cloudnative-pg:1.28.1}"
+TARGET_PREFIX="${TARGET_PREFIX:-ghcr.io/${GHCR_USER}}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
+PUSH="${PUSH:-true}"
 
+# Pinned Trivy image (immutable)
+TRIVY_IMAGE="ghcr.io/athithya-sakthivel/trivy-safe-0.69.3@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c"
+
+# Fail on HIGH/CRITICAL by default
+TRIVY_SEVERITY="${TRIVY_SEVERITY:-HIGH,CRITICAL}"
+
+# =========================
+# Utils
+# =========================
 log(){ printf "\033[0;34m[INFO]\033[0m %s\n" "$*"; }
 err(){ printf "\033[0;31m[ERROR]\033[0m %s\n" "$*" >&2; }
 
@@ -21,46 +36,76 @@ retry() {
   done
 }
 
-command -v docker >/dev/null || { err "docker required"; exit 1; }
+require() {
+  command -v "$1" >/dev/null || { err "$1 required"; exit 1; }
+}
 
-printf '%s\n' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+# =========================
+# Preconditions
+# =========================
+require docker
 
-IFS=',' read -ra IMAGE_ARRAY <<< "$SOURCE_IMAGES"
+echo "${GIT_PAT}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
 
-for SRC in "${IMAGE_ARRAY[@]}"; do
+IFS=',' read -ra IMAGES <<< "$SOURCE_IMAGES"
+
+# =========================
+# Main loop
+# =========================
+for SRC in "${IMAGES[@]}"; do
   SRC="$(echo "$SRC" | xargs)"
 
-  IMAGE_NAME="$(echo "$SRC" | awk -F/ '{print $NF}' | awk -F: '{print $1}')"
+  IMAGE_NAME="$(echo "$SRC" | awk -F/ '{print $NF}' | cut -d: -f1)"
   IMAGE_TAG="$(echo "$SRC" | awk -F: '{print $NF}')"
 
-  TARGET="docker.io/${TARGET_PREFIX}/${IMAGE_NAME}:${IMAGE_TAG}"
+  TARGET="${TARGET_PREFIX}/${IMAGE_NAME}:${IMAGE_TAG}"
 
-  log "Processing $SRC -> $TARGET"
+  log "Processing: $SRC → $TARGET"
 
-  if [ "$PUSH" != "true" ]; then
-    log "PUSH=false, skipping push"
-    continue
-  fi
-
+  # Idempotency check
   if docker manifest inspect "$TARGET" >/dev/null 2>&1; then
-    log "Remote image exists. Skipping $TARGET"
+    log "Already exists → skipping"
     continue
   fi
 
-  if [ -n "$PLATFORMS" ]; then
-    log "Mirroring multi-arch image for platforms: $PLATFORMS"
+  # -------------------------
+  # Pull (single arch for scan)
+  # -------------------------
+  log "Pulling image for scan"
+  retry docker pull --platform linux/amd64 "$SRC"
+
+  # -------------------------
+  # Security scan (pre-push)
+  # -------------------------
+  log "Scanning with pinned Trivy"
+  docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  "$TRIVY_IMAGE" image \
+  --scanners vuln \
+  --severity "$TRIVY_SEVERITY" \
+  --ignore-unfixed \
+  --exit-code 1 \
+  --no-progress \
+  "$SRC"
+
+  log "Scan passed"
+
+  # -------------------------
+  # Push (multi-arch mirror)
+  # -------------------------
+  if [ "$PUSH" = "true" ]; then
+    log "Publishing multi-arch image"
+
     retry docker buildx imagetools create \
       --platform "$PLATFORMS" \
       -t "$TARGET" \
       "$SRC"
+
+    log "Pushed → $TARGET"
   else
-    log "PLATFORMS empty → single-arch mirror"
-    retry docker pull "$SRC"
-    docker tag "$SRC" "$TARGET"
-    retry docker push "$TARGET"
+    log "PUSH=false → skipping push"
   fi
 
-  log "Completed $TARGET"
 done
 
-log "All images mirrored successfully"
+log "All images processed successfully"

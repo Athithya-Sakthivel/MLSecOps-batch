@@ -8,14 +8,12 @@ import re
 import sys
 import uuid
 from dataclasses import dataclass
-from itertools import islice, tee
-from pathlib import Path
-from tempfile import TemporaryDirectory
-from typing import Iterable, Sequence, Tuple
+from itertools import islice
+from typing import Any, Iterable, Sequence, Tuple
 
 from flytekit import Resources, current_context, task
 from flytekitplugins.spark import Spark
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, Row, SparkSession
 from pyspark.sql import functions as F
 
 LOG = logging.getLogger("elt_bronze_ingest")
@@ -42,6 +40,9 @@ AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN = os.environ.get("AWS_SESSION_TOKEN", "")
+AWS_ROLE_ARN = os.environ.get("AWS_ROLE_ARN", "")
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "")
+S3_PATH_STYLE_ACCESS = os.environ.get("S3_PATH_STYLE_ACCESS", "false")
 
 BRONZE_NAMESPACE = os.environ.get("BRONZE_NAMESPACE", "bronze")
 SILVER_NAMESPACE = os.environ.get("SILVER_NAMESPACE", "silver")
@@ -81,12 +82,12 @@ TAXI_ZONE_LOOKUP_URL = os.environ.get(
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or None
 
 MAX_ROWS_TO_EXTRACT_FROM_DATASETS = int(os.environ.get("MAX_ROWS_TO_EXTRACT_FROM_DATASETS", "0"))
-BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "10000"))
+BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "5000"))
 BRONZE_ROWS_PER_PARTITION = int(os.environ.get("BRONZE_ROWS_PER_PARTITION", "50000"))
 
 ICEBERG_TARGET_FILE_SIZE_BYTES = os.environ.get("ICEBERG_TARGET_FILE_SIZE_BYTES", "268435456")
-SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "2g")
-SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "2g")
+SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
+SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
 SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
 SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
 SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
@@ -99,6 +100,14 @@ ICEBERG_EXPIRE_DAYS = int(os.environ.get("ICEBERG_EXPIRE_DAYS", "7"))
 ICEBERG_ORPHAN_DAYS = int(os.environ.get("ICEBERG_ORPHAN_DAYS", "3"))
 ICEBERG_RETAIN_LAST = int(os.environ.get("ICEBERG_RETAIN_LAST", "3"))
 MAINTENANCE_REWRITE_DAYS = int(os.environ.get("MAINTENANCE_REWRITE_DAYS", "30"))
+
+ALLOW_LOCAL_SPARK_FALLBACK = os.environ.get("FLYTE_ALLOW_LOCAL_SPARK_FALLBACK", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
 
 TASK_IMAGE = os.environ.get(
     "ELT_TASK_IMAGE",
@@ -182,16 +191,6 @@ def table_exists(spark: SparkSession, table_id: str) -> bool:
     return len(rows) > 0
 
 
-def get_spark_session() -> SparkSession:
-    try:
-        spark = current_context().spark_session
-    except Exception as exc:
-        raise RuntimeError("Flyte did not provide a Spark session for this task") from exc
-    if spark is None:
-        raise RuntimeError("Flyte did not provide a Spark session for this task")
-    return spark
-
-
 def build_spark_conf() -> dict[str, str]:
     conf = {
         f"spark.sql.catalog.{CATALOG_NAME}": "org.apache.iceberg.spark.SparkCatalog",
@@ -223,9 +222,20 @@ def build_spark_conf() -> dict[str, str]:
 def build_hadoop_conf() -> dict[str, str]:
     conf = {
         "fs.s3a.endpoint.region": AWS_REGION,
-        "fs.s3a.path.style.access": "false",
     }
-    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    if S3_ENDPOINT:
+        conf["fs.s3a.endpoint"] = S3_ENDPOINT
+        conf["fs.s3a.path.style.access"] = S3_PATH_STYLE_ACCESS
+    else:
+        conf["fs.s3a.path.style.access"] = "false"
+
+    # Prefer the ambient credential chain when workload identity / IRSA is in use.
+    # Only force static credentials when they are explicitly present and the pod is
+    # not already configured for web identity / role-based auth.
+    has_web_identity = bool(os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE"))
+    has_role_based_auth = bool(AWS_ROLE_ARN)
+
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and not has_web_identity and not has_role_based_auth:
         conf["fs.s3a.access.key"] = AWS_ACCESS_KEY_ID
         conf["fs.s3a.secret.key"] = AWS_SECRET_ACCESS_KEY
         conf["fs.s3a.aws.credentials.provider"] = (
@@ -233,8 +243,9 @@ def build_hadoop_conf() -> dict[str, str]:
             if AWS_SESSION_TOKEN
             else "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
         )
-    if AWS_SESSION_TOKEN:
-        conf["fs.s3a.session.token"] = AWS_SESSION_TOKEN
+        if AWS_SESSION_TOKEN:
+            conf["fs.s3a.session.token"] = AWS_SESSION_TOKEN
+
     return conf
 
 
@@ -248,7 +259,7 @@ def load_streaming_dataset(
 ):
     from datasets import load_dataset
 
-    kwargs: dict = {"split": split, "streaming": True}
+    kwargs: dict[str, Any] = {"split": split, "streaming": True}
     if data_files is not None:
         kwargs["data_files"] = data_files
     if revision:
@@ -258,58 +269,89 @@ def load_streaming_dataset(
     return load_dataset(source, **kwargs)
 
 
-def materialize_iterable_to_parquet(
-    iterable: Iterable[dict],
-    out_path: Path,
+def get_spark_session() -> SparkSession:
+    try:
+        spark = current_context().spark_session
+    except Exception:
+        spark = None
+
+    if spark is not None:
+        return spark
+
+    if not ALLOW_LOCAL_SPARK_FALLBACK:
+        raise RuntimeError(
+            "Flyte did not provide a Spark session for this task. "
+            "This usually means the Spark plugin was not active. "
+            "Set FLYTE_ALLOW_LOCAL_SPARK_FALLBACK=true only for local testing."
+        )
+
+    builder = SparkSession.builder.appName("bronze_ingest_local_fallback")
+    for k, v in build_spark_conf().items():
+        builder = builder.config(k, v)
+    for k, v in build_hadoop_conf().items():
+        builder = builder.config(f"spark.hadoop.{k}", v)
+    return builder.getOrCreate()
+
+
+def iter_preview_rows(stream: Iterable[dict], n: int = 2) -> tuple[list[dict], Iterable[dict]]:
+    it = iter(stream)
+    preview = list(islice(it, n))
+    return preview, it
+
+
+def stream_to_dataframe(
+    spark: SparkSession,
+    rows: Iterable[dict],
     *,
     label: str,
     chunk_size: int = BRONZE_CHUNK_SIZE,
-) -> int:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        out_path.unlink()
-
-    writer = None
+) -> tuple[DataFrame, int]:
+    accumulated_df: DataFrame | None = None
+    schema = None
     total_rows = 0
     batch: list[dict] = []
 
-    try:
-        for row in iterable:
-            batch.append(normalize_record(dict(row)))
-            total_rows += 1
-            if len(batch) >= chunk_size:
-                table = pa.Table.from_pylist(batch)
-                if writer is None:
-                    writer = pq.ParquetWriter(
-                        str(out_path),
-                        table.schema,
-                        compression=PARQUET_COMPRESSION,
-                    )
-                writer.write_table(table)
-                log_json(msg="materialized_chunk", label=label, rows=total_rows, path=str(out_path))
-                batch.clear()
+    def flush_batch(current_batch: list[dict], current_schema) -> tuple[DataFrame, Any]:
+        if not current_batch:
+            raise RuntimeError(f"attempted to flush an empty batch for {label}")
+        batch_df = spark.createDataFrame(current_batch, schema=current_schema)
+        return batch_df, batch_df.schema
 
-        if batch:
-            table = pa.Table.from_pylist(batch)
-            if writer is None:
-                writer = pq.ParquetWriter(
-                    str(out_path),
-                    table.schema,
-                    compression=PARQUET_COMPRESSION,
-                )
-            writer.write_table(table)
-            log_json(msg="materialized_final_chunk", label=label, rows=total_rows, path=str(out_path))
+    for row in rows:
+        batch.append(normalize_record(dict(row)))
+        total_rows += 1
+        if len(batch) >= chunk_size:
+            batch_df, schema = flush_batch(batch, schema)
+            accumulated_df = batch_df if accumulated_df is None else accumulated_df.unionByName(
+                batch_df,
+                allowMissingColumns=True,
+            )
+            log_json(
+                msg="materialized_batch",
+                label=label,
+                rows=total_rows,
+                batch_rows=len(batch),
+            )
             batch.clear()
 
-        if total_rows == 0:
-            raise RuntimeError(f"no rows read from source {label!r}")
-        return total_rows
-    finally:
-        if writer is not None:
-            writer.close()
+    if batch:
+        batch_df, schema = flush_batch(batch, schema)
+        accumulated_df = batch_df if accumulated_df is None else accumulated_df.unionByName(
+            batch_df,
+            allowMissingColumns=True,
+        )
+        log_json(
+            msg="materialized_final_batch",
+            label=label,
+            rows=total_rows,
+            batch_rows=len(batch),
+        )
+        batch.clear()
+
+    if accumulated_df is None or total_rows == 0:
+        raise RuntimeError(f"no rows read from source {label!r}")
+
+    return accumulated_df, total_rows
 
 
 def cast_if_present(df: DataFrame, column: str, spark_type: str) -> DataFrame:
@@ -324,12 +366,9 @@ def add_trip_bronze_columns(df: DataFrame, *, run_id: str, source_ref: str) -> D
     pickup_location_col = first_existing(df.columns, ("pulocation_id", "pickup_location_id"))
     dropoff_location_col = first_existing(df.columns, ("dolocation_id", "dropoff_location_id"))
 
-    pickup_ts = F.to_timestamp(F.col(pickup_col))
-    dropoff_ts = F.to_timestamp(F.col(dropoff_col))
-
     df = (
-        df.withColumn("pickup_ts", pickup_ts)
-        .withColumn("dropoff_ts", dropoff_ts)
+        df.withColumn("pickup_ts", F.to_timestamp(F.col(pickup_col)))
+        .withColumn("dropoff_ts", F.to_timestamp(F.col(dropoff_col)))
         .withColumn("pickup_location_id", F.col(pickup_location_col).cast("long"))
         .withColumn("dropoff_location_id", F.col(dropoff_location_col).cast("long"))
         .withColumn("event_date", F.to_date(F.coalesce(F.col("pickup_ts"), F.col("dropoff_ts"))))
@@ -451,7 +490,7 @@ def write_replace_iceberg_table(df: DataFrame, table_id: str) -> str:
     ),
     container_image=TASK_IMAGE,
     retries=2,
-    limits=Resources(mem="2500M"),
+    limits=Resources(cpu="1000m", mem="3500M"),
 )
 def bronze_ingest() -> BronzeIngestResult:
     run_id = os.environ.get("RUN_ID") or os.environ.get("FLYTE_INTERNAL_EXECUTION_ID") or uuid.uuid4().hex
@@ -484,66 +523,56 @@ def bronze_ingest() -> BronzeIngestResult:
         token=HF_TOKEN,
     )
 
-    with TemporaryDirectory(prefix="flyte_elt_bronze_") as tmpdir:
-        tmp_root = Path(tmpdir)
-        trips_parquet = tmp_root / "trips.parquet"
-        zones_parquet = tmp_root / "taxi_zone_lookup.parquet"
+    trips_preview, trips_iter = iter_preview_rows(trips_stream, 2)
+    taxi_preview, taxi_iter = iter_preview_rows(taxi_zone_stream, 2)
 
-        trips_preview, trips_write = tee(trips_stream, 2)
-        taxi_preview, taxi_write = tee(taxi_zone_stream, 2)
+    for i, row in enumerate(trips_preview, start=1):
+        log_json(msg="trip_preview_row", row=i, data=normalize_record(dict(row)))
+    for i, row in enumerate(taxi_preview, start=1):
+        log_json(msg="taxi_zone_preview_row", row=i, data=normalize_record(dict(row)))
 
-        for i, row in enumerate(islice(trips_preview, 2), start=1):
-            log_json(msg="trip_preview_row", row=i, data=normalize_record(dict(row)))
-        for i, row in enumerate(islice(taxi_preview, 2), start=1):
-            log_json(msg="taxi_zone_preview_row", row=i, data=normalize_record(dict(row)))
+    if MAX_ROWS_TO_EXTRACT_FROM_DATASETS > 0:
+        trips_iter = islice(trips_iter, MAX_ROWS_TO_EXTRACT_FROM_DATASETS)
+        taxi_iter = islice(taxi_iter, MAX_ROWS_TO_EXTRACT_FROM_DATASETS)
 
-        trips_rows_iter = (
-            islice(trips_write, MAX_ROWS_TO_EXTRACT_FROM_DATASETS)
-            if MAX_ROWS_TO_EXTRACT_FROM_DATASETS > 0
-            else trips_write
-        )
-        zones_rows_iter = (
-            islice(taxi_write, MAX_ROWS_TO_EXTRACT_FROM_DATASETS)
-            if MAX_ROWS_TO_EXTRACT_FROM_DATASETS > 0
-            else taxi_write
-        )
+    spark = get_spark_session()
+    spark.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "WARN"))
 
-        trips_rows = materialize_iterable_to_parquet(trips_rows_iter, trips_parquet, label="trips")
-        taxi_zone_rows = materialize_iterable_to_parquet(
-            zones_rows_iter,
-            zones_parquet,
-            label="taxi_zone_lookup",
-        )
+    ensure_namespace(spark, CATALOG_NAME, BRONZE_NAMESPACE)
+    ensure_namespace(spark, CATALOG_NAME, SILVER_NAMESPACE)
+    ensure_namespace(spark, CATALOG_NAME, GOLD_NAMESPACE)
 
-        spark = get_spark_session()
-        spark.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "WARN"))
+    trips_raw_df, trips_rows = stream_to_dataframe(
+        spark,
+        trips_iter,
+        label="trips",
+        chunk_size=BRONZE_CHUNK_SIZE,
+    )
+    trips_df = add_trip_bronze_columns(trips_raw_df, run_id=run_id, source_ref=trips_source_ref)
+    trips_partitions = max(1, math.ceil(trips_rows / BRONZE_ROWS_PER_PARTITION))
+    trips_df = trips_df.repartition(trips_partitions, F.col("event_date"))
 
-        ensure_namespace(spark, CATALOG_NAME, BRONZE_NAMESPACE)
-        ensure_namespace(spark, CATALOG_NAME, SILVER_NAMESPACE)
-        ensure_namespace(spark, CATALOG_NAME, GOLD_NAMESPACE)
+    taxi_zone_raw_df, taxi_zone_rows = stream_to_dataframe(
+        spark,
+        taxi_iter,
+        label="taxi_zone_lookup",
+        chunk_size=min(BRONZE_CHUNK_SIZE, 1000),
+    )
+    taxi_zone_df = add_zone_bronze_columns(
+        taxi_zone_raw_df,
+        run_id=run_id,
+        source_ref=taxi_zone_source_ref,
+    ).coalesce(1)
 
-        trips_df = spark.read.parquet(str(trips_parquet))
-        trips_df = add_trip_bronze_columns(trips_df, run_id=run_id, source_ref=trips_source_ref)
-        trips_partitions = max(1, math.ceil(trips_rows / BRONZE_ROWS_PER_PARTITION))
-        trips_df = trips_df.repartition(trips_partitions, F.col("event_date"))
-
-        taxi_zone_df = spark.read.parquet(str(zones_parquet))
-        taxi_zone_df = add_zone_bronze_columns(
-            taxi_zone_df,
-            run_id=run_id,
-            source_ref=taxi_zone_source_ref,
-        )
-        taxi_zone_df = taxi_zone_df.coalesce(1)
-
-        trips_write_mode = write_partitioned_iceberg_table(
-            trips_df,
-            BRONZE_TRIPS_TABLE,
-            "event_date",
-        )
-        taxi_zone_write_mode = write_replace_iceberg_table(
-            taxi_zone_df,
-            BRONZE_TAXI_ZONE_TABLE,
-        )
+    trips_write_mode = write_partitioned_iceberg_table(
+        trips_df,
+        BRONZE_TRIPS_TABLE,
+        "event_date",
+    )
+    taxi_zone_write_mode = write_replace_iceberg_table(
+        taxi_zone_df,
+        BRONZE_TAXI_ZONE_TABLE,
+    )
 
     result = BronzeIngestResult(
         run_id=run_id,

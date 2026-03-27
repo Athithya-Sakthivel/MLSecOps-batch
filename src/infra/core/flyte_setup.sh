@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Bootstraps a full Flyte deployment with spark plugin on Kubernetes using Helm with deterministic configuration.
-# Discovers CNPG Postgres credentials, ensures required databases exist, and wires Flyte services to them.
-# Creates Kubernetes Secrets for DB password and, when USE_IAM=false, AWS credentials for task pods in execution namespaces.
-# Dynamically renders a storage-aware Helm values file (S3/GCS/Azure) and applies it via `helm upgrade --install`.
-# Waits for all deployments to become ready and outputs access details along with cluster diagnostics on failure.
-
 set -Eeuo pipefail
+IFS=$'\n\t'
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${ROOT_DIR}"
@@ -33,7 +28,6 @@ AWS_AUTH_MODE="${AWS_AUTH_MODE:-iam}"
 
 AWS_REGION="${AWS_REGION:-ap-south-1}"
 S3_BUCKET="${S3_BUCKET:-e2e-mlops-data-681802563986}"
-S3_PREFIX="${S3_PREFIX:-}"
 S3_ENDPOINT="${S3_ENDPOINT:-}"
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
@@ -74,15 +68,18 @@ READY_TIMEOUT="${READY_TIMEOUT:-1200}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-1200s}"
 FLYTE_ATOMIC="${FLYTE_ATOMIC:-false}"
 
-# Namespaces where Flyte task pods will run and where the task AWS secret must exist.
-# Default matches the namespace used in the current ELT workflow.
-FLYTE_TASK_NAMESPACES="${FLYTE_TASK_NAMESPACES:-flytesnacks-development}"
+FLYTE_TASK_NAMESPACES="${FLYTE_TASK_NAMESPACES:-default flytesnacks-development}"
 TASK_AWS_SECRET_NAME="${TASK_AWS_SECRET_NAME:-flyte-aws-credentials}"
-
-mkdir -p "${MANIFEST_DIR}"
 
 FLYTE_DASK_OPERATOR_ENABLED="${FLYTE_DASK_OPERATOR_ENABLED:-false}"
 FLYTE_DATABRICKS_ENABLED="${FLYTE_DATABRICKS_ENABLED:-false}"
+
+APP_DB_USER=""
+APP_DB_PASSWORD=""
+SERVICE_ANNOTATION_KEY=""
+SERVICE_ANNOTATION_VALUE=""
+
+mkdir -p "${MANIFEST_DIR}"
 
 log() { printf '[%s] [flyte] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
 fatal() { printf '[%s] [flyte][FATAL] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
@@ -97,9 +94,7 @@ yaml_bool() {
 
 detect_storage_provider() {
   case "${STORAGE_PROVIDER}" in
-    aws|gcs|azure)
-      printf '%s' "${STORAGE_PROVIDER}"
-      ;;
+    aws|gcs|azure) printf '%s' "${STORAGE_PROVIDER}" ;;
     auto)
       if [[ -n "${AZURE_STORAGE_ACCOUNT}" || -n "${AZURE_CLIENT_ID}" || -n "${AZURE_TENANT_ID}" ]]; then
         printf 'azure'
@@ -109,9 +104,7 @@ detect_storage_provider() {
         printf 'aws'
       fi
       ;;
-    *)
-      fatal "unsupported STORAGE_PROVIDER=${STORAGE_PROVIDER}"
-      ;;
+    *) fatal "unsupported STORAGE_PROVIDER=${STORAGE_PROVIDER}" ;;
   esac
 }
 
@@ -125,56 +118,45 @@ ensure_namespace() {
   kubectl label namespace "${namespace}" app.kubernetes.io/part-of=flyte --overwrite >/dev/null 2>&1 || true
 }
 
+ensure_default_serviceaccount() {
+  local namespace="$1"
+  kubectl -n "${namespace}" get sa default >/dev/null 2>&1 || kubectl -n "${namespace}" create sa default >/dev/null 2>&1 || true
+}
+
+patch_default_serviceaccount_annotation() {
+  local namespace="$1"
+  local key="$2"
+  local value="$3"
+  [[ -n "${key}" && -n "${value}" ]] || return 0
+  ensure_default_serviceaccount "${namespace}"
+  kubectl -n "${namespace}" annotate sa default "${key}=${value}" --overwrite >/dev/null
+}
+
+ensure_secret_literal() {
+  local namespace="$1"
+  local name="$2"
+  local key="$3"
+  local value="$4"
+  [[ -n "${value}" ]] || fatal "empty value for secret ${namespace}/${name}:${key}"
+  kubectl -n "${namespace}" create secret generic "${name}" --from-literal="${key}=${value}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+}
+
 ensure_task_aws_secret() {
   local namespace="$1"
   ensure_namespace "${namespace}"
 
-  local -a cmd=(kubectl -n "${namespace}" create secret generic "${TASK_AWS_SECRET_NAME}")
-
-  cmd+=(--from-literal="AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}")
-  cmd+=(--from-literal="AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}")
-  cmd+=(--from-literal="AWS_DEFAULT_REGION=${AWS_REGION}")
-  cmd+=(--from-literal="AWS_REGION=${AWS_REGION}")
-  cmd+=(--from-literal="FLYTE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}")
-  cmd+=(--from-literal="FLYTE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}")
-  cmd+=(--from-literal="FLYTE_AWS_ENDPOINT=${S3_ENDPOINT}")
+  local -a cmd=(
+    kubectl -n "${namespace}" create secret generic "${TASK_AWS_SECRET_NAME}"
+    --from-literal="AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+    --from-literal="AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+    --from-literal="AWS_DEFAULT_REGION=${AWS_REGION}"
+    --from-literal="AWS_REGION=${AWS_REGION}"
+    --from-literal="FLYTE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+    --from-literal="FLYTE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+  )
+  [[ -n "${AWS_SESSION_TOKEN}" ]] && cmd+=(--from-literal="AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}")
+  [[ -n "${S3_ENDPOINT}" ]] && cmd+=(--from-literal="FLYTE_AWS_ENDPOINT=${S3_ENDPOINT}")
   cmd+=(--dry-run=client -o yaml)
-
-  if [[ -n "${AWS_SESSION_TOKEN}" ]]; then
-    cmd=(kubectl -n "${namespace}" create secret generic "${TASK_AWS_SECRET_NAME}" \
-      --from-literal="AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
-      --from-literal="AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
-      --from-literal="AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}" \
-      --from-literal="AWS_DEFAULT_REGION=${AWS_REGION}" \
-      --from-literal="AWS_REGION=${AWS_REGION}" \
-      --from-literal="FLYTE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
-      --from-literal="FLYTE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
-      --from-literal="FLYTE_AWS_ENDPOINT=${S3_ENDPOINT}" \
-      --dry-run=client -o yaml)
-  fi
-
-  if [[ -z "${S3_ENDPOINT}" ]]; then
-    cmd=(kubectl -n "${namespace}" create secret generic "${TASK_AWS_SECRET_NAME}" \
-      --from-literal="AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
-      --from-literal="AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
-      --from-literal="AWS_DEFAULT_REGION=${AWS_REGION}" \
-      --from-literal="AWS_REGION=${AWS_REGION}" \
-      --from-literal="FLYTE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
-      --from-literal="FLYTE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
-      --dry-run=client -o yaml)
-    if [[ -n "${AWS_SESSION_TOKEN}" ]]; then
-      cmd=(kubectl -n "${namespace}" create secret generic "${TASK_AWS_SECRET_NAME}" \
-        --from-literal="AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
-        --from-literal="AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
-        --from-literal="AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}" \
-        --from-literal="AWS_DEFAULT_REGION=${AWS_REGION}" \
-        --from-literal="AWS_REGION=${AWS_REGION}" \
-        --from-literal="FLYTE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
-        --from-literal="FLYTE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
-        --dry-run=client -o yaml)
-    fi
-  fi
-
   "${cmd[@]}" | kubectl apply -f - >/dev/null
 }
 
@@ -203,19 +185,11 @@ get_primary_pod() {
 }
 
 resolve_db_host() {
-  if [[ -n "${DB_HOST}" ]]; then
-    return 0
-  fi
+  [[ -n "${DB_HOST}" ]] && return 0
   case "${DB_ACCESS_MODE}" in
-    rw)
-      DB_HOST="${CNPG_CLUSTER}-rw.${POSTGRES_NS}.svc.cluster.local"
-      ;;
-    pooler)
-      DB_HOST="${POOLER_SERVICE}.${POSTGRES_NS}.svc.cluster.local"
-      ;;
-    *)
-      fatal "unsupported DB_ACCESS_MODE=${DB_ACCESS_MODE}"
-      ;;
+    rw) DB_HOST="${CNPG_CLUSTER}-rw.${POSTGRES_NS}.svc.cluster.local" ;;
+    pooler) DB_HOST="${POOLER_SERVICE}.${POSTGRES_NS}.svc.cluster.local" ;;
+    *) fatal "unsupported DB_ACCESS_MODE=${DB_ACCESS_MODE}" ;;
   esac
 }
 
@@ -224,54 +198,25 @@ ensure_database() {
   local primary exists
   primary="$(get_primary_pod)"
   [[ -n "${primary}" ]] || fatal "CNPG primary pod not found for ${CNPG_CLUSTER}"
+
   exists="$(kubectl -n "${POSTGRES_NS}" exec "${primary}" -- sh -lc "psql -U postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='${db_name}';\"" 2>/dev/null | tr -d '[:space:]' || true)"
+
   if [[ "${exists}" != "1" ]]; then
     log "creating database ${db_name}"
     kubectl -n "${POSTGRES_NS}" exec "${primary}" -- sh -lc "psql -U postgres -v ON_ERROR_STOP=1 -c \"CREATE DATABASE ${db_name} OWNER \\\"${APP_DB_USER}\\\";\"" >/dev/null
   else
     log "database ${db_name} already exists"
   fi
+
   kubectl -n "${POSTGRES_NS}" exec "${primary}" -- sh -lc "psql -U postgres -v ON_ERROR_STOP=1 -c \"ALTER DATABASE ${db_name} OWNER TO \\\"${APP_DB_USER}\\\";\"" >/dev/null 2>&1 || true
   kubectl -n "${POSTGRES_NS}" exec "${primary}" -- sh -lc "psql -U postgres -d \"${db_name}\" -v ON_ERROR_STOP=1 -c \"ALTER SCHEMA public OWNER TO \\\"${APP_DB_USER}\\\";\"" >/dev/null 2>&1 || true
-}
-
-ensure_secret_literal() {
-  local namespace="$1"
-  local name="$2"
-  local key="$3"
-  local value="$4"
-  [[ -n "${value}" ]] || fatal "empty value for secret ${namespace}/${name}:${key}"
-  kubectl -n "${namespace}" create secret generic "${name}" --from-literal="${key}=${value}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-}
-
-render_sa_block() {
-  local key="$1"
-  local value="$2"
-  if [[ -n "${key}" && -n "${value}" ]]; then
-    cat <<EOF
-  serviceAccount:
-    create: true
-    annotations:
-      ${key}: "${value}"
-EOF
-  else
-    cat <<EOF
-  serviceAccount:
-    create: true
-    annotations: {}
-EOF
-  fi
 }
 
 render_storage_block() {
   local provider="$1"
   case "${provider}" in
     aws)
-      if [[ "${USE_IAM}" == "true" ]]; then
-        AWS_AUTH_MODE="iam"
-      else
-        AWS_AUTH_MODE="accesskey"
-      fi
+      if [[ "${USE_IAM}" == "true" ]]; then AWS_AUTH_MODE="iam"; else AWS_AUTH_MODE="accesskey"; fi
       cat <<EOF
 storage:
   secretName: ""
@@ -342,123 +287,100 @@ $(printf '%s\n' "${FLYTE_STORAGE_CUSTOM_YAML}" | sed 's/^/    /')
     targetGCPercent: 70
 EOF
       ;;
-    *)
-      fatal "unsupported storage provider ${provider}"
-      ;;
+    *) fatal "unsupported storage provider ${provider}" ;;
   esac
 }
 
 render_k8s_block() {
   local provider="$1"
+  local session_token_line=""
+  local endpoint_line=""
+  [[ -n "${AWS_SESSION_TOKEN}" ]] && session_token_line="            - AWS_SESSION_TOKEN: \"${AWS_SESSION_TOKEN}\""
+  [[ -n "${S3_ENDPOINT}" ]] && endpoint_line="            - FLYTE_AWS_ENDPOINT: \"${S3_ENDPOINT}\""
+
   if [[ "${provider}" == "aws" && "${USE_IAM}" == "false" ]]; then
     cat <<EOF
-k8s:
-  plugins:
     k8s:
-      default-cpus: "100m"
-      default-memory: "200Mi"
-      default-env-from-configmaps: []
-      default-env-from-secrets:
-        - ${TASK_AWS_SECRET_NAME}
-      default-env-vars: []
+      plugins:
+        k8s:
+          default-cpus: "100m"
+          default-memory: "200Mi"
+          default-env-from-configmaps: []
+          default-env-from-secrets:
+            - ${TASK_AWS_SECRET_NAME}
+          default-env-vars:
+            - AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
+            - AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
+            - AWS_DEFAULT_REGION: "${AWS_REGION}"
+            - AWS_REGION: "${AWS_REGION}"
+            - FLYTE_AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
+            - FLYTE_AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
+${session_token_line}
+${endpoint_line}
 EOF
   else
     cat <<EOF
-k8s:
-  plugins:
     k8s:
-      default-cpus: "100m"
-      default-memory: "200Mi"
-      default-env-from-configmaps: []
-      default-env-from-secrets: []
-      default-env-vars: []
+      plugins:
+        k8s:
+          default-cpus: "100m"
+          default-memory: "200Mi"
+          default-env-from-configmaps: []
+          default-env-from-secrets: []
+          default-env-vars: []
 EOF
   fi
 }
 
-render_sparkoperator_block() {
-  local provider="$1"
-  local enabled
-  enabled="$(yaml_bool "${FLYTE_SPARK_OPERATOR_ENABLED:-false}")"
-
-  cat <<EOF
-sparkoperator:
-  enabled: ${enabled}
-EOF
-}
-
 render_spark_runtime_block() {
   local provider="$1"
-
   case "${provider}" in
     aws)
       cat <<EOF
-plugins:
-  spark:
-    spark-config-default:
-      - spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.DefaultAWSCredentialsProviderChain"
-      - spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version: "2"
-      - spark.kubernetes.allocation.batch.size: "50"
-      - spark.hadoop.fs.s3a.acl.default: "BucketOwnerFullControl"
-      - spark.hadoop.fs.s3n.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
-      - spark.hadoop.fs.AbstractFileSystem.s3n.impl: "org.apache.hadoop.fs.s3a.S3A"
-      - spark.hadoop.fs.s3.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
-      - spark.hadoop.fs.AbstractFileSystem.s3.impl: "org.apache.hadoop.fs.s3a.S3A"
-      - spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
-      - spark.hadoop.fs.AbstractFileSystem.s3a.impl: "org.apache.hadoop.fs.s3a.S3A"
-      - spark.hadoop.fs.s3a.multipart.threshold: "536870912"
-      - spark.blacklist.enabled: "true"
-      - spark.blacklist.timeout: "5m"
-      - spark.task.maxfailures: "8"
+    plugins:
+      spark:
+        spark-config-default:
+          - spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.DefaultAWSCredentialsProviderChain"
+          - spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version: "2"
+          - spark.kubernetes.allocation.batch.size: "50"
+          - spark.hadoop.fs.s3a.acl.default: "BucketOwnerFullControl"
+          - spark.hadoop.fs.s3n.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+          - spark.hadoop.fs.AbstractFileSystem.s3n.impl: "org.apache.hadoop.fs.s3a.S3A"
+          - spark.hadoop.fs.s3.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+          - spark.hadoop.fs.AbstractFileSystem.s3.impl: "org.apache.hadoop.fs.s3a.S3A"
+          - spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+          - spark.hadoop.fs.AbstractFileSystem.s3a.impl: "org.apache.hadoop.fs.s3a.S3A"
+          - spark.hadoop.fs.s3a.multipart.threshold: "536870912"
+          - spark.blacklist.enabled: "true"
+          - spark.blacklist.timeout: "5m"
+          - spark.task.maxfailures: "8"
 EOF
       ;;
-    gcs)
+    gcs|azure)
       cat <<EOF
-plugins:
-  spark:
-    spark-config-default: []
+    plugins:
+      spark:
+        spark-config-default: []
 EOF
       ;;
-    azure)
-      cat <<EOF
-plugins:
-  spark:
-    spark-config-default: []
-EOF
-      ;;
-    *)
-      fatal "unsupported storage provider ${provider}"
-      ;;
+    *) fatal "unsupported storage provider ${provider}" ;;
   esac
 }
+
 render_values_file() {
   local provider="$1"
-  local admin_sa scheduler_sa datacatalog_sa propeller_sa console_sa webhook_sa raw_prefix remote_scheme
-
-  admin_sa="$(render_sa_block "${SERVICE_ANNOTATION_KEY}" "${SERVICE_ANNOTATION_VALUE}")"
-  scheduler_sa="$(render_sa_block "${SERVICE_ANNOTATION_KEY}" "${SERVICE_ANNOTATION_VALUE}")"
-  datacatalog_sa="$(render_sa_block "${SERVICE_ANNOTATION_KEY}" "${SERVICE_ANNOTATION_VALUE}")"
-  propeller_sa="$(render_sa_block "${SERVICE_ANNOTATION_KEY}" "${SERVICE_ANNOTATION_VALUE}")"
-  console_sa="$(render_sa_block "" "")"
-  webhook_sa="$(render_sa_block "" "")"
-
+  local raw_prefix remote_scheme
   case "${provider}" in
-    aws)
-      raw_prefix="${FLYTE_RAWOUTPUT_PREFIX:-s3://${S3_BUCKET}/}"
-      remote_scheme="s3"
-      ;;
-    gcs)
-      raw_prefix="${FLYTE_RAWOUTPUT_PREFIX:-gs://${GCP_BUCKET}/}"
-      remote_scheme="gs"
-      ;;
-    azure)
-      raw_prefix="${FLYTE_RAWOUTPUT_PREFIX:-abfs://${AZURE_CONTAINER}@${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net/}"
-      remote_scheme="abfs"
-      ;;
-    *)
-      fatal "unsupported storage provider ${provider}"
-      ;;
+    aws) raw_prefix="${FLYTE_RAWOUTPUT_PREFIX:-s3://${S3_BUCKET}/}"; remote_scheme="s3" ;;
+    gcs) raw_prefix="${FLYTE_RAWOUTPUT_PREFIX:-gs://${GCP_BUCKET}/}"; remote_scheme="gs" ;;
+    azure) raw_prefix="${FLYTE_RAWOUTPUT_PREFIX:-abfs://${AZURE_CONTAINER}@${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net/}"; remote_scheme="abfs" ;;
+    *) fatal "unsupported storage provider ${provider}" ;;
   esac
+
+  local storage_block k8s_block spark_block
+  storage_block="$(render_storage_block "${provider}")"
+  k8s_block="$(render_k8s_block "${provider}")"
+  spark_block="$(render_spark_runtime_block "${provider}")"
 
   cat > "${VALUES_FILE}" <<EOF
 deployRedoc: false
@@ -466,45 +388,57 @@ deployRedoc: false
 flyteadmin:
   enabled: true
   replicaCount: 1
-${admin_sa}
+  serviceAccount:
+    create: true
+    annotations: {}
   service:
     type: ClusterIP
 
 flytescheduler:
   runPrecheck: true
-${scheduler_sa}
+  serviceAccount:
+    create: true
+    annotations: {}
   service:
     enabled: false
 
 datacatalog:
   enabled: true
   replicaCount: 1
-${datacatalog_sa}
+  serviceAccount:
+    create: true
+    annotations: {}
   service:
     type: ClusterIP
 
 flyteconnector:
-  enabled: $(yaml_bool "${FLYTE_CONNECTOR_ENABLED:-false}")
+  enabled: $(yaml_bool "${FLYTE_CONNECTOR_ENABLED}")
 
 flytepropeller:
   enabled: true
   manager: false
   createCRDs: true
   replicaCount: 1
-${propeller_sa}
+  serviceAccount:
+    create: true
+    annotations: {}
   service:
     enabled: false
 
 flyteconsole:
   enabled: true
   replicaCount: 1
-${console_sa}
+  serviceAccount:
+    create: true
+    annotations: {}
   service:
     type: ClusterIP
 
 webhook:
   enabled: true
-${webhook_sa}
+  serviceAccount:
+    create: true
+    annotations: {}
   service:
     type: ClusterIP
 
@@ -513,10 +447,11 @@ common:
     name: ${DB_SECRET_NAME}
     secretManifest: {}
   ingress:
+    host: ""
     ingressClassName: "${FLYTE_INGRESS_CLASS_NAME}"
-    enabled: $(yaml_bool "${FLYTE_INGRESS_ENABLED:-false}")
+    enabled: $(yaml_bool "${FLYTE_INGRESS_ENABLED}")
     webpackHMR: false
-    separateGrpcIngress: $(yaml_bool "${FLYTE_SEPARATE_GRPC_INGRESS:-false}")
+    separateGrpcIngress: $(yaml_bool "${FLYTE_SEPARATE_GRPC_INGRESS}")
     separateGrpcIngressAnnotations: {}
     annotations: {}
     albSSLRedirect: false
@@ -525,7 +460,7 @@ common:
   flyteNamespaceTemplate:
     enabled: false
 
-$(render_storage_block "${provider}")
+${storage_block}
 
 db:
   datacatalog:
@@ -582,37 +517,39 @@ configmap:
             container: container
             sidecar: sidecar
             container_array: k8s-array
+            sensor: connector-service
             spark: spark
     task_logs:
       plugins:
         logs:
           kubernetes-enabled: true
           cloudwatch-enabled: false
-$(render_k8s_block "${provider}" | sed 's/^/    /')
-$(render_spark_runtime_block "${provider}" | sed 's/^/    /')
+${k8s_block}
+${spark_block}
 
 workflow_scheduler:
-  enabled: $(yaml_bool "${FLYTE_WORKFLOW_SCHEDULER_ENABLED:-false}")
+  enabled: $(yaml_bool "${FLYTE_WORKFLOW_SCHEDULER_ENABLED}")
 
 workflow_notifications:
-  enabled: $(yaml_bool "${FLYTE_WORKFLOW_NOTIFICATIONS_ENABLED:-false}")
+  enabled: $(yaml_bool "${FLYTE_WORKFLOW_NOTIFICATIONS_ENABLED}")
 
 external_events:
-  enable: $(yaml_bool "${FLYTE_EXTERNAL_EVENTS_ENABLED:-false}")
+  enable: $(yaml_bool "${FLYTE_EXTERNAL_EVENTS_ENABLED}")
 
 cloud_events:
-  enable: $(yaml_bool "${FLYTE_CLOUD_EVENTS_ENABLED:-false}")
+  enable: $(yaml_bool "${FLYTE_CLOUD_EVENTS_ENABLED}")
 
 cluster_resource_manager:
-  enabled: $(yaml_bool "${FLYTE_CLUSTER_RESOURCE_MANAGER_ENABLED:-true}")
+  enabled: $(yaml_bool "${FLYTE_CLUSTER_RESOURCE_MANAGER_ENABLED}")
 
-$(render_sparkoperator_block "${provider}")
+sparkoperator:
+  enabled: $(yaml_bool "${FLYTE_SPARK_OPERATOR_ENABLED}")
 
 daskoperator:
-  enabled: $(yaml_bool "${FLYTE_DASK_OPERATOR_ENABLED:-false}")
+  enabled: $(yaml_bool "${FLYTE_DASK_OPERATOR_ENABLED}")
 
 databricks:
-  enabled: $(yaml_bool "${FLYTE_DATABRICKS_ENABLED:-false}")
+  enabled: $(yaml_bool "${FLYTE_DATABRICKS_ENABLED}")
 EOF
 }
 
@@ -626,13 +563,12 @@ require_prereqs() {
 }
 
 ensure_release_namespace() {
-  if ! kubectl get namespace "${TARGET_NS}" >/dev/null 2>&1; then
-    kubectl create namespace "${TARGET_NS}" >/dev/null
-  fi
+  kubectl get namespace "${TARGET_NS}" >/dev/null 2>&1 || kubectl create namespace "${TARGET_NS}" >/dev/null
+  kubectl label namespace "${TARGET_NS}" app.kubernetes.io/part-of=flyte --overwrite >/dev/null 2>&1 || true
+}
 
-  kubectl label namespace "${TARGET_NS}" \
-    app.kubernetes.io/part-of=flyte \
-    --overwrite >/dev/null 2>&1 || true
+validate_rendered_values() {
+  helm template "${RELEASE_NAME}" "${CHART_REPO_NAME}/${CHART_NAME}" --version "${CHART_VERSION}" -n "${TARGET_NS}" -f "${VALUES_FILE}" >/dev/null
 }
 
 wait_for_rollouts() {
@@ -689,6 +625,7 @@ main() {
   app_user="$(secret_value "${app_secret}" username)"
   app_password="$(secret_value "${app_secret}" password)"
   app_port="$(secret_value "${app_secret}" port)"
+
   [[ -n "${app_user}" ]] || fatal "username missing from CNPG app secret ${app_secret}"
   [[ -n "${app_password}" ]] || fatal "password missing from CNPG app secret ${app_secret}"
 
@@ -744,13 +681,24 @@ main() {
   ensure_database "${FLYTE_DATACATALOG_DB}"
   ensure_secret_literal "${TARGET_NS}" "${DB_SECRET_NAME}" "pass.txt" "${APP_DB_PASSWORD}"
 
+  for ns in $(split_namespaces); do
+    ensure_namespace "${ns}"
+    if [[ "${provider}" == "aws" && "${USE_IAM}" == "true" ]]; then
+      patch_default_serviceaccount_annotation "${ns}" "eks.amazonaws.com/role-arn" "${AWS_ROLE_ARN}"
+    elif [[ "${provider}" == "gcs" && -n "${GCP_SA_EMAIL}" ]]; then
+      patch_default_serviceaccount_annotation "${ns}" "iam.gke.io/gcp-service-account" "${GCP_SA_EMAIL}"
+    elif [[ "${provider}" == "azure" && -n "${AZURE_CLIENT_ID}" ]]; then
+      patch_default_serviceaccount_annotation "${ns}" "azure.workload.identity/client-id" "${AZURE_CLIENT_ID}"
+    fi
+  done
+
   helm repo add "${CHART_REPO_NAME}" "${CHART_REPO_URL}" >/dev/null 2>&1 || true
   helm repo update >/dev/null
 
   render_values_file "${provider}"
+  validate_rendered_values
 
-  local -a helm_args
-  helm_args=(
+  local -a helm_args=(
     upgrade
     --install
     "${RELEASE_NAME}"
@@ -765,12 +713,9 @@ main() {
     --timeout
     "${READY_TIMEOUT}s"
   )
-  if [[ "${FLYTE_ATOMIC}" == "true" ]]; then
-    helm_args+=(--atomic)
-  fi
+  [[ "${FLYTE_ATOMIC}" == "true" ]] && helm_args+=(--atomic)
 
   helm "${helm_args[@]}"
-
   wait_for_rollouts
   print_summary
 }
@@ -804,7 +749,7 @@ Environment variables:
   DB_ACCESS_MODE=rw|pooler
   STORAGE_PROVIDER=auto|aws|gcs|azure
   USE_IAM=true|false
-  FLYTE_TASK_NAMESPACES=flytesnacks-development[,other-namespace]
+  FLYTE_TASK_NAMESPACES=default flytesnacks-development[,other-namespace]
   TASK_AWS_SECRET_NAME=flyte-aws-credentials
   FLYTE_SPARK_OPERATOR_ENABLED=true|false
   FLYTE_ATOMIC=true|false
