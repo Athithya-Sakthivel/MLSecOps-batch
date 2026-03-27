@@ -14,7 +14,7 @@
 
 set -Eeuo pipefail
 
-export ELT_TASK_IMAGE="ghcr.io/athithya-sakthivel/flyte-elt-task:2026-03-27-04-32--8631391"
+export ELT_TASK_IMAGE="ghcr.io/athithya-sakthivel/flyte-elt-task:2026-03-27-09-56--e4e99ab"
 
 REMOTE_PROJECT="${REMOTE_PROJECT:-flytesnacks}"
 REMOTE_DOMAIN="${REMOTE_DOMAIN:-development}"
@@ -238,7 +238,7 @@ lint_workflow() {
   fi
 
   log "Running ruff on ${WORKFLOW_PACKAGE_DIR}"
-  ruff check "${WORKFLOW_PACKAGE_DIR}"
+  ruff check "${WORKFLOW_PACKAGE_DIR}" --fix
 }
 
 usage() {
