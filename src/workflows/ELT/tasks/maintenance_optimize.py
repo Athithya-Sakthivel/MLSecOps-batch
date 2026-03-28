@@ -40,6 +40,21 @@ _handler.setFormatter(logging.Formatter("%(message)s"))
 LOG.handlers[:] = [_handler]
 LOG.propagate = False
 
+K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
+ELT_PROFILE = os.environ.get(
+    "ELT_PROFILE",
+    "dev" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod",
+).strip().lower()
+
+if ELT_PROFILE == "prod":
+    TASK_LIMITS = Resources(cpu="1000m", mem="768Mi")
+    TASK_RETRIES = 1
+else:
+    TASK_LIMITS = Resources(cpu="500m", mem="512Mi")
+    TASK_RETRIES = 1
+
+DEFAULT_REWRITE_WHERE = "as_of_date >= date_sub(current_date(), 30)"
+
 
 @dataclass(frozen=True)
 class MaintenanceResult:
@@ -58,6 +73,16 @@ def split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def parse_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
@@ -70,6 +95,8 @@ def utc_cutoff_string(days: int) -> str:
 
 
 def execute_sql_action(spark: SparkSession, statement: str) -> None:
+    # Spark SQL procedures often return rows; exhaust them without pulling
+    # the whole result to the driver.
     spark.sql(statement).rdd.foreachPartition(lambda _: None)
 
 
@@ -105,7 +132,7 @@ def rewrite_data_files_call(table_id: str, where_clause: str) -> str:
 
 def parse_table_list(env_name: str, default_value: str) -> list[str]:
     raw = os.environ.get(env_name, default_value)
-    return [qualify_table_id(item) for item in split_csv(raw)]
+    return dedupe_preserve_order([qualify_table_id(item) for item in split_csv(raw)])
 
 
 def parse_table_predicate_map(env_name: str) -> dict[str, str]:
@@ -147,6 +174,12 @@ def table_op_result(table_id: str, operation: str, status: str, message: str = "
     }
 
 
+def default_rewrite_predicates() -> dict[str, str]:
+    return {
+        qualify_table_id(GOLD_TRAINING_TABLE): DEFAULT_REWRITE_WHERE,
+    }
+
+
 @task(
     task_config=Spark(
         spark_conf=build_spark_conf(),
@@ -154,8 +187,8 @@ def table_op_result(table_id: str, operation: str, status: str, message: str = "
         executor_path="/opt/venv/bin/python",
     ),
     container_image=TASK_IMAGE,
-    retries=1,
-    limits=Resources(mem="2500M"),
+    retries=TASK_RETRIES,
+    limits=TASK_LIMITS,
 )
 def maintenance_optimize() -> MaintenanceResult:
     spark = get_spark_session()
@@ -188,14 +221,18 @@ def maintenance_optimize() -> MaintenanceResult:
     )
 
     rewrite_where_by_table = parse_table_predicate_map("ICEBERG_MAINTENANCE_REWRITE_WHERE_BY_TABLE_JSON")
+    if not rewrite_where_by_table:
+        rewrite_where_by_table = default_rewrite_predicates()
 
-    for table_id in set(expire_tables + orphan_tables + rewrite_tables):
+    for table_id in dedupe_preserve_order(expire_tables + orphan_tables + rewrite_tables):
         catalog, namespace, _ = table_id.split(".")
         ensure_namespace(spark, catalog, namespace)
 
     log_json(
         msg="maintenance_start",
         run_id=run_id,
+        profile=ELT_PROFILE,
+        k8s_cluster=K8S_CLUSTER,
         expire_tables=expire_tables,
         orphan_tables=orphan_tables,
         rewrite_tables=rewrite_tables,
@@ -213,24 +250,6 @@ def maintenance_optimize() -> MaintenanceResult:
 
     expire_before = utc_cutoff_string(ICEBERG_EXPIRE_DAYS)
     orphan_before = utc_cutoff_string(ICEBERG_ORPHAN_DAYS)
-
-    def record_and_maybe_raise(table_id: str, operation: str, exc: Exception) -> None:
-        failed.append(table_id)
-        table_results.append(
-            table_op_result(
-                table_id=table_id,
-                operation=operation,
-                status="failed",
-                message=str(exc),
-            )
-        )
-        log_json(
-            msg=f"maintenance_{operation}_failed",
-            table=table_id,
-            error=str(exc),
-        )
-        if not continue_on_error:
-            raise
 
     for table_id in expire_tables:
         if not table_exists(spark, table_id):
@@ -265,7 +284,22 @@ def maintenance_optimize() -> MaintenanceResult:
                 )
             )
         except Exception as exc:
-            record_and_maybe_raise(table_id, "expire_orphan", exc)
+            failed.append(table_id)
+            table_results.append(
+                table_op_result(
+                    table_id=table_id,
+                    operation="expire_orphan",
+                    status="failed",
+                    message=str(exc),
+                )
+            )
+            log_json(
+                msg="maintenance_expire_orphan_failed",
+                table=table_id,
+                error=str(exc),
+            )
+            if not continue_on_error:
+                raise
 
     for table_id in rewrite_tables:
         if not table_exists(spark, table_id):
@@ -323,9 +357,24 @@ def maintenance_optimize() -> MaintenanceResult:
                 )
             )
         except Exception as exc:
-            record_and_maybe_raise(table_id, "rewrite", exc)
+            failed.append(table_id)
+            table_results.append(
+                table_op_result(
+                    table_id=table_id,
+                    operation="rewrite",
+                    status="failed",
+                    message=str(exc),
+                )
+            )
+            log_json(
+                msg="maintenance_rewrite_failed",
+                table=table_id,
+                error=str(exc),
+            )
+            if not continue_on_error:
+                raise
 
-    if failed and continue_on_error:
+    if failed:
         raise RuntimeError(
             "Iceberg maintenance completed with failures: "
             + json.dumps(
@@ -340,7 +389,7 @@ def maintenance_optimize() -> MaintenanceResult:
 
     result = MaintenanceResult(
         run_id=run_id,
-        status="ok" if not failed else "partial_failure",
+        status="ok",
         expired_tables=",".join(expired_done),
         rewritten_tables=",".join(rewritten_done),
         skipped_tables=",".join(skipped),

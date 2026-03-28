@@ -21,15 +21,12 @@ from workflows.ELT.tasks.bronze_ingest import (
     TASK_IMAGE,
     BronzeIngestResult,
     build_hadoop_conf,
-    build_spark_conf,
     ensure_namespace,
     get_spark_session,
     log_json,
     qualify_table_id,
     table_exists,
 )
-
-SILVER_ROWS_PER_PARTITION = int(os.environ.get("SILVER_ROWS_PER_PARTITION", "50000"))
 
 LOG = logging.getLogger("elt_silver_transform")
 LOG.setLevel(logging.INFO)
@@ -38,6 +35,40 @@ _handler.setFormatter(logging.Formatter("%(message)s"))
 LOG.handlers[:] = [_handler]
 LOG.propagate = False
 
+K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
+ELT_PROFILE = os.environ.get(
+    "ELT_PROFILE",
+    "dev" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod",
+).strip().lower()
+
+if ELT_PROFILE == "prod":
+    TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
+    SPARK_DRIVER_MEMORY = "2g"
+    SPARK_EXECUTOR_MEMORY = "2g"
+    SPARK_DRIVER_MEMORY_OVERHEAD = "512m"
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = "512m"
+    SPARK_EXECUTOR_CORES = "1"
+    SPARK_EXECUTOR_INSTANCES = "1"
+    SPARK_DRIVER_CORES = "1"
+    SPARK_SHUFFLE_PARTITIONS = "8"
+    SPARK_MAX_PARTITION_BYTES = "134217728"
+    SPARK_MAX_RESULT_SIZE = "256m"
+    TASK_RETRIES = 1
+else:
+    TASK_LIMITS = Resources(cpu="500m", mem="768Mi")
+    SPARK_DRIVER_MEMORY = "1g"
+    SPARK_EXECUTOR_MEMORY = "1g"
+    SPARK_DRIVER_MEMORY_OVERHEAD = "256m"
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = "256m"
+    SPARK_EXECUTOR_CORES = "1"
+    SPARK_EXECUTOR_INSTANCES = "1"
+    SPARK_DRIVER_CORES = "1"
+    SPARK_SHUFFLE_PARTITIONS = "4"
+    SPARK_MAX_PARTITION_BYTES = "67108864"
+    SPARK_MAX_RESULT_SIZE = "128m"
+    TASK_RETRIES = 1
+
+SILVER_ROWS_PER_PARTITION = int(os.environ.get("SILVER_ROWS_PER_PARTITION", "50000"))
 
 @dataclass(frozen=True)
 class SilverTransformResult:
@@ -53,6 +84,95 @@ def require_columns(df: DataFrame, required: Sequence[str], label: str) -> None:
     missing = set(required) - set(df.columns)
     if missing:
         raise RuntimeError(f"{label} is missing required columns: {sorted(missing)}")
+
+
+def ensure_column(df: DataFrame, column: str, spark_type: str) -> DataFrame:
+    if column in df.columns:
+        return df.withColumn(column, F.col(column).cast(spark_type))
+    return df.withColumn(column, F.lit(None).cast(spark_type))
+
+
+def ensure_trips_schema(df: DataFrame) -> DataFrame:
+    required = (
+        "pickup_ts",
+        "dropoff_ts",
+        "pickup_location_id",
+        "dropoff_location_id",
+        "trip_distance",
+        "fare_amount",
+        "total_amount",
+        "run_id",
+        "source_revision",
+        "source_file",
+        "source_uri",
+        "ingestion_ts",
+    )
+    require_columns(df, required, "bronze trips table")
+
+    cast_map = {
+        "pickup_location_id": "long",
+        "dropoff_location_id": "long",
+        "trip_distance": "double",
+        "fare_amount": "double",
+        "tip_amount": "double",
+        "total_amount": "double",
+        "extra": "double",
+        "mta_tax": "double",
+        "tolls_amount": "double",
+        "improvement_surcharge": "double",
+        "congestion_surcharge": "double",
+        "cbd_congestion_fee": "double",
+        "vendor_id": "long",
+        "ratecode_id": "long",
+        "passenger_count": "long",
+        "payment_type": "long",
+        "trip_type": "long",
+        "store_and_fwd_flag": "string",
+    }
+
+    normalized = df
+    for col_name, spark_type in cast_map.items():
+        normalized = ensure_column(normalized, col_name, spark_type)
+
+    return normalized
+
+
+def ensure_zone_schema(df: DataFrame) -> DataFrame:
+    required = ("location_id", "borough", "zone", "service_zone")
+    require_columns(df, required, "bronze taxi zone table")
+
+    normalized = (
+        df.select(
+            F.col("location_id").cast("long").alias("location_id"),
+            F.col("borough").cast("string").alias("borough"),
+            F.col("zone").cast("string").alias("zone"),
+            F.col("service_zone").cast("string").alias("service_zone"),
+        )
+        .dropDuplicates(["location_id"])
+    )
+    return normalized
+
+
+def stable_trip_id_expr() -> F.Column:
+    return F.sha2(
+        F.concat_ws(
+            "||",
+            F.coalesce(F.col("t.pickup_ts").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.dropoff_ts").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.pickup_location_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.dropoff_location_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.vendor_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.ratecode_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.passenger_count").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.payment_type").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.trip_distance").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.fare_amount").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.total_amount").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.source_revision").cast("string"), F.lit("")),
+            F.coalesce(F.col("t.source_file").cast("string"), F.lit("")),
+        ),
+        256,
+    )
 
 
 def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_column: str) -> str:
@@ -73,34 +193,11 @@ def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_colu
 
 
 def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str) -> DataFrame:
-    require_columns(
-        trips_df,
-        (
-            "pickup_ts",
-            "dropoff_ts",
-            "pickup_location_id",
-            "dropoff_location_id",
-            "trip_distance",
-            "fare_amount",
-            "total_amount",
-        ),
-        "bronze trips table",
-    )
-    require_columns(
-        zones_df,
-        ("location_id", "borough", "zone", "service_zone"),
-        "bronze taxi zone table",
-    )
-
-    zone_lookup = zones_df.dropDuplicates(["location_id"]).select(
-        F.col("location_id").cast("long").alias("location_id"),
-        F.col("borough").cast("string").alias("borough"),
-        F.col("zone").cast("string").alias("zone"),
-        F.col("service_zone").cast("string").alias("service_zone"),
-    )
+    trips_df = ensure_trips_schema(trips_df)
+    zones_df = ensure_zone_schema(zones_df)
 
     pickup_lookup = broadcast(
-        zone_lookup.select(
+        zones_df.select(
             F.col("location_id").alias("pickup_location_id_join"),
             F.col("borough").alias("pickup_borough"),
             F.col("zone").alias("pickup_zone"),
@@ -108,7 +205,7 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
         )
     )
     dropoff_lookup = broadcast(
-        zone_lookup.select(
+        zones_df.select(
             F.col("location_id").alias("dropoff_location_id_join"),
             F.col("borough").alias("dropoff_borough"),
             F.col("zone").alias("dropoff_zone"),
@@ -131,44 +228,107 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
     )
 
     canonical = joined.select(
-        *[F.col(f"t.{c}") for c in trips_df.columns],
+        F.col("t.run_id").alias("bronze_run_id"),
+        F.col("t.source_uri"),
+        F.col("t.source_revision"),
+        F.col("t.source_file"),
+        F.col("t.source_kind"),
+        F.col("t.ingestion_ts"),
+        F.col("t.pickup_ts"),
+        F.col("t.dropoff_ts"),
+        F.col("t.pickup_location_id"),
+        F.col("t.dropoff_location_id"),
+        F.col("t.vendor_id"),
+        F.col("t.ratecode_id"),
+        F.col("t.passenger_count"),
+        F.col("t.payment_type"),
+        F.col("t.trip_type"),
+        F.col("t.store_and_fwd_flag"),
+        F.col("t.trip_distance"),
+        F.col("t.fare_amount"),
+        F.col("t.tip_amount"),
+        F.col("t.total_amount"),
+        F.col("t.extra"),
+        F.col("t.mta_tax"),
+        F.col("t.tolls_amount"),
+        F.col("t.improvement_surcharge"),
+        F.col("t.congestion_surcharge"),
+        F.col("t.cbd_congestion_fee"),
         F.col("pickup_borough"),
         F.col("pickup_zone"),
         F.col("pickup_service_zone"),
         F.col("dropoff_borough"),
         F.col("dropoff_zone"),
         F.col("dropoff_service_zone"),
-    )
+    ).withColumn("trip_id", stable_trip_id_expr())
 
     canonical = (
-        canonical.withColumn(
-            "trip_key",
-            F.sha2(
-                F.concat_ws(
-                    "||",
-                    F.coalesce(F.col("pickup_ts").cast("string"), F.lit("")),
-                    F.coalesce(F.col("dropoff_ts").cast("string"), F.lit("")),
-                    F.coalesce(F.col("pickup_location_id").cast("string"), F.lit("")),
-                    F.coalesce(F.col("dropoff_location_id").cast("string"), F.lit("")),
-                    F.coalesce(F.col("run_id").cast("string"), F.lit("")),
-                    F.coalesce(F.col("source_revision").cast("string"), F.lit("")),
-                ),
-                256,
-            ),
+        canonical.withColumn("pickup_date", F.to_date(F.col("pickup_ts")))
+        .withColumn("pickup_hour", F.hour(F.col("pickup_ts")).cast("int"))
+        .withColumn("pickup_dow", F.dayofweek(F.col("pickup_ts")).cast("int"))
+        .withColumn("pickup_month", F.month(F.col("pickup_ts")).cast("int"))
+        .withColumn(
+            "pickup_is_weekend",
+            F.when(F.dayofweek(F.col("pickup_ts")).isin(1, 7), F.lit(1)).otherwise(F.lit(0)).cast("int"),
         )
-        .withColumn("pickup_date", F.to_date(F.col("pickup_ts")))
         .withColumn(
             "trip_duration_seconds",
-            (F.unix_timestamp("dropoff_ts") - F.unix_timestamp("pickup_ts")).cast("long"),
+            (F.col("dropoff_ts").cast("long") - F.col("pickup_ts").cast("long")).cast("long"),
         )
         .withColumn(
             "trip_duration_minutes",
             F.round(F.col("trip_duration_seconds") / F.lit(60.0), 3),
         )
+        .withColumn("silver_run_id", F.lit(run_id))
+    )
+
+    canonical = canonical.select(
+        "trip_id",
+        "pickup_date",
+        "pickup_ts",
+        "dropoff_ts",
+        "pickup_hour",
+        "pickup_dow",
+        "pickup_month",
+        "pickup_is_weekend",
+        "trip_duration_seconds",
+        "trip_duration_minutes",
+        "pickup_location_id",
+        "dropoff_location_id",
+        "pickup_borough",
+        "pickup_zone",
+        "pickup_service_zone",
+        "dropoff_borough",
+        "dropoff_zone",
+        "dropoff_service_zone",
+        "vendor_id",
+        "ratecode_id",
+        "passenger_count",
+        "payment_type",
+        "trip_type",
+        "store_and_fwd_flag",
+        "trip_distance",
+        "fare_amount",
+        "tip_amount",
+        "total_amount",
+        "extra",
+        "mta_tax",
+        "tolls_amount",
+        "improvement_surcharge",
+        "congestion_surcharge",
+        "cbd_congestion_fee",
+        "source_uri",
+        "source_revision",
+        "source_file",
+        "source_kind",
+        "ingestion_ts",
+        "bronze_run_id",
+        "silver_run_id",
     )
 
     required = {
-        "trip_key",
+        "trip_id",
+        "pickup_date",
         "pickup_ts",
         "dropoff_ts",
         "pickup_location_id",
@@ -177,7 +337,13 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
         "pickup_zone",
         "dropoff_borough",
         "dropoff_zone",
-        "pickup_date",
+        "trip_duration_seconds",
+        "trip_distance",
+        "fare_amount",
+        "total_amount",
+        "source_uri",
+        "source_revision",
+        "source_file",
     }
     missing = required - set(canonical.columns)
     if missing:
@@ -197,13 +363,53 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
 
 @task(
     task_config=Spark(
-        spark_conf=build_spark_conf(),
+        spark_conf={
+            f"spark.sql.catalog.{CATALOG_NAME}": "org.apache.iceberg.spark.SparkCatalog",
+            f"spark.sql.catalog.{CATALOG_NAME}.type": "rest",
+            f"spark.sql.catalog.{CATALOG_NAME}.uri": os.environ.get(
+                "ICEBERG_REST_URI",
+                "http://iceberg-rest.default.svc.cluster.local:9001/iceberg",
+            ),
+            f"spark.sql.catalog.{CATALOG_NAME}.warehouse": os.environ.get(
+                "ICEBERG_WAREHOUSE",
+                "s3://e2e-mlops-data-681802563986/iceberg/warehouse/",
+            ),
+            f"spark.sql.catalog.{CATALOG_NAME}.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+            "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+            "spark.sql.shuffle.partitions": SPARK_SHUFFLE_PARTITIONS,
+            "spark.sql.files.maxPartitionBytes": SPARK_MAX_PARTITION_BYTES,
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.session.timeZone": "UTC",
+            "spark.sql.sources.partitionOverwriteMode": "dynamic",
+            "spark.driver.memory": SPARK_DRIVER_MEMORY,
+            "spark.driver.memoryOverhead": SPARK_DRIVER_MEMORY_OVERHEAD,
+            "spark.executor.memory": SPARK_EXECUTOR_MEMORY,
+            "spark.executor.memoryOverhead": SPARK_EXECUTOR_MEMORY_OVERHEAD,
+            "spark.executor.cores": SPARK_EXECUTOR_CORES,
+            "spark.executor.instances": SPARK_EXECUTOR_INSTANCES,
+            "spark.driver.cores": SPARK_DRIVER_CORES,
+            "spark.driver.maxResultSize": SPARK_MAX_RESULT_SIZE,
+            "spark.kubernetes.authenticate.driver.serviceAccountName": os.environ.get(
+                "SPARK_SERVICE_ACCOUNT",
+                "spark",
+            ),
+            "spark.kubernetes.authenticate.executor.serviceAccountName": os.environ.get(
+                "SPARK_SERVICE_ACCOUNT",
+                "spark",
+            ),
+            "spark.kubernetes.driver.limit.cores": SPARK_DRIVER_CORES,
+            "spark.kubernetes.executor.limit.cores": SPARK_EXECUTOR_CORES,
+            "spark.task.maxFailures": "4",
+            "spark.excludeOnFailure.enabled": "true",
+            "spark.excludeOnFailure.timeout": "5m",
+        },
         hadoop_conf=build_hadoop_conf(),
         executor_path="/opt/venv/bin/python",
     ),
     container_image=TASK_IMAGE,
-    retries=2,
-    limits=Resources(mem="2500M"),
+    retries=TASK_RETRIES,
+    limits=TASK_LIMITS,
 )
 def silver_transform(bronze: BronzeIngestResult) -> SilverTransformResult:
     spark = get_spark_session()
@@ -217,10 +423,13 @@ def silver_transform(bronze: BronzeIngestResult) -> SilverTransformResult:
 
     log_json(
         msg="silver_transform_start",
+        profile=ELT_PROFILE,
+        k8s_cluster=K8S_CLUSTER,
         run_id=bronze.run_id,
         bronze_trips_table=bronze_trips_table,
         bronze_taxi_zone_table=bronze_taxi_zone_table,
         silver_table=silver_table,
+        bronze_trips_rows=bronze.trips_rows,
     )
 
     trips_df = spark.table(bronze_trips_table)
@@ -228,7 +437,7 @@ def silver_transform(bronze: BronzeIngestResult) -> SilverTransformResult:
 
     canonical_df = build_canonical_frame(trips_df, zones_df, bronze.run_id)
 
-    target_partitions = max(1, math.ceil(bronze.trips_rows / SILVER_ROWS_PER_PARTITION))
+    target_partitions = max(1, math.ceil(max(bronze.trips_rows, 1) / 50000))
     canonical_df = canonical_df.repartition(target_partitions, F.col("pickup_date"))
 
     write_mode = write_partitioned_iceberg_table(

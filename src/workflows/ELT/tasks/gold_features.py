@@ -39,13 +39,27 @@ _handler.setFormatter(logging.Formatter("%(message)s"))
 LOG.handlers[:] = [_handler]
 LOG.propagate = False
 
+K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
+ELT_PROFILE = os.environ.get(
+    "ELT_PROFILE",
+    "dev" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod",
+).strip().lower()
+
 FEATURE_VERSION = os.environ.get("GOLD_FEATURE_VERSION", "trip_eta_lgbm_v1")
 SCHEMA_VERSION = os.environ.get("GOLD_SCHEMA_VERSION", "trip_eta_frozen_matrix_v1")
-ROUTE_PAIR_BUCKETS = int(os.environ.get("ROUTE_PAIR_BUCKETS", "4096"))
-ROUTE_PAIR_HASH_SALT = os.environ.get("ROUTE_PAIR_HASH_SALT", "trip_eta_route_pair_v1")
-GOLD_REPARTITIONS = int(os.environ.get("GOLD_REPARTITIONS", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8")))
+ROUTE_PAIR_BUCKETS = 4096
+ROUTE_PAIR_HASH_SALT = "trip_eta_route_pair_v1"
 MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "lightgbm")
 INFERENCE_RUNTIME = os.environ.get("INFERENCE_RUNTIME", "onnxruntime")
+
+if ELT_PROFILE == "prod":
+    TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
+    GOLD_REPARTITIONS = 8
+    TASK_RETRIES = 1
+else:
+    TASK_LIMITS = Resources(cpu="500m", mem="768Mi")
+    GOLD_REPARTITIONS = 4
+    TASK_RETRIES = 1
 
 
 @dataclass(frozen=True)
@@ -120,13 +134,9 @@ def build_borough_map_df(spark):
 
 def distinct_service_zone_values(silver_df: DataFrame) -> list[str]:
     rows = (
-        silver_df.select(
-            F.coalesce(F.col("pickup_service_zone"), F.lit("")).alias("service_zone")
-        )
+        silver_df.select(F.coalesce(F.col("pickup_service_zone"), F.lit("")).alias("service_zone"))
         .unionByName(
-            silver_df.select(
-                F.coalesce(F.col("dropoff_service_zone"), F.lit("")).alias("service_zone")
-            )
+            silver_df.select(F.coalesce(F.col("dropoff_service_zone"), F.lit("")).alias("service_zone"))
         )
         .select(F.lower(F.trim(F.col("service_zone"))).alias("service_zone_norm"))
         .where(F.col("service_zone_norm") != "")
@@ -160,32 +170,34 @@ def route_pair_bucket_expr(pickup_zone_id_col, dropoff_zone_id_col):
         ),
         256,
     )
-    bucket = F.pmod(F.conv(F.substring(route_hash, 1, 15), 16, 10).cast("long"), F.lit(ROUTE_PAIR_BUCKETS)).cast("int") + F.lit(1)
+    bucket = F.pmod(
+        F.conv(F.substring(route_hash, 1, 15), 16, 10).cast("long"),
+        F.lit(ROUTE_PAIR_BUCKETS),
+    ).cast("int") + F.lit(1)
     return bucket
 
 
 def build_window_features(df: DataFrame) -> DataFrame:
-    as_of_sec = F.unix_timestamp(F.col("as_of_ts")).cast("long")
+    df = df.withColumn("as_of_ts_sec", F.col("as_of_ts").cast("long"))
 
     w_zone_hour_7d = (
         Window.partitionBy("pickup_zone_id", "pickup_hour")
-        .orderBy(as_of_sec)
+        .orderBy("as_of_ts_sec")
         .rangeBetween(-7 * 24 * 60 * 60, -1)
     )
     w_zone_30d = (
         Window.partitionBy("pickup_zone_id")
-        .orderBy(as_of_sec)
+        .orderBy("as_of_ts_sec")
         .rangeBetween(-30 * 24 * 60 * 60, -1)
     )
     w_zone_hour_90d = (
         Window.partitionBy("pickup_zone_id", "pickup_hour")
-        .orderBy(as_of_sec)
+        .orderBy("as_of_ts_sec")
         .rangeBetween(-90 * 24 * 60 * 60, -1)
     )
 
     return (
-        df.withColumn("as_of_ts_sec", as_of_sec)
-        .withColumn(
+        df.withColumn(
             "avg_duration_7d_zone_hour",
             F.coalesce(
                 F.avg(F.col("label_trip_duration_seconds")).over(w_zone_hour_7d),
@@ -453,11 +465,11 @@ def build_encoding_spec(service_zone_values: list[str]) -> dict:
     }
 
 
-def build_aggregate_spec() -> list[dict]:
+def build_aggregate_spec(source_silver_table: str) -> list[dict]:
     return [
         {
             "name": "avg_duration_7d_zone_hour",
-            "source_table": "gold.training_matrix_source_silver",
+            "source_table": source_silver_table,
             "source_column": "label_trip_duration_seconds",
             "filter_predicate": "trip_start_ts in [as_of_ts - 7d, as_of_ts)",
             "window_length": "7d",
@@ -467,7 +479,7 @@ def build_aggregate_spec() -> list[dict]:
         },
         {
             "name": "avg_fare_30d_zone",
-            "source_table": "gold.training_matrix_source_silver",
+            "source_table": source_silver_table,
             "source_column": "fare_amount",
             "filter_predicate": "trip_start_ts in [as_of_ts - 30d, as_of_ts)",
             "window_length": "30d",
@@ -477,7 +489,7 @@ def build_aggregate_spec() -> list[dict]:
         },
         {
             "name": "trip_count_90d_zone_hour",
-            "source_table": "gold.training_matrix_source_silver",
+            "source_table": source_silver_table,
             "source_column": "count(*)",
             "filter_predicate": "trip_start_ts in [as_of_ts - 90d, as_of_ts)",
             "window_length": "90d",
@@ -488,12 +500,13 @@ def build_aggregate_spec() -> list[dict]:
     ]
 
 
-def build_label_spec() -> dict:
+def build_label_spec(source_silver_table: str) -> dict:
     return {
         "name": "label_trip_duration_seconds",
         "dtype": "float64",
         "unit": "seconds",
-        "source": "silver.trip_duration_seconds",
+        "source_table": source_silver_table,
+        "source_column": "trip_duration_seconds",
         "null_policy": "drop_row_if_null",
         "primary_metric": "mae",
         "secondary_metric": "rmse",
@@ -509,16 +522,11 @@ def build_schema_hash(feature_spec_rows: list[dict]) -> str:
 def encode_categories(base: DataFrame, service_zone_map_df: DataFrame) -> DataFrame:
     borough_map_df = build_borough_map_df(base.sparkSession)
 
-    pickup_norm = normalize_text_expr("pickup_borough")
-    dropoff_norm = normalize_text_expr("dropoff_borough")
-    pickup_zone_norm = normalize_text_expr("pickup_service_zone")
-    dropoff_zone_norm = normalize_text_expr("dropoff_service_zone")
-
     encoded = (
-        base.withColumn("pickup_borough_norm", pickup_norm)
-        .withColumn("dropoff_borough_norm", dropoff_norm)
-        .withColumn("pickup_service_zone_norm", pickup_zone_norm)
-        .withColumn("dropoff_service_zone_norm", dropoff_zone_norm)
+        base.withColumn("pickup_borough_norm", normalize_text_expr("pickup_borough"))
+        .withColumn("dropoff_borough_norm", normalize_text_expr("dropoff_borough"))
+        .withColumn("pickup_service_zone_norm", normalize_text_expr("pickup_service_zone"))
+        .withColumn("dropoff_service_zone_norm", normalize_text_expr("dropoff_service_zone"))
         .join(
             broadcast(
                 borough_map_df.select(
@@ -575,11 +583,11 @@ def encode_categories(base: DataFrame, service_zone_map_df: DataFrame) -> DataFr
     )
 
 
-def build_training_matrix(silver_df: DataFrame, run_id: str) -> DataFrame:
+def build_training_matrix(silver_df: DataFrame, run_id: str) -> tuple[DataFrame, list[str], list[dict], str]:
     require_columns(
         silver_df,
         (
-            "trip_key",
+            "trip_id",
             "pickup_ts",
             "dropoff_ts",
             "pickup_location_id",
@@ -599,7 +607,7 @@ def build_training_matrix(silver_df: DataFrame, run_id: str) -> DataFrame:
 
     base = (
         silver_df.select(
-            "trip_key",
+            "trip_id",
             "pickup_ts",
             "dropoff_ts",
             "pickup_location_id",
@@ -610,15 +618,11 @@ def build_training_matrix(silver_df: DataFrame, run_id: str) -> DataFrame:
             "dropoff_borough",
             "dropoff_zone",
             "dropoff_service_zone",
-            "vendor_id",
-            "ratecode_id",
-            "passenger_count",
-            "fare_amount",
             "trip_duration_seconds",
             "trip_duration_minutes",
+            "fare_amount",
             "total_amount",
         )
-        .withColumn("trip_id", F.col("trip_key"))
         .withColumn("as_of_ts", F.col("pickup_ts"))
         .withColumn("as_of_date", F.to_date(F.col("pickup_ts")))
         .withColumn("schema_version", F.lit(SCHEMA_VERSION))
@@ -632,6 +636,7 @@ def build_training_matrix(silver_df: DataFrame, run_id: str) -> DataFrame:
         )
         .withColumn("pickup_zone_id", F.coalesce(F.col("pickup_location_id").cast("int"), F.lit(0)).cast("int"))
         .withColumn("dropoff_zone_id", F.coalesce(F.col("dropoff_location_id").cast("int"), F.lit(0)).cast("int"))
+        .withColumn("label_trip_duration_seconds", F.col("trip_duration_seconds").cast("double"))
     )
 
     service_zone_values = distinct_service_zone_values(base)
@@ -644,29 +649,6 @@ def build_training_matrix(silver_df: DataFrame, run_id: str) -> DataFrame:
             (F.col("pickup_zone_id") > 0) & (F.col("dropoff_zone_id") > 0),
             route_pair_bucket_expr(F.col("pickup_zone_id"), F.col("dropoff_zone_id")),
         ).otherwise(F.lit(0)).cast("int"),
-    )
-
-    base = base.withColumn(
-        "label_trip_duration_seconds",
-        F.col("trip_duration_seconds").cast("double"),
-    )
-
-    base = (
-        base.withColumn("pickup_hour", F.col("pickup_hour").cast("int"))
-        .withColumn("pickup_dow", F.col("pickup_dow").cast("int"))
-        .withColumn("pickup_month", F.col("pickup_month").cast("int"))
-        .withColumn("pickup_is_weekend", F.col("pickup_is_weekend").cast("int"))
-        .withColumn("pickup_zone_id", F.col("pickup_zone_id").cast("int"))
-        .withColumn("dropoff_zone_id", F.col("dropoff_zone_id").cast("int"))
-        .withColumn("pickup_borough_id", F.col("pickup_borough_id").cast("int"))
-        .withColumn("dropoff_borough_id", F.col("dropoff_borough_id").cast("int"))
-        .withColumn("pickup_service_zone_id", F.col("pickup_service_zone_id").cast("int"))
-        .withColumn("dropoff_service_zone_id", F.col("dropoff_service_zone_id").cast("int"))
-        .withColumn("fare_amount", F.col("fare_amount").cast("double"))
-        .withColumn("trip_duration_seconds", F.col("trip_duration_seconds").cast("double"))
-        .withColumn("trip_duration_minutes", F.col("trip_duration_minutes").cast("double"))
-        .withColumn("total_amount", F.col("total_amount").cast("double"))
-        .withColumn("route_pair_id", F.col("route_pair_id").cast("int"))
     )
 
     base = build_window_features(base)
@@ -728,8 +710,8 @@ def build_training_matrix(silver_df: DataFrame, run_id: str) -> DataFrame:
         executor_path="/opt/venv/bin/python",
     ),
     container_image=TASK_IMAGE,
-    retries=2,
-    limits=Resources(mem="2500M"),
+    retries=TASK_RETRIES,
+    limits=TASK_LIMITS,
 )
 def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
     spark = get_spark_session()
@@ -743,6 +725,8 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
 
     log_json(
         msg="gold_features_start",
+        profile=ELT_PROFILE,
+        k8s_cluster=K8S_CLUSTER,
         run_id=silver.run_id,
         source_silver_table=source_silver_table,
         gold_table=gold_table,
@@ -786,12 +770,12 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
         separators=(",", ":"),
     )
     aggregate_spec_json = json.dumps(
-        build_aggregate_spec(),
+        build_aggregate_spec(source_silver_table),
         sort_keys=True,
         separators=(",", ":"),
     )
     label_spec_json = json.dumps(
-        build_label_spec(),
+        build_label_spec(source_silver_table),
         sort_keys=True,
         separators=(",", ":"),
     )

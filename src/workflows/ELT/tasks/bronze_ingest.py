@@ -36,7 +36,7 @@ ICEBERG_REST_AUTH_TYPE = os.environ.get("ICEBERG_REST_AUTH_TYPE", "")
 ICEBERG_REST_USER = os.environ.get("ICEBERG_REST_USER", "")
 ICEBERG_REST_PASSWORD = os.environ.get("ICEBERG_REST_PASSWORD", "")
 
-AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
+AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN = os.environ.get("AWS_SESSION_TOKEN", "")
@@ -85,27 +85,42 @@ MAX_ROWS_TO_EXTRACT_FROM_DATASETS = int(os.environ.get("MAX_ROWS_TO_EXTRACT_FROM
 BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "2000"))
 BRONZE_ROWS_PER_PARTITION = int(os.environ.get("BRONZE_ROWS_PER_PARTITION", "25000"))
 
-ICEBERG_TARGET_FILE_SIZE_BYTES = os.environ.get("ICEBERG_TARGET_FILE_SIZE_BYTES", "268435456")
+ICEBERG_TARGET_FILE_SIZE_BYTES = "268435456"
 
-# Conservative Spark defaults to reduce memory pressure in the Spark driver/executor pods.
-SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark")
-SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "2g")
-SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "2g")
-SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "512m")
-SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "512m")
-SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
-SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
-SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
-SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
-SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
-SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "256m")
+K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
+ELT_PROFILE = os.environ.get(
+    "ELT_PROFILE",
+    "dev" if K8S_CLUSTER in {"kind", "minikube", "k3s", "local"} else "prod",
+).strip().lower()
 
-PARQUET_COMPRESSION = os.environ.get("PARQUET_COMPRESSION", "snappy")
-
-ICEBERG_EXPIRE_DAYS = int(os.environ.get("ICEBERG_EXPIRE_DAYS", "7"))
-ICEBERG_ORPHAN_DAYS = int(os.environ.get("ICEBERG_ORPHAN_DAYS", "3"))
-ICEBERG_RETAIN_LAST = int(os.environ.get("ICEBERG_RETAIN_LAST", "3"))
-MAINTENANCE_REWRITE_DAYS = int(os.environ.get("MAINTENANCE_REWRITE_DAYS", "30"))
+if ELT_PROFILE == "prod":
+    TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
+    SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark")
+    SPARK_DRIVER_MEMORY = "1g"
+    SPARK_EXECUTOR_MEMORY = "1g"
+    SPARK_DRIVER_MEMORY_OVERHEAD = "256m"
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = "256m"
+    SPARK_EXECUTOR_CORES = "1"
+    SPARK_EXECUTOR_INSTANCES = "1"
+    SPARK_DRIVER_CORES = "1"
+    SPARK_SHUFFLE_PARTITIONS = "8"
+    SPARK_MAX_PARTITION_BYTES = "134217728"
+    SPARK_MAX_RESULT_SIZE = "256m"
+    TASK_RETRIES = 1
+else:
+    TASK_LIMITS = Resources(cpu="500m", mem="512Mi")
+    SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark")
+    SPARK_DRIVER_MEMORY = "768m"
+    SPARK_EXECUTOR_MEMORY = "512m"
+    SPARK_DRIVER_MEMORY_OVERHEAD = "256m"
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = "256m"
+    SPARK_EXECUTOR_CORES = "1"
+    SPARK_EXECUTOR_INSTANCES = "1"
+    SPARK_DRIVER_CORES = "1"
+    SPARK_SHUFFLE_PARTITIONS = "4"
+    SPARK_MAX_PARTITION_BYTES = "67108864"
+    SPARK_MAX_RESULT_SIZE = "128m"
+    TASK_RETRIES = 1
 
 ALLOW_LOCAL_SPARK_FALLBACK = os.environ.get("FLYTE_ALLOW_LOCAL_SPARK_FALLBACK", "false").lower() in (
     "1",
@@ -115,10 +130,7 @@ ALLOW_LOCAL_SPARK_FALLBACK = os.environ.get("FLYTE_ALLOW_LOCAL_SPARK_FALLBACK", 
     "on",
 )
 
-TASK_IMAGE = os.environ.get(
-    "ELT_TASK_IMAGE",
-    "ghcr.io/athithya-sakthivel/flyte-elt-task:1.0.9",
-).strip()
+TASK_IMAGE = os.environ.get("ELT_TASK_IMAGE").strip()
 if not TASK_IMAGE:
     raise RuntimeError("ELT_TASK_IMAGE must be set before importing bronze_ingest.py")
 
@@ -221,6 +233,11 @@ def build_spark_conf() -> dict[str, str]:
         "spark.driver.maxResultSize": SPARK_MAX_RESULT_SIZE,
         "spark.kubernetes.authenticate.driver.serviceAccountName": SPARK_SERVICE_ACCOUNT,
         "spark.kubernetes.authenticate.executor.serviceAccountName": SPARK_SERVICE_ACCOUNT,
+        "spark.kubernetes.driver.limit.cores": SPARK_DRIVER_CORES,
+        "spark.kubernetes.executor.limit.cores": SPARK_EXECUTOR_CORES,
+        "spark.task.maxFailures": "4",
+        "spark.excludeOnFailure.enabled": "true",
+        "spark.excludeOnFailure.timeout": "5m",
     }
     if ICEBERG_REST_AUTH_TYPE:
         conf[f"spark.sql.catalog.{CATALOG_NAME}.rest.auth.type"] = ICEBERG_REST_AUTH_TYPE
@@ -234,6 +251,7 @@ def build_spark_conf() -> dict[str, str]:
 def build_hadoop_conf() -> dict[str, str]:
     conf = {
         "fs.s3a.endpoint.region": AWS_REGION,
+        "fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.DefaultAWSCredentialsProviderChain",
     }
     if S3_ENDPOINT:
         conf["fs.s3a.endpoint"] = S3_ENDPOINT
@@ -241,9 +259,6 @@ def build_hadoop_conf() -> dict[str, str]:
     else:
         conf["fs.s3a.path.style.access"] = "false"
 
-    # Prefer the ambient credential chain when workload identity / IRSA is in use.
-    # Only force static credentials when they are explicitly present and the pod is
-    # not already configured for web identity / role-based auth.
     has_web_identity = bool(os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE"))
     has_role_based_auth = bool(AWS_ROLE_ARN)
 
@@ -501,8 +516,8 @@ def write_replace_iceberg_table(df: DataFrame, table_id: str) -> str:
         executor_path="/opt/venv/bin/python",
     ),
     container_image=TASK_IMAGE,
-    retries=0,
-    limits=Resources(cpu="1000m", mem="3500M"),
+    retries=TASK_RETRIES,
+    limits=TASK_LIMITS,
 )
 def bronze_ingest() -> BronzeIngestResult:
     run_id = os.environ.get("RUN_ID") or os.environ.get("FLYTE_INTERNAL_EXECUTION_ID") or uuid.uuid4().hex
@@ -517,6 +532,8 @@ def bronze_ingest() -> BronzeIngestResult:
     log_json(
         msg="bronze_ingest_start",
         run_id=run_id,
+        profile=ELT_PROFILE,
+        k8s_cluster=K8S_CLUSTER,
         trips_source=trips_source_ref,
         taxi_zone_source=taxi_zone_source_ref,
         max_rows=MAX_ROWS_TO_EXTRACT_FROM_DATASETS,
