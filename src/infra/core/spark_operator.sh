@@ -1,31 +1,65 @@
 #!/usr/bin/env bash
-# Installs and manages the Spark Operator via Helm with strict version pinning and deterministic rollout behavior.
-# Configures webhook, metrics, and timeout settings based on K8S_CLUSTER to ensure consistent behavior across kind and cloud environments.
-# Performs CRD validation, deployment readiness checks, and emits full runtime state (pods, events, logs) for observability.
-# Flyte already validates and structures Spark jobs upstream, making Kubernetes admission webhook checks redundant in controlled workflows.
+# Installs and manages the Spark Operator for the ELT stack.
+# Goals:
+# - idempotent rollout and cleanup
+# - no fragile Helm --set encoding for list values
+# - explicit webhook
+# - namespace bootstrap with quota and RBAC
+# - target-namespace-only Spark Operator access
+# - focused diagnostics on failure
 
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-K8S_CLUSTER="${K8S_CLUSTER:-kind}" # or cloud
+REPO_ROOT="$(git -C "${SCRIPT_DIR}/../.." rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
+
+K8S_CLUSTER="${K8S_CLUSTER:-kind}" # kind|eks
+
 HELM_RELEASE="${HELM_RELEASE:-spark-operator}"
 HELM_REPO="${HELM_REPO:-spark-operator}"
 HELM_REPO_URL="${HELM_REPO_URL:-https://kubeflow.github.io/spark-operator}"
 HELM_CHART="${HELM_CHART:-spark-operator/spark-operator}"
-HELM_VERSION="${HELM_VERSION:-1.4.0}"
+HELM_VERSION="${HELM_VERSION:-2.5.0}"
 NAMESPACE="${NAMESPACE:-spark-operator}"
-SPARK_JOB_NAMESPACES="${SPARK_JOB_NAMESPACES:-}"
-SPARK_JOB_NAMESPACE_SELECTOR="${SPARK_JOB_NAMESPACE_SELECTOR:-}"
+
+REMOTE_PROJECT="${REMOTE_PROJECT:-flytesnacks}"
+REMOTE_DOMAIN="${REMOTE_DOMAIN:-development}"
+TASK_NAMESPACE="${TASK_NAMESPACE:-${REMOTE_PROJECT}-${REMOTE_DOMAIN}}"
+
+# Default to the ELT namespace only.
+# If set to wildcard, we still bootstrap the ELT namespace only to avoid accidental
+# cluster-wide drift.
+SPARK_JOB_NAMESPACES_RAW="${SPARK_JOB_NAMESPACES:-${TASK_NAMESPACE}}"
+
+SPARK_APP_SERVICE_ACCOUNT="${SPARK_APP_SERVICE_ACCOUNT:-spark}"
+SPARK_OPERATOR_SERVICE_ACCOUNT="${SPARK_OPERATOR_SERVICE_ACCOUNT:-spark-operator-controller}"
+
+ENABLE_WEBHOOK_KIND="${ENABLE_WEBHOOK_KIND:-true}"
+ENABLE_WEBHOOK_EKS="${ENABLE_WEBHOOK_EKS:-true}"
+
 ENABLE_METRICS_KIND="${ENABLE_METRICS_KIND:-false}"
-ENABLE_METRICS_CLOUD="${ENABLE_METRICS_CLOUD:-true}"
+ENABLE_METRICS_EKS="${ENABLE_METRICS_EKS:-true}"
 
 TIMEOUT_KIND="${TIMEOUT_KIND:-600}"
-TIMEOUT_CLOUD="${TIMEOUT_CLOUD:-900}"
+TIMEOUT_EKS="${TIMEOUT_EKS:-900}"
+
+RESOURCE_QUOTA_NAME="${RESOURCE_QUOTA_NAME:-spark-workload-quota}"
+RESOURCE_QUOTA_KIND_REQUESTS_CPU="${RESOURCE_QUOTA_KIND_REQUESTS_CPU:-2}"
+RESOURCE_QUOTA_KIND_REQUESTS_MEMORY="${RESOURCE_QUOTA_KIND_REQUESTS_MEMORY:-1536Mi}"
+RESOURCE_QUOTA_KIND_LIMITS_CPU="${RESOURCE_QUOTA_KIND_LIMITS_CPU:-4}"
+RESOURCE_QUOTA_KIND_LIMITS_MEMORY="${RESOURCE_QUOTA_KIND_LIMITS_MEMORY:-3000Mi}"
+RESOURCE_QUOTA_KIND_PODS="${RESOURCE_QUOTA_KIND_PODS:-20}"
+
+RESOURCE_QUOTA_EKS_REQUESTS_CPU="${RESOURCE_QUOTA_EKS_REQUESTS_CPU:-8}"
+RESOURCE_QUOTA_EKS_REQUESTS_MEMORY="${RESOURCE_QUOTA_EKS_REQUESTS_MEMORY:-16Gi}"
+RESOURCE_QUOTA_EKS_LIMITS_CPU="${RESOURCE_QUOTA_EKS_LIMITS_CPU:-16}"
+RESOURCE_QUOTA_EKS_LIMITS_MEMORY="${RESOURCE_QUOTA_EKS_LIMITS_MEMORY:-32Gi}"
+RESOURCE_QUOTA_EKS_PODS="${RESOURCE_QUOTA_EKS_PODS:-100}"
+
 CRD_SPARK_APPLICATIONS="${CRD_SPARK_APPLICATIONS:-sparkapplications.sparkoperator.k8s.io}"
 CRD_SCHEDULED_SPARK_APPLICATIONS="${CRD_SCHEDULED_SPARK_APPLICATIONS:-scheduledsparkapplications.sparkoperator.k8s.io}"
-
-ENABLE_WEBHOOK_KIND="${ENABLE_WEBHOOK_KIND:-false}"
-ENABLE_WEBHOOK_CLOUD="${ENABLE_WEBHOOK_CLOUD:-false}"
+CRD_SPARK_CONNECTS="${CRD_SPARK_CONNECTS:-sparkconnects.sparkoperator.k8s.io}"
 
 log() { printf '[%s] [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${K8S_CLUSTER}" "$*" >&2; }
 fatal() { printf '[%s] [%s] [FATAL] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${K8S_CLUSTER}" "$*" >&2; exit 1; }
@@ -33,8 +67,8 @@ require_bin() { command -v "$1" >/dev/null 2>&1 || fatal "$1 not found in PATH";
 
 validate_cluster() {
   case "${K8S_CLUSTER}" in
-    kind|cloud) ;;
-    *) fatal "K8S_CLUSTER must be kind or cloud" ;;
+    kind|eks) ;;
+    *) fatal "K8S_CLUSTER must be kind or eks" ;;
   esac
 }
 
@@ -42,7 +76,7 @@ cluster_timeout() {
   if [[ "${K8S_CLUSTER}" == "kind" ]]; then
     printf '%s' "${TIMEOUT_KIND}"
   else
-    printf '%s' "${TIMEOUT_CLOUD}"
+    printf '%s' "${TIMEOUT_EKS}"
   fi
 }
 
@@ -50,7 +84,7 @@ cluster_enable_webhook() {
   if [[ "${K8S_CLUSTER}" == "kind" ]]; then
     printf '%s' "${ENABLE_WEBHOOK_KIND}"
   else
-    printf '%s' "${ENABLE_WEBHOOK_CLOUD}"
+    printf '%s' "${ENABLE_WEBHOOK_EKS}"
   fi
 }
 
@@ -58,7 +92,7 @@ cluster_enable_metrics() {
   if [[ "${K8S_CLUSTER}" == "kind" ]]; then
     printf '%s' "${ENABLE_METRICS_KIND}"
   else
-    printf '%s' "${ENABLE_METRICS_CLOUD}"
+    printf '%s' "${ENABLE_METRICS_EKS}"
   fi
 }
 
@@ -75,77 +109,265 @@ add_repo() {
   helm repo update >/dev/null
 }
 
-job_namespaces_json() {
-  local input="${SPARK_JOB_NAMESPACES}"
-  if [[ -z "${input}" ]]; then
-    return 1
-  fi
+ensure_namespace() {
+  kubectl get namespace "${TASK_NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${TASK_NAMESPACE}" >/dev/null
+}
 
-  if [[ "${input}" == "*" || "${input}" == "all" || "${input}" == "cluster-wide" ]]; then
-    printf '[""]'
+normalize_job_namespaces() {
+  local raw="${SPARK_JOB_NAMESPACES_RAW}"
+  if [[ -z "${raw}" || "${raw}" == "*" || "${raw}" == "all" || "${raw}" == "cluster-wide" ]]; then
+    printf '%s\n' "${TASK_NAMESPACE}"
     return 0
   fi
 
   local -a parts
-  IFS=',' read -r -a parts <<<"${input}"
-  local json='['
-  local sep=''
+  IFS=',' read -r -a parts <<<"${raw}"
+  local seen=""
   local ns
   for ns in "${parts[@]}"; do
-    json+="${sep}\"${ns}\""
-    sep=','
+    ns="$(printf '%s' "${ns}" | xargs)"
+    [[ -n "${ns}" ]] || continue
+    case ",${seen}," in
+      *,"${ns}",*) ;;
+      *) seen="${seen}${seen:+,}${ns}" ;;
+    esac
   done
-  json+=']'
-  printf '%s' "${json}"
+
+  if [[ -z "${seen}" ]]; then
+    printf '%s\n' "${TASK_NAMESPACE}"
+  else
+    printf '%s\n' "${seen}" | tr ',' '\n'
+  fi
 }
 
-build_helm_args() {
-  local -a args
-  args=(
-    upgrade
-    --install
-    "${HELM_RELEASE}"
-    "${HELM_CHART}"
-    --namespace
-    "${NAMESPACE}"
-    --create-namespace
-    --set
-    "hook.upgradeCrd=true"
-    --set
-    "webhook.enable=$(cluster_enable_webhook)"
-    --set
-    "prometheus.metrics.enable=$(cluster_enable_metrics)"
-    --set
-    "controller.leaderElection.enable=true"
-    --wait
-    --wait-for-jobs
-    --atomic
-    --timeout
-    "$(cluster_timeout)s"
-  )
+resource_quota_spec() {
+  if [[ "${K8S_CLUSTER}" == "kind" ]]; then
+    cat <<EOF
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ${RESOURCE_QUOTA_NAME}
+  namespace: ${TASK_NAMESPACE}
+spec:
+  hard:
+    requests.cpu: "${RESOURCE_QUOTA_KIND_REQUESTS_CPU}"
+    requests.memory: "${RESOURCE_QUOTA_KIND_REQUESTS_MEMORY}"
+    limits.cpu: "${RESOURCE_QUOTA_KIND_LIMITS_CPU}"
+    limits.memory: "${RESOURCE_QUOTA_KIND_LIMITS_MEMORY}"
+    pods: "${RESOURCE_QUOTA_KIND_PODS}"
+EOF
+  else
+    cat <<EOF
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ${RESOURCE_QUOTA_NAME}
+  namespace: ${TASK_NAMESPACE}
+spec:
+  hard:
+    requests.cpu: "${RESOURCE_QUOTA_EKS_REQUESTS_CPU}"
+    requests.memory: "${RESOURCE_QUOTA_EKS_REQUESTS_MEMORY}"
+    limits.cpu: "${RESOURCE_QUOTA_EKS_LIMITS_CPU}"
+    limits.memory: "${RESOURCE_QUOTA_EKS_LIMITS_MEMORY}"
+    pods: "${RESOURCE_QUOTA_EKS_PODS}"
+EOF
+  fi
+}
 
-  if [[ -n "${SPARK_JOB_NAMESPACE_SELECTOR}" ]]; then
-    args+=(--set "spark.jobNamespaceSelector=${SPARK_JOB_NAMESPACE_SELECTOR}")
+bootstrap_target_namespace() {
+  log "bootstrapping ELT namespace RBAC and quota for ${TASK_NAMESPACE}"
+  ensure_namespace
+
+  kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${SPARK_APP_SERVICE_ACCOUNT}
+  namespace: ${TASK_NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${SPARK_APP_SERVICE_ACCOUNT}
+  namespace: ${TASK_NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - configmaps
+      - events
+      - secrets
+      - serviceaccounts
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources:
+      - sparkapplications
+      - sparkapplications/status
+      - sparkapplications/finalizers
+      - scheduledsparkapplications
+      - scheduledsparkapplications/status
+      - scheduledsparkapplications/finalizers
+      - sparkconnects
+      - sparkconnects/status
+      - sparkconnects/finalizers
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${SPARK_APP_SERVICE_ACCOUNT}
+  namespace: ${TASK_NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: ${SPARK_APP_SERVICE_ACCOUNT}
+    namespace: ${TASK_NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ${SPARK_APP_SERVICE_ACCOUNT}
+EOF
+
+  kubectl apply -f - <<EOF
+$(resource_quota_spec)
+EOF
+
+  if ! kubectl auth can-i create pods -n "${TASK_NAMESPACE}" \
+      --as="system:serviceaccount:${TASK_NAMESPACE}:${SPARK_APP_SERVICE_ACCOUNT}" >/dev/null 2>&1; then
+    fatal "service account ${SPARK_APP_SERVICE_ACCOUNT} cannot create pods in ${TASK_NAMESPACE}"
   fi
 
-  if json_value="$(job_namespaces_json)"; then
-    args+=(--set-json "spark.jobNamespaces=${json_value}")
+  log "ELT namespace RBAC and quota verified for ${TASK_NAMESPACE}"
+}
+
+bootstrap_operator_access_rbac() {
+  log "bootstrapping Spark Operator controller access for ${TASK_NAMESPACE}"
+
+  kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${HELM_RELEASE}-target-access
+  namespace: ${TASK_NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - configmaps
+      - events
+      - secrets
+      - serviceaccounts
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources:
+      - sparkapplications
+      - sparkapplications/status
+      - sparkapplications/finalizers
+      - scheduledsparkapplications
+      - scheduledsparkapplications/status
+      - scheduledsparkapplications/finalizers
+      - sparkconnects
+      - sparkconnects/status
+      - sparkconnects/finalizers
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${HELM_RELEASE}-target-access
+  namespace: ${TASK_NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: ${SPARK_OPERATOR_SERVICE_ACCOUNT}
+    namespace: ${NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ${HELM_RELEASE}-target-access
+EOF
+
+  if ! kubectl auth can-i list pods -n "${TASK_NAMESPACE}" \
+      --as="system:serviceaccount:${NAMESPACE}:${SPARK_OPERATOR_SERVICE_ACCOUNT}" >/dev/null 2>&1; then
+    fatal "operator service account ${SPARK_OPERATOR_SERVICE_ACCOUNT} cannot list pods in ${TASK_NAMESPACE}"
   fi
 
-  if [[ -n "${HELM_VERSION}" ]]; then
-    args+=(--version "${HELM_VERSION}")
+  if ! kubectl auth can-i list services -n "${TASK_NAMESPACE}" \
+      --as="system:serviceaccount:${NAMESPACE}:${SPARK_OPERATOR_SERVICE_ACCOUNT}" >/dev/null 2>&1; then
+    fatal "operator service account ${SPARK_OPERATOR_SERVICE_ACCOUNT} cannot list services in ${TASK_NAMESPACE}"
   fi
 
-  printf '%s\n' "${args[@]}"
+  if ! kubectl auth can-i list configmaps -n "${TASK_NAMESPACE}" \
+      --as="system:serviceaccount:${NAMESPACE}:${SPARK_OPERATOR_SERVICE_ACCOUNT}" >/dev/null 2>&1; then
+    fatal "operator service account ${SPARK_OPERATOR_SERVICE_ACCOUNT} cannot list configmaps in ${TASK_NAMESPACE}"
+  fi
+
+  if ! kubectl auth can-i list sparkconnects.sparkoperator.k8s.io -n "${TASK_NAMESPACE}" \
+      --as="system:serviceaccount:${NAMESPACE}:${SPARK_OPERATOR_SERVICE_ACCOUNT}" >/dev/null 2>&1; then
+    fatal "operator service account ${SPARK_OPERATOR_SERVICE_ACCOUNT} cannot list sparkconnects in ${TASK_NAMESPACE}"
+  fi
+
+  log "Spark Operator controller access verified for ${TASK_NAMESPACE}"
+}
+
+write_helm_values_file() {
+  local values_file="$1"
+  local -a namespaces=()
+  local ns
+
+  mapfile -t namespaces < <(normalize_job_namespaces)
+
+  {
+    cat <<EOF
+hook:
+  upgradeCrd: true
+
+webhook:
+  enable: $(cluster_enable_webhook)
+
+metrics:
+  enable: $(cluster_enable_metrics)
+
+controller:
+  replicas: 1
+  leaderElection:
+    enable: true
+  serviceAccount:
+    create: true
+  rbac:
+    create: true
+
+spark:
+  serviceAccount:
+    create: false
+    name: ${SPARK_APP_SERVICE_ACCOUNT}
+  rbac:
+    create: false
+  jobNamespaces:
+EOF
+
+    for ns in "${namespaces[@]}"; do
+      printf '    - "%s"\n' "${ns}"
+    done
+  } >"${values_file}"
 }
 
 find_deployments() {
-  kubectl -n "${NAMESPACE}" get deploy -l "app.kubernetes.io/instance=${HELM_RELEASE}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+  kubectl -n "${NAMESPACE}" get deploy \
+    -l "app.kubernetes.io/instance=${HELM_RELEASE}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
 }
 
 dump_diagnostics() {
   require_bin kubectl
   require_bin helm
+
+  log "=== HELM STATUS ==="
+  helm status "${HELM_RELEASE}" -n "${NAMESPACE}" || true
 
   log "=== NAMESPACE PODS ==="
   kubectl -n "${NAMESPACE}" get pods -o wide || true
@@ -153,14 +375,16 @@ dump_diagnostics() {
   log "=== NAMESPACE SERVICES ==="
   kubectl -n "${NAMESPACE}" get svc -o wide || true
 
-  log "=== NAMESPACE EVENTS ==="
-  kubectl -n "${NAMESPACE}" get events --sort-by=.lastTimestamp || true
+  log "=== SPARK APPLICATIONS (ALL NAMESPACES) ==="
+  kubectl get sparkapplications -A -o wide || true
 
   log "=== CRDs ==="
-  kubectl get crd | grep -E 'sparkoperator|sparkapplications|scheduledsparkapplications' || true
+  kubectl get crd | grep -E 'sparkoperator|sparkapplications|scheduledsparkapplications|sparkconnects' || true
 
-  log "=== HELM STATUS ==="
-  helm status "${HELM_RELEASE}" -n "${NAMESPACE}" || true
+  log "=== FILTERED EVENTS ==="
+  kubectl -n "${NAMESPACE}" get events --sort-by=.lastTimestamp \
+    | grep -E 'Warning|Failed|BackOff|ErrImagePull|ImagePullBackOff|CrashLoopBackOff|OOMKilled|FailedMount|Unavailable|ProgressDeadlineExceeded' \
+    | tail -n 120 || true
 
   local deploy_name
   while IFS= read -r deploy_name; do
@@ -168,7 +392,7 @@ dump_diagnostics() {
     log "=== DEPLOYMENT ${deploy_name} ==="
     kubectl -n "${NAMESPACE}" describe deployment "${deploy_name}" || true
     log "=== LOGS ${deploy_name} ==="
-    kubectl -n "${NAMESPACE}" logs deployment/"${deploy_name}" --tail=300 || true
+    kubectl -n "${NAMESPACE}" logs deployment/"${deploy_name}" --tail=200 || true
   done < <(find_deployments)
 }
 
@@ -183,12 +407,14 @@ on_error() {
 wait_for_deployments() {
   local deploy_name
   local found=0
+
   while IFS= read -r deploy_name; do
     [[ -n "${deploy_name}" ]] || continue
     found=1
     log "waiting for deployment ${deploy_name}"
     kubectl -n "${NAMESPACE}" rollout status "deployment/${deploy_name}" --timeout="$(cluster_timeout)s" >/dev/null
   done < <(find_deployments)
+
   [[ "${found}" -eq 1 ]] || fatal "operator deployment not found in namespace ${NAMESPACE}"
 }
 
@@ -198,16 +424,40 @@ install_operator() {
   add_repo
   trap 'on_error $? $LINENO' ERR
 
+  bootstrap_target_namespace
+  bootstrap_operator_access_rbac
+
+  local values_file
+  values_file="$(mktemp "/tmp/${HELM_RELEASE}.values.XXXXXX.yaml")"
+
+  write_helm_values_file "${values_file}"
+
   log "installing Spark Operator release=${HELM_RELEASE} namespace=${NAMESPACE} chart=${HELM_CHART} version=${HELM_VERSION}"
-  mapfile -t helm_args < <(build_helm_args)
-  helm "${helm_args[@]}"
+  helm upgrade --install \
+    "${HELM_RELEASE}" \
+    "${HELM_CHART}" \
+    --namespace "${NAMESPACE}" \
+    --create-namespace \
+    --version "${HELM_VERSION}" \
+    --wait \
+    --wait-for-jobs \
+    --atomic \
+    --timeout "$(cluster_timeout)s" \
+    -f "${values_file}"
+
+  rm -f "${values_file}"
 
   log "verifying CRDs"
-  for crd in "${CRD_SPARK_APPLICATIONS}" "${CRD_SCHEDULED_SPARK_APPLICATIONS}"; do
+  for crd in "${CRD_SPARK_APPLICATIONS}" "${CRD_SCHEDULED_SPARK_APPLICATIONS}" "${CRD_SPARK_CONNECTS}"; do
     kubectl get crd "${crd}" >/dev/null 2>&1 || fatal "CRD ${crd} not found after install"
   done
 
   wait_for_deployments
+
+  if ! kubectl auth can-i list pods -n "${TASK_NAMESPACE}" \
+      --as="system:serviceaccount:${NAMESPACE}:${SPARK_OPERATOR_SERVICE_ACCOUNT}" >/dev/null 2>&1; then
+    fatal "operator access check failed after rollout"
+  fi
 }
 
 rollout() {
@@ -215,7 +465,7 @@ rollout() {
   install_operator
   log "rollout success"
   log "cluster=${K8S_CLUSTER} namespace=${NAMESPACE} release=${HELM_RELEASE} chart=${HELM_CHART} version=${HELM_VERSION}"
-  log "webhook_enabled=$(cluster_enable_webhook) metrics_enabled=$(cluster_enable_metrics) spark_job_namespaces=${SPARK_JOB_NAMESPACES:-default}"
+  log "webhook_enabled=$(cluster_enable_webhook) metrics_enabled=$(cluster_enable_metrics) spark_job_namespaces=${SPARK_JOB_NAMESPACES_RAW}"
 }
 
 cleanup() {
@@ -242,18 +492,26 @@ case "${1:-}" in
 Usage: $0 [OPTION]
 
 Environment variables:
-  K8S_CLUSTER                 kind|cloud (default: kind)
-  HELM_RELEASE                Helm release name (default: spark-operator)
-  NAMESPACE                   Operator namespace (default: spark-operator)
-  SPARK_JOB_NAMESPACES        Comma-separated namespaces; use all|*|cluster-wide for cluster-wide
-  SPARK_JOB_NAMESPACE_SELECTOR  Label selector for watched namespaces
-  HELM_VERSION                Helm chart version pin (default: 1.4.0)
-  ENABLE_WEBHOOK_KIND         kind default for webhook.enable (default: false)
-  ENABLE_WEBHOOK_CLOUD        cloud default for webhook.enable (default: true)
-  ENABLE_METRICS_KIND         kind default for prometheus.metrics.enable (default: false)
-  ENABLE_METRICS_CLOUD        cloud default for prometheus.metrics.enable (default: true)
-  TIMEOUT_KIND                kind timeout seconds (default: 600)
-  TIMEOUT_CLOUD               cloud timeout seconds (default: 900)
+  K8S_CLUSTER                     kind|eks (default: kind)
+  HELM_RELEASE                    Helm release name (default: spark-operator)
+  NAMESPACE                       Operator namespace (default: spark-operator)
+  HELM_REPO                       Helm repo name (default: spark-operator)
+  HELM_REPO_URL                   Helm repo URL (default: https://kubeflow.github.io/spark-operator)
+  HELM_CHART                      Helm chart ref (default: spark-operator/spark-operator)
+  HELM_VERSION                    Helm chart pin (default: 2.5.0)
+  REMOTE_PROJECT                  Used only to derive default TASK_NAMESPACE
+  REMOTE_DOMAIN                   Used only to derive default TASK_NAMESPACE
+  TASK_NAMESPACE                  Default Spark job namespace (default: ${REMOTE_PROJECT}-${REMOTE_DOMAIN})
+  SPARK_JOB_NAMESPACES            Comma-separated namespaces; wildcard defaults to TASK_NAMESPACE
+  SPARK_APP_SERVICE_ACCOUNT       Spark app service account name (default: spark)
+  SPARK_OPERATOR_SERVICE_ACCOUNT  Spark Operator controller SA (default: spark-operator-controller)
+  ENABLE_WEBHOOK_KIND             kind default for webhook.enable (default: true)
+  ENABLE_WEBHOOK_EKS              eks default for webhook.enable (default: true)
+  ENABLE_METRICS_KIND             kind default for metrics.enable (default: false)
+  ENABLE_METRICS_EKS              eks default for metrics.enable (default: true)
+  TIMEOUT_KIND                    kind timeout seconds (default: 600)
+  TIMEOUT_EKS                     eks timeout seconds (default: 900)
+  RESOURCE_QUOTA_NAME             ResourceQuota name (default: spark-workload-quota)
 
 Options:
   --rollout    Install or upgrade Spark Operator

@@ -85,7 +85,11 @@ MAX_ROWS_TO_EXTRACT_FROM_DATASETS = int(os.environ.get("MAX_ROWS_TO_EXTRACT_FROM
 BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "2000"))
 BRONZE_ROWS_PER_PARTITION = int(os.environ.get("BRONZE_ROWS_PER_PARTITION", "25000"))
 
-ICEBERG_TARGET_FILE_SIZE_BYTES = "268435456"
+ICEBERG_TARGET_FILE_SIZE_BYTES = os.environ.get("ICEBERG_TARGET_FILE_SIZE_BYTES", "268435456")
+
+ICEBERG_EXPIRE_DAYS = int(os.environ.get("ICEBERG_EXPIRE_DAYS", "7"))
+ICEBERG_ORPHAN_DAYS = int(os.environ.get("ICEBERG_ORPHAN_DAYS", "7"))
+ICEBERG_RETAIN_LAST = int(os.environ.get("ICEBERG_RETAIN_LAST", "1"))
 
 K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
 ELT_PROFILE = os.environ.get(
@@ -93,46 +97,48 @@ ELT_PROFILE = os.environ.get(
     "dev" if K8S_CLUSTER in {"kind", "minikube", "k3s", "local"} else "prod",
 ).strip().lower()
 
-if ELT_PROFILE == "prod":
-    TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
-    SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark")
-    SPARK_DRIVER_MEMORY = "1g"
-    SPARK_EXECUTOR_MEMORY = "1g"
-    SPARK_DRIVER_MEMORY_OVERHEAD = "256m"
-    SPARK_EXECUTOR_MEMORY_OVERHEAD = "256m"
-    SPARK_EXECUTOR_CORES = "1"
-    SPARK_EXECUTOR_INSTANCES = "1"
-    SPARK_DRIVER_CORES = "1"
-    SPARK_SHUFFLE_PARTITIONS = "8"
-    SPARK_MAX_PARTITION_BYTES = "134217728"
-    SPARK_MAX_RESULT_SIZE = "256m"
-    TASK_RETRIES = 1
-else:
-    TASK_LIMITS = Resources(cpu="500m", mem="512Mi")
-    SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark")
-    SPARK_DRIVER_MEMORY = "768m"
-    SPARK_EXECUTOR_MEMORY = "512m"
-    SPARK_DRIVER_MEMORY_OVERHEAD = "256m"
-    SPARK_EXECUTOR_MEMORY_OVERHEAD = "256m"
-    SPARK_EXECUTOR_CORES = "1"
-    SPARK_EXECUTOR_INSTANCES = "1"
-    SPARK_DRIVER_CORES = "1"
-    SPARK_SHUFFLE_PARTITIONS = "4"
-    SPARK_MAX_PARTITION_BYTES = "67108864"
-    SPARK_MAX_RESULT_SIZE = "128m"
-    TASK_RETRIES = 1
-
-ALLOW_LOCAL_SPARK_FALLBACK = os.environ.get("FLYTE_ALLOW_LOCAL_SPARK_FALLBACK", "false").lower() in (
+SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark")
+ALLOW_LOCAL_SPARK_FALLBACK = os.environ.get("FLYTE_ALLOW_LOCAL_SPARK_FALLBACK", "false").lower() in {
     "1",
     "true",
     "yes",
     "y",
     "on",
-)
+}
 
-TASK_IMAGE = os.environ.get("ELT_TASK_IMAGE").strip()
+TASK_IMAGE = os.environ.get(
+    "ELT_TASK_IMAGE",
+    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-03-27-09-56--e4e99ab",
+).strip()
 if not TASK_IMAGE:
     raise RuntimeError("ELT_TASK_IMAGE must be set before importing bronze_ingest.py")
+
+if ELT_PROFILE == "prod":
+    TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
+    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
+    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
+    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
+    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
+    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
+    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8")
+    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
+    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "256m")
+    TASK_RETRIES = int(os.environ.get("BRONZE_TASK_RETRIES", "1"))
+else:
+    TASK_LIMITS = Resources(cpu="500m", mem="512Mi")
+    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "768m")
+    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "512m")
+    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
+    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
+    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
+    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
+    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "67108864")
+    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "128m")
+    TASK_RETRIES = int(os.environ.get("BRONZE_TASK_RETRIES", "0"))
 
 
 @dataclass(frozen=True)
@@ -148,7 +154,7 @@ class BronzeIngestResult:
     taxi_zone_write_mode: str
 
 
-def log_json(**payload) -> None:
+def log_json(**payload: Any) -> None:
     LOG.info(json.dumps(payload, default=str, sort_keys=True))
 
 

@@ -1,50 +1,27 @@
 name: full_repo_security_scan
 
 on:
-  # Run on every push to any branch.
-  # This is the primary path: every new commit gets checked immediately.
   push:
     branches:
       - "**"
-
-  # Run once per day as a safety net.
-  # This catches cases such as workflow skips, transient failures, or newly added rules
-  # that may start flagging older code later.
   schedule:
     - cron: "0 2 * * *"
-
-  # Allow manual execution from the Actions UI.
   workflow_dispatch:
 
 permissions:
-  # Read-only access is enough for checkout plus all scans in this workflow.
   contents: read
 
 concurrency:
-  # Prevent duplicate scans for the same ref from running at the same time.
-  # If a new run starts for the same branch, cancel the older in-progress run.
   group: full-repo-security-scan-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
   run:
-    # Keep shell behavior consistent across all script steps.
     shell: bash
 
 env:
-  # Force JavaScript-based GitHub Actions to use Node 24.
-  # This avoids the Node 20 deprecation path on GitHub-hosted runners.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
-  # Single pinned container image containing:
-  # - Trivy 0.69.3
-  # - Gitleaks 8.30.1
-  # - OpenGrep 1.16.5
-  # The digest pin makes the runtime deterministic and safe.
   SCANNER_IMAGE: ghcr.io/athithya-sakthivel/trivy-0.69.3-gitleaks-8.30.1-opengrep-1.16.5@sha256:2d19bd7b418692a20ae57b24620da3af648878a66d582022c0721512fff1b5e2
-
-  # Centralized Trivy severity threshold.
-  # Changing it here updates the policy for the whole workflow.
   TRIVY_SEVERITY: HIGH,CRITICAL
 
 jobs:
@@ -57,77 +34,39 @@ jobs:
       - name: Check out repository with full history
         uses: actions/checkout@v5
         with:
-          # Required for Gitleaks full-history scanning.
-          # Without full history, Gitleaks cannot inspect all commits.
           fetch-depth: 0
-
-          # Avoid leaving reusable credentials in the workspace.
           persist-credentials: false
 
-      - name: Prepare cache directories
+      - name: Prepare writable cache directories
         run: |
-          # Create writable cache directories before mounting them into the container.
-          # The container runs as a non-root user, so these locations must be writable.
-          install -d -m 0777 "$HOME/.cache/trivy"
-          install -d -m 0777 "$HOME/.cache/opengrep"
-
-      - name: Restore Trivy cache
-        uses: actions/cache@v5
-        with:
-          # Trivy cache stores vulnerability database and supporting metadata.
-          path: ~/.cache/trivy
-
-          # Stable cache key by OS.
-          # restore-keys allows partial reuse if the exact key is unavailable.
-          key: trivy-db-${{ runner.os }}
-          restore-keys: |
-            trivy-db-${{ runner.os }}-
-
-      - name: Restore OpenGrep cache
-        uses: actions/cache@v5
-        with:
-          # OpenGrep uses this location for runtime/cache data.
-          path: ~/.cache/opengrep
-          key: opengrep-cache-${{ runner.os }}
-          restore-keys: |
-            opengrep-cache-${{ runner.os }}-
+          set -euo pipefail
+          install -d -m 0777 "$RUNNER_TEMP/trivy-cache"
+          install -d -m 0777 "$RUNNER_TEMP/opengrep-cache"
 
       - name: Run OpenGrep, Gitleaks, and Trivy
         env:
-          # OpenGrep emits Python dependency warnings from its embedded runtime.
-          # This suppresses warning noise without affecting scan results.
           PYTHONWARNINGS: ignore
+          TRIVY_CACHE_DIR: /home/appuser/.cache/trivy
         run: |
           set -euo pipefail
 
-          # Root of the checked-out repository on the GitHub runner.
           REPO_ROOT="$GITHUB_WORKSPACE"
-
-          # Repo-local OpenGrep rule file.
-          # This is used together with standard rule bundles.
           RULE_FILE="$REPO_ROOT/src/opengrep/mlops_sast_rules.yaml"
 
-          # Fail early if the custom rule file is missing or empty.
           if [[ ! -s "$RULE_FILE" ]]; then
             echo "::error::Missing or empty OpenGrep rules file: $RULE_FILE"
             exit 1
           fi
 
-          # Run all scanners inside a single pinned container image.
-          #
-          # --entrypoint /bin/sh is required because the image's default entrypoint is Trivy.
-          # We want a shell so we can run OpenGrep, Gitleaks, and Trivy sequentially.
-          #
-          # Host caches are mounted into the non-root container user home so each tool
-          # can write its cache data without permission errors.
           docker run --rm \
             -e HOME=/home/appuser \
             -e XDG_CACHE_HOME=/home/appuser/.cache \
             -e PYTHONWARNINGS=ignore \
             -e TRIVY_SEVERITY \
+            -e TRIVY_CACHE_DIR \
             -v "$REPO_ROOT:/workspace" \
-            -v "$HOME/.cache/trivy:/home/appuser/.cache/trivy" \
-            -v "$HOME/.cache/opengrep:/home/appuser/.cache/opengrep" \
+            -v "$RUNNER_TEMP/trivy-cache:/home/appuser/.cache/trivy" \
+            -v "$RUNNER_TEMP/opengrep-cache:/home/appuser/.cache/opengrep" \
             -w /workspace \
             --entrypoint /bin/sh \
             "$SCANNER_IMAGE" \
@@ -135,8 +74,6 @@ jobs:
               set -eu
 
               echo "=== OpenGrep SAST Scan ==="
-              # Standard SAST bundle configs plus the repo-local custom rules file.
-              # Each --config adds another rules source.
               opengrep scan \
                 --config p/owasp-top-ten \
                 --config p/python \
@@ -149,8 +86,6 @@ jobs:
                 .
 
               echo "=== Gitleaks Full History Scan ==="
-              # Scan every commit in repository history.
-              # If a repo-local Gitleaks config exists, use it; otherwise use defaults.
               if [ -s /workspace/.gitleaks.toml ]; then
                 gitleaks git \
                   --config /workspace/.gitleaks.toml \
@@ -167,13 +102,8 @@ jobs:
               fi
 
               echo "=== Trivy Filesystem Scan ==="
-              # Scan the repository working tree for:
-              # - vulnerabilities in dependencies
-              # - misconfigurations
-              # HIGH,CRITICAL is configured through TRIVY_SEVERITY.
-              # .git is skipped because Git metadata is not part of the deliverable.
-              # src/opengrep is skipped so the custom rules are not scanned as app code.
               trivy fs \
+                --cache-dir "$TRIVY_CACHE_DIR" \
                 --scanners vuln,misconfig \
                 --severity "$TRIVY_SEVERITY" \
                 --ignore-unfixed \
