@@ -48,10 +48,30 @@ ELT_PROFILE = os.environ.get(
 
 if ELT_PROFILE == "prod":
     TASK_LIMITS = Resources(cpu="1000m", mem="768Mi")
-    TASK_RETRIES = 1
+    TASK_RETRIES = int(os.environ.get("MAINTENANCE_TASK_RETRIES", "1"))
+    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
+    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
+    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
+    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
+    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
+    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
+    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
+    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "256m")
 else:
     TASK_LIMITS = Resources(cpu="500m", mem="512Mi")
-    TASK_RETRIES = 1
+    TASK_RETRIES = int(os.environ.get("MAINTENANCE_TASK_RETRIES", "1"))
+    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "768m")
+    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "512m")
+    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
+    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
+    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
+    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
+    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "67108864")
+    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "128m")
 
 DEFAULT_REWRITE_WHERE = "as_of_date >= date_sub(current_date(), 30)"
 
@@ -95,8 +115,6 @@ def utc_cutoff_string(days: int) -> str:
 
 
 def execute_sql_action(spark: SparkSession, statement: str) -> None:
-    # Spark SQL procedures often return rows; exhaust them without pulling
-    # the whole result to the driver.
     spark.sql(statement).rdd.foreachPartition(lambda _: None)
 
 
@@ -180,9 +198,24 @@ def default_rewrite_predicates() -> dict[str, str]:
     }
 
 
+def maintenance_spark_conf() -> dict[str, str]:
+    return build_spark_conf(
+        spark_driver_memory=SPARK_DRIVER_MEMORY,
+        spark_executor_memory=SPARK_EXECUTOR_MEMORY,
+        spark_driver_memory_overhead=SPARK_DRIVER_MEMORY_OVERHEAD,
+        spark_executor_memory_overhead=SPARK_EXECUTOR_MEMORY_OVERHEAD,
+        spark_executor_cores=SPARK_EXECUTOR_CORES,
+        spark_executor_instances=SPARK_EXECUTOR_INSTANCES,
+        spark_driver_cores=SPARK_DRIVER_CORES,
+        spark_shuffle_partitions=SPARK_SHUFFLE_PARTITIONS,
+        spark_max_partition_bytes=SPARK_MAX_PARTITION_BYTES,
+        spark_max_result_size=SPARK_MAX_RESULT_SIZE,
+    )
+
+
 @task(
     task_config=Spark(
-        spark_conf=build_spark_conf(),
+        spark_conf=maintenance_spark_conf(),
         hadoop_conf=build_hadoop_conf(),
         executor_path="/opt/venv/bin/python",
     ),

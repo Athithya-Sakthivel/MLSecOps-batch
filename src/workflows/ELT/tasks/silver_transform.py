@@ -15,12 +15,12 @@ from pyspark.sql.functions import broadcast
 
 from workflows.ELT.tasks.bronze_ingest import (
     CATALOG_NAME,
-    ICEBERG_TARGET_FILE_SIZE_BYTES,
     SILVER_NAMESPACE,
     SILVER_TRIPS_TABLE,
     TASK_IMAGE,
     BronzeIngestResult,
     build_hadoop_conf,
+    build_spark_conf,
     ensure_namespace,
     get_spark_session,
     log_json,
@@ -43,32 +43,32 @@ ELT_PROFILE = os.environ.get(
 
 if ELT_PROFILE == "prod":
     TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
-    SPARK_DRIVER_MEMORY = "2g"
-    SPARK_EXECUTOR_MEMORY = "2g"
-    SPARK_DRIVER_MEMORY_OVERHEAD = "512m"
-    SPARK_EXECUTOR_MEMORY_OVERHEAD = "512m"
-    SPARK_EXECUTOR_CORES = "1"
-    SPARK_EXECUTOR_INSTANCES = "1"
-    SPARK_DRIVER_CORES = "1"
-    SPARK_SHUFFLE_PARTITIONS = "8"
-    SPARK_MAX_PARTITION_BYTES = "134217728"
-    SPARK_MAX_RESULT_SIZE = "256m"
-    TASK_RETRIES = 1
+    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "2g")
+    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "2g")
+    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "512m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "512m")
+    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
+    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
+    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
+    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8")
+    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
+    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "256m")
+    TASK_RETRIES = int(os.environ.get("SILVER_TASK_RETRIES", "1"))
+    SILVER_ROWS_PER_PARTITION = int(os.environ.get("SILVER_ROWS_PER_PARTITION", "100000"))
 else:
     TASK_LIMITS = Resources(cpu="500m", mem="768Mi")
-    SPARK_DRIVER_MEMORY = "1g"
-    SPARK_EXECUTOR_MEMORY = "1g"
-    SPARK_DRIVER_MEMORY_OVERHEAD = "256m"
-    SPARK_EXECUTOR_MEMORY_OVERHEAD = "256m"
-    SPARK_EXECUTOR_CORES = "1"
-    SPARK_EXECUTOR_INSTANCES = "1"
-    SPARK_DRIVER_CORES = "1"
-    SPARK_SHUFFLE_PARTITIONS = "4"
-    SPARK_MAX_PARTITION_BYTES = "67108864"
-    SPARK_MAX_RESULT_SIZE = "128m"
-    TASK_RETRIES = 1
-
-SILVER_ROWS_PER_PARTITION = int(os.environ.get("SILVER_ROWS_PER_PARTITION", "50000"))
+    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
+    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
+    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
+    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
+    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
+    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
+    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "67108864")
+    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "128m")
+    TASK_RETRIES = int(os.environ.get("SILVER_TASK_RETRIES", "1"))
+    SILVER_ROWS_PER_PARTITION = int(os.environ.get("SILVER_ROWS_PER_PARTITION", "50000"))
 
 @dataclass(frozen=True)
 class SilverTransformResult:
@@ -185,7 +185,7 @@ def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_colu
         df.writeTo(table_id)
         .tableProperty("format-version", "2")
         .tableProperty("write.format.default", "parquet")
-        .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
+        .tableProperty("write.target-file-size-bytes", "268435456")
         .partitionedBy(F.col(partition_column))
         .create()
     )
@@ -361,49 +361,24 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
     )
 
 
+def silver_spark_conf() -> dict[str, str]:
+    return build_spark_conf(
+        spark_driver_memory=SPARK_DRIVER_MEMORY,
+        spark_executor_memory=SPARK_EXECUTOR_MEMORY,
+        spark_driver_memory_overhead=SPARK_DRIVER_MEMORY_OVERHEAD,
+        spark_executor_memory_overhead=SPARK_EXECUTOR_MEMORY_OVERHEAD,
+        spark_executor_cores=SPARK_EXECUTOR_CORES,
+        spark_executor_instances=SPARK_EXECUTOR_INSTANCES,
+        spark_driver_cores=SPARK_DRIVER_CORES,
+        spark_shuffle_partitions=SPARK_SHUFFLE_PARTITIONS,
+        spark_max_partition_bytes=SPARK_MAX_PARTITION_BYTES,
+        spark_max_result_size=SPARK_MAX_RESULT_SIZE,
+    )
+
+
 @task(
     task_config=Spark(
-        spark_conf={
-            f"spark.sql.catalog.{CATALOG_NAME}": "org.apache.iceberg.spark.SparkCatalog",
-            f"spark.sql.catalog.{CATALOG_NAME}.type": "rest",
-            f"spark.sql.catalog.{CATALOG_NAME}.uri": os.environ.get(
-                "ICEBERG_REST_URI",
-                "http://iceberg-rest.default.svc.cluster.local:9001/iceberg",
-            ),
-            f"spark.sql.catalog.{CATALOG_NAME}.warehouse": os.environ.get(
-                "ICEBERG_WAREHOUSE",
-                "s3://e2e-mlops-data-681802563986/iceberg/warehouse/",
-            ),
-            f"spark.sql.catalog.{CATALOG_NAME}.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
-            "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-            "spark.sql.shuffle.partitions": SPARK_SHUFFLE_PARTITIONS,
-            "spark.sql.files.maxPartitionBytes": SPARK_MAX_PARTITION_BYTES,
-            "spark.sql.adaptive.enabled": "true",
-            "spark.sql.adaptive.coalescePartitions.enabled": "true",
-            "spark.sql.session.timeZone": "UTC",
-            "spark.sql.sources.partitionOverwriteMode": "dynamic",
-            "spark.driver.memory": SPARK_DRIVER_MEMORY,
-            "spark.driver.memoryOverhead": SPARK_DRIVER_MEMORY_OVERHEAD,
-            "spark.executor.memory": SPARK_EXECUTOR_MEMORY,
-            "spark.executor.memoryOverhead": SPARK_EXECUTOR_MEMORY_OVERHEAD,
-            "spark.executor.cores": SPARK_EXECUTOR_CORES,
-            "spark.executor.instances": SPARK_EXECUTOR_INSTANCES,
-            "spark.driver.cores": SPARK_DRIVER_CORES,
-            "spark.driver.maxResultSize": SPARK_MAX_RESULT_SIZE,
-            "spark.kubernetes.authenticate.driver.serviceAccountName": os.environ.get(
-                "SPARK_SERVICE_ACCOUNT",
-                "spark",
-            ),
-            "spark.kubernetes.authenticate.executor.serviceAccountName": os.environ.get(
-                "SPARK_SERVICE_ACCOUNT",
-                "spark",
-            ),
-            "spark.kubernetes.driver.limit.cores": SPARK_DRIVER_CORES,
-            "spark.kubernetes.executor.limit.cores": SPARK_EXECUTOR_CORES,
-            "spark.task.maxFailures": "4",
-            "spark.excludeOnFailure.enabled": "true",
-            "spark.excludeOnFailure.timeout": "5m",
-        },
+        spark_conf=silver_spark_conf(),
         hadoop_conf=build_hadoop_conf(),
         executor_path="/opt/venv/bin/python",
     ),
@@ -437,7 +412,7 @@ def silver_transform(bronze: BronzeIngestResult) -> SilverTransformResult:
 
     canonical_df = build_canonical_frame(trips_df, zones_df, bronze.run_id)
 
-    target_partitions = max(1, math.ceil(max(bronze.trips_rows, 1) / 50000))
+    target_partitions = max(1, math.ceil(max(bronze.trips_rows, 1) / SILVER_ROWS_PER_PARTITION))
     canonical_df = canonical_df.repartition(target_partitions, F.col("pickup_date"))
 
     write_mode = write_partitioned_iceberg_table(

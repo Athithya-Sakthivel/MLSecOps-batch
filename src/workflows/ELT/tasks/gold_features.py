@@ -47,19 +47,39 @@ ELT_PROFILE = os.environ.get(
 
 FEATURE_VERSION = os.environ.get("GOLD_FEATURE_VERSION", "trip_eta_lgbm_v1")
 SCHEMA_VERSION = os.environ.get("GOLD_SCHEMA_VERSION", "trip_eta_frozen_matrix_v1")
-ROUTE_PAIR_BUCKETS = 4096
-ROUTE_PAIR_HASH_SALT = "trip_eta_route_pair_v1"
+ROUTE_PAIR_BUCKETS = int(os.environ.get("ROUTE_PAIR_BUCKETS", "4096"))
+ROUTE_PAIR_HASH_SALT = os.environ.get("ROUTE_PAIR_HASH_SALT", "trip_eta_route_pair_v1")
 MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "lightgbm")
 INFERENCE_RUNTIME = os.environ.get("INFERENCE_RUNTIME", "onnxruntime")
 
 if ELT_PROFILE == "prod":
     TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
-    GOLD_REPARTITIONS = 8
-    TASK_RETRIES = 1
+    GOLD_REPARTITIONS = int(os.environ.get("GOLD_REPARTITIONS", "8"))
+    TASK_RETRIES = int(os.environ.get("GOLD_TASK_RETRIES", "1"))
+    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "2g")
+    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "2g")
+    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "512m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "512m")
+    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
+    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
+    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
+    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8")
+    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
+    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "256m")
 else:
     TASK_LIMITS = Resources(cpu="500m", mem="768Mi")
-    GOLD_REPARTITIONS = 4
-    TASK_RETRIES = 1
+    GOLD_REPARTITIONS = int(os.environ.get("GOLD_REPARTITIONS", "4"))
+    TASK_RETRIES = int(os.environ.get("GOLD_TASK_RETRIES", "1"))
+    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
+    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
+    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
+    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
+    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
+    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
+    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "67108864")
+    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "128m")
 
 
 @dataclass(frozen=True)
@@ -224,184 +244,26 @@ def build_window_features(df: DataFrame) -> DataFrame:
 
 def build_feature_spec_rows(service_zone_values: list[str]) -> list[dict]:
     return [
-        {
-            "name": "trip_id",
-            "role": "metadata",
-            "dtype": "string",
-            "nullable": False,
-            "unit": "identifier",
-            "missing_policy": "required",
-        },
-        {
-            "name": "as_of_ts",
-            "role": "metadata",
-            "dtype": "timestamp",
-            "nullable": False,
-            "unit": "timestamp_utc",
-            "missing_policy": "required",
-        },
-        {
-            "name": "as_of_date",
-            "role": "metadata",
-            "dtype": "date",
-            "nullable": False,
-            "unit": "date_utc",
-            "missing_policy": "required",
-        },
-        {
-            "name": "schema_version",
-            "role": "metadata",
-            "dtype": "string",
-            "nullable": False,
-            "unit": "version_tag",
-            "missing_policy": "required",
-        },
-        {
-            "name": "feature_version",
-            "role": "metadata",
-            "dtype": "string",
-            "nullable": False,
-            "unit": "version_tag",
-            "missing_policy": "required",
-        },
-        {
-            "name": "pickup_hour",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "hour_0_23",
-            "missing_policy": "required",
-        },
-        {
-            "name": "pickup_dow",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "dayofweek_1_sun_7_sat",
-            "missing_policy": "required",
-        },
-        {
-            "name": "pickup_month",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "month_1_12",
-            "missing_policy": "required",
-        },
-        {
-            "name": "pickup_is_weekend",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "boolean_0_1",
-            "missing_policy": "required",
-        },
-        {
-            "name": "pickup_borough_id",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "categorical_id",
-            "missing_policy": "0_unknown",
-            "categorical_feature": True,
-            "domain": [0, 1, 2, 3, 4, 5, 6],
-        },
-        {
-            "name": "pickup_zone_id",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "taxi_zone_location_id",
-            "missing_policy": "0_unknown",
-            "categorical_feature": True,
-            "domain": "positive_location_ids_and_0_unknown",
-        },
-        {
-            "name": "pickup_service_zone_id",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "categorical_id",
-            "missing_policy": "0_unknown",
-            "categorical_feature": True,
-            "domain": [0] + list(range(1, len(service_zone_values) + 1)),
-        },
-        {
-            "name": "dropoff_borough_id",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "categorical_id",
-            "missing_policy": "0_unknown",
-            "categorical_feature": True,
-            "domain": [0, 1, 2, 3, 4, 5, 6],
-        },
-        {
-            "name": "dropoff_zone_id",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "taxi_zone_location_id",
-            "missing_policy": "0_unknown",
-            "categorical_feature": True,
-            "domain": "positive_location_ids_and_0_unknown",
-        },
-        {
-            "name": "dropoff_service_zone_id",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "categorical_id",
-            "missing_policy": "0_unknown",
-            "categorical_feature": True,
-            "domain": [0] + list(range(1, len(service_zone_values) + 1)),
-        },
-        {
-            "name": "route_pair_id",
-            "role": "feature",
-            "dtype": "int32",
-            "nullable": False,
-            "unit": "hashed_bucket",
-            "missing_policy": "0_unknown",
-            "categorical_feature": True,
-            "domain": [0] + list(range(1, ROUTE_PAIR_BUCKETS + 1)),
-            "hash_algorithm": "sha256",
-            "hash_salt": ROUTE_PAIR_HASH_SALT,
-            "bucket_count": ROUTE_PAIR_BUCKETS,
-        },
-        {
-            "name": "avg_duration_7d_zone_hour",
-            "role": "feature",
-            "dtype": "float64",
-            "nullable": True,
-            "unit": "seconds",
-            "missing_policy": "nan_on_cold_start",
-        },
-        {
-            "name": "avg_fare_30d_zone",
-            "role": "feature",
-            "dtype": "float64",
-            "nullable": True,
-            "unit": "currency_amount",
-            "missing_policy": "nan_on_cold_start",
-        },
-        {
-            "name": "trip_count_90d_zone_hour",
-            "role": "feature",
-            "dtype": "float64",
-            "nullable": False,
-            "unit": "count",
-            "missing_policy": "0_on_cold_start",
-        },
-        {
-            "name": "label_trip_duration_seconds",
-            "role": "label",
-            "dtype": "float64",
-            "nullable": False,
-            "unit": "seconds",
-            "missing_policy": "drop_row_if_null",
-            "target_metric": "mae",
-        },
+        {"name": "trip_id", "role": "metadata", "dtype": "string", "nullable": False, "unit": "identifier", "missing_policy": "required"},
+        {"name": "as_of_ts", "role": "metadata", "dtype": "timestamp", "nullable": False, "unit": "timestamp_utc", "missing_policy": "required"},
+        {"name": "as_of_date", "role": "metadata", "dtype": "date", "nullable": False, "unit": "date_utc", "missing_policy": "required"},
+        {"name": "schema_version", "role": "metadata", "dtype": "string", "nullable": False, "unit": "version_tag", "missing_policy": "required"},
+        {"name": "feature_version", "role": "metadata", "dtype": "string", "nullable": False, "unit": "version_tag", "missing_policy": "required"},
+        {"name": "pickup_hour", "role": "feature", "dtype": "int32", "nullable": False, "unit": "hour_0_23", "missing_policy": "required"},
+        {"name": "pickup_dow", "role": "feature", "dtype": "int32", "nullable": False, "unit": "dayofweek_1_sun_7_sat", "missing_policy": "required"},
+        {"name": "pickup_month", "role": "feature", "dtype": "int32", "nullable": False, "unit": "month_1_12", "missing_policy": "required"},
+        {"name": "pickup_is_weekend", "role": "feature", "dtype": "int32", "nullable": False, "unit": "boolean_0_1", "missing_policy": "required"},
+        {"name": "pickup_borough_id", "role": "feature", "dtype": "int32", "nullable": False, "unit": "categorical_id", "missing_policy": "0_unknown", "categorical_feature": True, "domain": [0, 1, 2, 3, 4, 5, 6]},
+        {"name": "pickup_zone_id", "role": "feature", "dtype": "int32", "nullable": False, "unit": "taxi_zone_location_id", "missing_policy": "0_unknown", "categorical_feature": True, "domain": "positive_location_ids_and_0_unknown"},
+        {"name": "pickup_service_zone_id", "role": "feature", "dtype": "int32", "nullable": False, "unit": "categorical_id", "missing_policy": "0_unknown", "categorical_feature": True, "domain": [0] + list(range(1, len(service_zone_values) + 1))},
+        {"name": "dropoff_borough_id", "role": "feature", "dtype": "int32", "nullable": False, "unit": "categorical_id", "missing_policy": "0_unknown", "categorical_feature": True, "domain": [0, 1, 2, 3, 4, 5, 6]},
+        {"name": "dropoff_zone_id", "role": "feature", "dtype": "int32", "nullable": False, "unit": "taxi_zone_location_id", "missing_policy": "0_unknown", "categorical_feature": True, "domain": "positive_location_ids_and_0_unknown"},
+        {"name": "dropoff_service_zone_id", "role": "feature", "dtype": "int32", "nullable": False, "unit": "categorical_id", "missing_policy": "0_unknown", "categorical_feature": True, "domain": [0] + list(range(1, len(service_zone_values) + 1))},
+        {"name": "route_pair_id", "role": "feature", "dtype": "int32", "nullable": False, "unit": "hashed_bucket", "missing_policy": "0_unknown", "categorical_feature": True, "domain": [0] + list(range(1, ROUTE_PAIR_BUCKETS + 1)), "hash_algorithm": "sha256", "hash_salt": ROUTE_PAIR_HASH_SALT, "bucket_count": ROUTE_PAIR_BUCKETS},
+        {"name": "avg_duration_7d_zone_hour", "role": "feature", "dtype": "float64", "nullable": True, "unit": "seconds", "missing_policy": "nan_on_cold_start"},
+        {"name": "avg_fare_30d_zone", "role": "feature", "dtype": "float64", "nullable": True, "unit": "currency_amount", "missing_policy": "nan_on_cold_start"},
+        {"name": "trip_count_90d_zone_hour", "role": "feature", "dtype": "float64", "nullable": False, "unit": "count", "missing_policy": "0_on_cold_start"},
+        {"name": "label_trip_duration_seconds", "role": "label", "dtype": "float64", "nullable": False, "unit": "seconds", "missing_policy": "drop_row_if_null", "target_metric": "mae"},
     ]
 
 
@@ -703,9 +565,24 @@ def build_training_matrix(silver_df: DataFrame, run_id: str) -> tuple[DataFrame,
     return training, service_zone_values, feature_spec_rows, schema_hash
 
 
+def gold_spark_conf() -> dict[str, str]:
+    return build_spark_conf(
+        spark_driver_memory=SPARK_DRIVER_MEMORY,
+        spark_executor_memory=SPARK_EXECUTOR_MEMORY,
+        spark_driver_memory_overhead=SPARK_DRIVER_MEMORY_OVERHEAD,
+        spark_executor_memory_overhead=SPARK_EXECUTOR_MEMORY_OVERHEAD,
+        spark_executor_cores=SPARK_EXECUTOR_CORES,
+        spark_executor_instances=SPARK_EXECUTOR_INSTANCES,
+        spark_driver_cores=SPARK_DRIVER_CORES,
+        spark_shuffle_partitions=SPARK_SHUFFLE_PARTITIONS,
+        spark_max_partition_bytes=SPARK_MAX_PARTITION_BYTES,
+        spark_max_result_size=SPARK_MAX_RESULT_SIZE,
+    )
+
+
 @task(
     task_config=Spark(
-        spark_conf=build_spark_conf(),
+        spark_conf=gold_spark_conf(),
         hadoop_conf=build_hadoop_conf(),
         executor_path="/opt/venv/bin/python",
     ),

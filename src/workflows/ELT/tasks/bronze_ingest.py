@@ -36,11 +36,17 @@ ICEBERG_REST_AUTH_TYPE = os.environ.get("ICEBERG_REST_AUTH_TYPE", "")
 ICEBERG_REST_USER = os.environ.get("ICEBERG_REST_USER", "")
 ICEBERG_REST_PASSWORD = os.environ.get("ICEBERG_REST_PASSWORD", "")
 
+K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
+ELT_PROFILE = os.environ.get(
+    "ELT_PROFILE",
+    "dev" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod",
+).strip().lower()
+
 AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-AWS_SESSION_TOKEN = os.environ.get("AWS_SESSION_TOKEN", "")
-AWS_ROLE_ARN = os.environ.get("AWS_ROLE_ARN", "")
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("aws_access_key_id", "")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY") or os.environ.get("aws_secret_access_key", "")
+AWS_SESSION_TOKEN = os.environ.get("AWS_SESSION_TOKEN") or os.environ.get("aws_session_token", "")
+AWS_ROLE_ARN = os.environ.get("AWS_ROLE_ARN") or os.environ.get("aws_role_arn", "")
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "")
 S3_PATH_STYLE_ACCESS = os.environ.get("S3_PATH_STYLE_ACCESS", "false")
 
@@ -81,34 +87,9 @@ TAXI_ZONE_LOOKUP_URL = os.environ.get(
 )
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or None
 
-MAX_ROWS_TO_EXTRACT_FROM_DATASETS = int(os.environ.get("MAX_ROWS_TO_EXTRACT_FROM_DATASETS", "0"))
-BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "2000"))
-BRONZE_ROWS_PER_PARTITION = int(os.environ.get("BRONZE_ROWS_PER_PARTITION", "25000"))
-
-ICEBERG_TARGET_FILE_SIZE_BYTES = os.environ.get("ICEBERG_TARGET_FILE_SIZE_BYTES", "268435456")
-
-ICEBERG_EXPIRE_DAYS = int(os.environ.get("ICEBERG_EXPIRE_DAYS", "7"))
-ICEBERG_ORPHAN_DAYS = int(os.environ.get("ICEBERG_ORPHAN_DAYS", "7"))
-ICEBERG_RETAIN_LAST = int(os.environ.get("ICEBERG_RETAIN_LAST", "1"))
-
-K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
-ELT_PROFILE = os.environ.get(
-    "ELT_PROFILE",
-    "dev" if K8S_CLUSTER in {"kind", "minikube", "k3s", "local"} else "prod",
-).strip().lower()
-
-SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark")
-ALLOW_LOCAL_SPARK_FALLBACK = os.environ.get("FLYTE_ALLOW_LOCAL_SPARK_FALLBACK", "false").lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
-}
-
 TASK_IMAGE = os.environ.get(
     "ELT_TASK_IMAGE",
-    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-03-27-09-56--e4e99ab",
+    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-03-28-16-58--ab2a8d6",
 ).strip()
 if not TASK_IMAGE:
     raise RuntimeError("ELT_TASK_IMAGE must be set before importing bronze_ingest.py")
@@ -126,6 +107,10 @@ if ELT_PROFILE == "prod":
     SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
     SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "256m")
     TASK_RETRIES = int(os.environ.get("BRONZE_TASK_RETRIES", "1"))
+    MAX_ROWS_TO_EXTRACT_FROM_DATASETS = int(os.environ.get("MAX_ROWS_TO_EXTRACT_FROM_DATASETS", "0"))
+    BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "5000"))
+    BRONZE_ROWS_PER_PARTITION = int(os.environ.get("BRONZE_ROWS_PER_PARTITION", "100000"))
+    ICEBERG_TARGET_FILE_SIZE_BYTES = os.environ.get("ICEBERG_TARGET_FILE_SIZE_BYTES", "536870912")
 else:
     TASK_LIMITS = Resources(cpu="500m", mem="512Mi")
     SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "768m")
@@ -139,6 +124,10 @@ else:
     SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "67108864")
     SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "128m")
     TASK_RETRIES = int(os.environ.get("BRONZE_TASK_RETRIES", "0"))
+    MAX_ROWS_TO_EXTRACT_FROM_DATASETS = int(os.environ.get("MAX_ROWS_TO_EXTRACT_FROM_DATASETS", "10000"))
+    BRONZE_CHUNK_SIZE = int(os.environ.get("BRONZE_CHUNK_SIZE", "2000"))
+    BRONZE_ROWS_PER_PARTITION = int(os.environ.get("BRONZE_ROWS_PER_PARTITION", "25000"))
+    ICEBERG_TARGET_FILE_SIZE_BYTES = os.environ.get("ICEBERG_TARGET_FILE_SIZE_BYTES", "268435456")
 
 
 @dataclass(frozen=True)
@@ -215,7 +204,20 @@ def table_exists(spark: SparkSession, table_id: str) -> bool:
     return len(rows) > 0
 
 
-def build_spark_conf() -> dict[str, str]:
+def build_spark_conf(
+    *,
+    spark_driver_memory: str,
+    spark_executor_memory: str,
+    spark_driver_memory_overhead: str,
+    spark_executor_memory_overhead: str,
+    spark_executor_cores: str,
+    spark_executor_instances: str,
+    spark_driver_cores: str,
+    spark_shuffle_partitions: str,
+    spark_max_partition_bytes: str,
+    spark_max_result_size: str,
+    spark_task_max_failures: str = "4",
+) -> dict[str, str]:
     conf = {
         f"spark.sql.catalog.{CATALOG_NAME}": "org.apache.iceberg.spark.SparkCatalog",
         f"spark.sql.catalog.{CATALOG_NAME}.type": "rest",
@@ -223,28 +225,49 @@ def build_spark_conf() -> dict[str, str]:
         f"spark.sql.catalog.{CATALOG_NAME}.warehouse": ICEBERG_WAREHOUSE,
         f"spark.sql.catalog.{CATALOG_NAME}.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
         "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-        "spark.sql.shuffle.partitions": SPARK_SHUFFLE_PARTITIONS,
-        "spark.sql.files.maxPartitionBytes": SPARK_MAX_PARTITION_BYTES,
+        "spark.sql.shuffle.partitions": spark_shuffle_partitions,
+        "spark.sql.files.maxPartitionBytes": spark_max_partition_bytes,
         "spark.sql.adaptive.enabled": "true",
         "spark.sql.adaptive.coalescePartitions.enabled": "true",
         "spark.sql.session.timeZone": "UTC",
         "spark.sql.sources.partitionOverwriteMode": "dynamic",
-        "spark.driver.memory": SPARK_DRIVER_MEMORY,
-        "spark.driver.memoryOverhead": SPARK_DRIVER_MEMORY_OVERHEAD,
-        "spark.executor.memory": SPARK_EXECUTOR_MEMORY,
-        "spark.executor.memoryOverhead": SPARK_EXECUTOR_MEMORY_OVERHEAD,
-        "spark.executor.cores": SPARK_EXECUTOR_CORES,
-        "spark.executor.instances": SPARK_EXECUTOR_INSTANCES,
-        "spark.driver.cores": SPARK_DRIVER_CORES,
-        "spark.driver.maxResultSize": SPARK_MAX_RESULT_SIZE,
-        "spark.kubernetes.authenticate.driver.serviceAccountName": SPARK_SERVICE_ACCOUNT,
-        "spark.kubernetes.authenticate.executor.serviceAccountName": SPARK_SERVICE_ACCOUNT,
-        "spark.kubernetes.driver.limit.cores": SPARK_DRIVER_CORES,
-        "spark.kubernetes.executor.limit.cores": SPARK_EXECUTOR_CORES,
-        "spark.task.maxFailures": "4",
+        "spark.driver.memory": spark_driver_memory,
+        "spark.driver.memoryOverhead": spark_driver_memory_overhead,
+        "spark.executor.memory": spark_executor_memory,
+        "spark.executor.memoryOverhead": spark_executor_memory_overhead,
+        "spark.executor.cores": spark_executor_cores,
+        "spark.executor.instances": spark_executor_instances,
+        "spark.driver.cores": spark_driver_cores,
+        "spark.driver.maxResultSize": spark_max_result_size,
+        "spark.kubernetes.authenticate.driver.serviceAccountName": os.environ.get(
+            "SPARK_SERVICE_ACCOUNT",
+            "spark",
+        ),
+        "spark.kubernetes.authenticate.executor.serviceAccountName": os.environ.get(
+            "SPARK_SERVICE_ACCOUNT",
+            "spark",
+        ),
+        "spark.kubernetes.driver.limit.cores": spark_driver_cores,
+        "spark.kubernetes.executor.limit.cores": spark_executor_cores,
+        "spark.task.maxFailures": spark_task_max_failures,
         "spark.excludeOnFailure.enabled": "true",
         "spark.excludeOnFailure.timeout": "5m",
+        "spark.hadoop.fs.s3a.endpoint.region": AWS_REGION,
     }
+
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        conf["spark.kubernetes.driverEnv.AWS_ACCESS_KEY_ID"] = AWS_ACCESS_KEY_ID
+        conf["spark.kubernetes.driverEnv.AWS_SECRET_ACCESS_KEY"] = AWS_SECRET_ACCESS_KEY
+        conf["spark.kubernetes.driverEnv.AWS_DEFAULT_REGION"] = AWS_REGION
+        conf["spark.kubernetes.driverEnv.AWS_REGION"] = AWS_REGION
+        conf["spark.executorEnv.AWS_ACCESS_KEY_ID"] = AWS_ACCESS_KEY_ID
+        conf["spark.executorEnv.AWS_SECRET_ACCESS_KEY"] = AWS_SECRET_ACCESS_KEY
+        conf["spark.executorEnv.AWS_DEFAULT_REGION"] = AWS_REGION
+        conf["spark.executorEnv.AWS_REGION"] = AWS_REGION
+        if AWS_SESSION_TOKEN:
+            conf["spark.kubernetes.driverEnv.AWS_SESSION_TOKEN"] = AWS_SESSION_TOKEN
+            conf["spark.executorEnv.AWS_SESSION_TOKEN"] = AWS_SESSION_TOKEN
+
     if ICEBERG_REST_AUTH_TYPE:
         conf[f"spark.sql.catalog.{CATALOG_NAME}.rest.auth.type"] = ICEBERG_REST_AUTH_TYPE
     if ICEBERG_REST_USER:
@@ -305,25 +328,19 @@ def load_streaming_dataset(
 def get_spark_session() -> SparkSession:
     try:
         spark = current_context().spark_session
-    except Exception:
-        spark = None
-
-    if spark is not None:
-        return spark
-
-    if not ALLOW_LOCAL_SPARK_FALLBACK:
+    except Exception as exc:
         raise RuntimeError(
             "Flyte did not provide a Spark session for this task. "
-            "This usually means the Spark plugin was not active. "
-            "Set FLYTE_ALLOW_LOCAL_SPARK_FALLBACK=true only for local testing."
+            "This usually means the Spark plugin was not active."
+        ) from exc
+
+    if spark is None:
+        raise RuntimeError(
+            "Flyte did not provide a Spark session for this task. "
+            "This usually means the Spark plugin was not active."
         )
 
-    builder = SparkSession.builder.appName("bronze_ingest_local_fallback")
-    for k, v in build_spark_conf().items():
-        builder = builder.config(k, v)
-    for k, v in build_hadoop_conf().items():
-        builder = builder.config(f"spark.hadoop.{k}", v)
-    return builder.getOrCreate()
+    return spark
 
 
 def iter_preview_rows(stream: Iterable[dict], n: int = 2) -> tuple[list[dict], Iterable[dict]]:
@@ -515,9 +532,32 @@ def write_replace_iceberg_table(df: DataFrame, table_id: str) -> str:
     return "create"
 
 
+def detect_aws_credential_mode() -> str:
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        if AWS_SESSION_TOKEN:
+            return "static_env_session"
+        return "static_env"
+    if os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE"):
+        return "web_identity"
+    if AWS_ROLE_ARN:
+        return "role_arn"
+    return "missing"
+
+
 @task(
     task_config=Spark(
-        spark_conf=build_spark_conf(),
+        spark_conf=build_spark_conf(
+            spark_driver_memory=SPARK_DRIVER_MEMORY,
+            spark_executor_memory=SPARK_EXECUTOR_MEMORY,
+            spark_driver_memory_overhead=SPARK_DRIVER_MEMORY_OVERHEAD,
+            spark_executor_memory_overhead=SPARK_EXECUTOR_MEMORY_OVERHEAD,
+            spark_executor_cores=SPARK_EXECUTOR_CORES,
+            spark_executor_instances=SPARK_EXECUTOR_INSTANCES,
+            spark_driver_cores=SPARK_DRIVER_CORES,
+            spark_shuffle_partitions=SPARK_SHUFFLE_PARTITIONS,
+            spark_max_partition_bytes=SPARK_MAX_PARTITION_BYTES,
+            spark_max_result_size=SPARK_MAX_RESULT_SIZE,
+        ),
         hadoop_conf=build_hadoop_conf(),
         executor_path="/opt/venv/bin/python",
     ),
@@ -540,6 +580,7 @@ def bronze_ingest() -> BronzeIngestResult:
         run_id=run_id,
         profile=ELT_PROFILE,
         k8s_cluster=K8S_CLUSTER,
+        aws_credential_mode=detect_aws_credential_mode(),
         trips_source=trips_source_ref,
         taxi_zone_source=taxi_zone_source_ref,
         max_rows=MAX_ROWS_TO_EXTRACT_FROM_DATASETS,
