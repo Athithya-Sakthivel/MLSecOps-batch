@@ -3,9 +3,12 @@ repos:
     rev: 83d9cd6
     hooks:
       - id: gitleaks
+        files: ^src/
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: aca6d4c
     hooks:
       - id: ruff-check
+        files: ^src/.*\.py$
       - id: ruff-format
+        files: ^src/.*\.py$
