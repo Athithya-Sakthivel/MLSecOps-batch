@@ -8,13 +8,11 @@ spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:18.3-minimal-trixie
   bootstrap:
     initdb:
-      database: iceberg_catalogue_metadata
+      database: flyte_admin
       owner: app
       postInitSQL:
-        - CREATE DATABASE flyte_admin OWNER app;
         - CREATE DATABASE datacatalog OWNER app;
         - CREATE DATABASE mlflow OWNER app;
-        - CREATE DATABASE app OWNER app;
       postInitApplicationSQL:
         - ALTER SCHEMA public OWNER TO app;
   storage:

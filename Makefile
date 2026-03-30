@@ -1,7 +1,7 @@
 lc:
 	kind delete cluster --name local-cluster || true && kind create cluster --name local-cluster && bash src/infra/core/default_storage_class.sh && sleep 15 && \
-	bash src/infra/core/postgres_cluster.sh --rollout && bash src/infra/iceberg/iceberg.sh --rollout && bash src/infra/core/spark_operator.sh --rollout && \
-	python3 src/infra/core/flyte_setup.py --rollout && bash src/workflows/ELT/commands.sh
+	bash src/infra/core/postgres_cluster.sh --rollout && bash src/infra/elt/iceberg.sh --rollout && bash src/infra/elt/spark_operator.sh --rollout && \
+	python3 src/infra/core/flyte_setup.py --rollout
 
 set-sa:
 	bash src/core/default_storage_class.sh
@@ -12,7 +12,7 @@ tree:
 push:
 	git add .
 	git commit -m "new"
-	gitleaks detect --source . --exit-code 1
+	gitleaks detect --source . --exit-code 1 --redact
 	git push origin main --force
 
 clean:

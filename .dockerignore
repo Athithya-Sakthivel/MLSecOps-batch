@@ -229,3 +229,42 @@ data
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+.env
+
+# Pip cache
+.cache/pip/
+
+# General cache
+.cache/
+tmp/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# OS
+.DS_Store
+
+# Node (if any)
+node_modules/
+.npm/
+
+# Java / Spark
+target/
+.gradle/
+.ivy2/
+
+# Docker
+Dockerfile*
+docker-compose*

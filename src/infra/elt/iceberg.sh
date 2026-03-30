@@ -3,19 +3,17 @@ set -Eeuo pipefail
 
 TARGET_NS="${TARGET_NS:-default}"
 MANIFEST_DIR="${MANIFEST_DIR:-src/manifests/iceberg}"
+
 DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-iceberg-rest}"
 SERVICE_NAME="${SERVICE_NAME:-iceberg-rest}"
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-iceberg-rest-sa}"
 SECRET_NAME="${SECRET_NAME:-iceberg-storage-credentials}"
 ANNOTATION_KEY="${ANNOTATION_KEY:-mlsecops.iceberg.checksum}"
 
-# Official Apache Iceberg REST fixture.
-# The fixture listens on 8181 internally.
 IMAGE="${IMAGE:-apache/iceberg-rest-fixture:1.10.1@sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f}"
 CONTAINER_PORT="${CONTAINER_PORT:-8181}"
 SERVICE_PORT="${SERVICE_PORT:-8181}"
 
-# AWS / S3 contract for the fixture.
 AWS_REGION="${AWS_REGION:-ap-south-1}"
 S3_BUCKET="${S3_BUCKET:-e2e-mlops-data-681802563986}"
 S3_PREFIX="${S3_PREFIX:-iceberg/warehouse}"
@@ -44,8 +42,8 @@ require_bin() {
 
 require_prereqs() {
   require_bin kubectl
-  require_bin curl
   require_bin python3
+  require_bin sha256sum
   kubectl version --client >/dev/null 2>&1 || fatal "kubectl client unavailable"
   kubectl cluster-info >/dev/null 2>&1 || fatal "kubectl cannot reach cluster"
 }
@@ -189,6 +187,10 @@ spec:
         env:
         - name: AWS_REGION
           value: "${AWS_REGION}"
+        - name: AWS_DEFAULT_REGION
+          value: "${AWS_REGION}"
+        - name: AWS_EC2_METADATA_DISABLED
+          value: "true"
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
             secretKeyRef:
@@ -318,10 +320,19 @@ apply_manifests() {
 dump_diagnostics() {
   log "diagnostics: pods"
   kubectl -n "${TARGET_NS}" get pods -o wide || true
+
   log "diagnostics: deployment"
   kubectl -n "${TARGET_NS}" describe deployment "${DEPLOYMENT_NAME}" || true
+
+  log "diagnostics: service"
+  kubectl -n "${TARGET_NS}" get svc "${SERVICE_NAME}" -o wide || true
+
+  log "diagnostics: endpoints"
+  kubectl -n "${TARGET_NS}" get endpoints "${SERVICE_NAME}" -o wide || true
+
   log "diagnostics: recent events"
-  kubectl get events -A --sort-by=.lastTimestamp | tail -n 60 || true
+  kubectl get events -A --sort-by=.lastTimestamp | tail -n 80 || true
+
   log "diagnostics: logs"
   kubectl -n "${TARGET_NS}" logs deployment/"${DEPLOYMENT_NAME}" --tail=200 || true
 }
@@ -341,35 +352,77 @@ wait_for_deployment_ready() {
 }
 
 rest_smoke() {
-  local base code
+  local base
   base="$(rest_base_url)"
-
   log "running REST smoke"
-  code="$(
-    kubectl -n "${TARGET_NS}" run iceberg-rest-smoke --rm -i --restart=Never \
-      --image=curlimages/curl:8.12.1 \
-      --command -- sh -lc "
-        set -eu
-        base='${base}'
-        curl -fsS \"\${base}/v1/config\" >/dev/null
-        curl -fsS \"\${base}/v1/namespaces\" >/dev/null
-        code=\$(curl -sS -o /tmp/ns.out -w '%{http_code}' -X POST \
-          -H 'Content-Type: application/json' \
-          --data '{\"namespace\":[\"mlsecops_smoke\"]}' \
-          \"\${base}/v1/namespaces\")
-        case \"\$code\" in
-          200|201|204|409) ;;
-          *)
-            cat /tmp/ns.out >&2
-            exit 1
-            ;;
-        esac
-        echo rest_smoke_ok
-      " 2>/dev/null || true
-  )"
-  if [[ "${code}" != *"rest_smoke_ok"* ]]; then
-    fatal "REST smoke failed"
-  fi
+
+  cat <<'PY' | kubectl -n "${TARGET_NS}" run iceberg-rest-smoke --rm -i --restart=Never \
+    --image=python:3.12-slim \
+    --env BASE_URL="${base}" \
+    --command -- python /dev/stdin
+from __future__ import annotations
+
+import json
+import os
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+base = os.environ["BASE_URL"].rstrip("/")
+
+def fetch(path: str, *, method: str = "GET", body: bytes | None = None, headers: dict[str, str] | None = None):
+    req = Request(f"{base}{path}", data=body, method=method, headers=headers or {})
+    try:
+        with urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            print(f"GET {path} -> {resp.status}")
+            if raw:
+                print(raw[:2000])
+            return resp.status, raw
+    except HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        print(f"HTTPError {method} {path} -> {exc.code}", file=sys.stderr)
+        if raw:
+            print(raw[:4000], file=sys.stderr)
+        raise
+    except URLError as exc:
+        print(f"URLError {method} {path} -> {exc}", file=sys.stderr)
+        raise
+
+status, body = fetch("/v1/config")
+if status != 200:
+    raise SystemExit(f"unexpected /v1/config status: {status}")
+
+try:
+    parsed = json.loads(body)
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"/v1/config did not return valid JSON: {exc}") from exc
+
+if not isinstance(parsed, dict):
+    raise SystemExit(f"/v1/config returned unexpected payload type: {type(parsed)!r}")
+
+status, body = fetch("/v1/namespaces")
+if status != 200:
+    raise SystemExit(f"unexpected /v1/namespaces status: {status}")
+
+try:
+    json.loads(body)
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"/v1/namespaces did not return valid JSON: {exc}") from exc
+
+payload = json.dumps({"namespace": ["mlsecops_smoke"]}).encode("utf-8")
+status, body = fetch(
+    "/v1/namespaces",
+    method="POST",
+    body=payload,
+    headers={"Content-Type": "application/json"},
+)
+
+if status not in {200, 201, 204, 409}:
+    raise SystemExit(f"unexpected namespace create status: {status}")
+
+print("rest_smoke_ok")
+PY
   log "REST smoke passed"
 }
 
@@ -379,7 +432,7 @@ spark_smoke() {
     return 0
   fi
 
-  local ak sk token warehouse uri extra_env=()
+  local ak sk token warehouse uri
   ak="$(
     kubectl -n "${TARGET_NS}" get secret "${SECRET_NAME}" \
       -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null | base64 -d || true
@@ -400,24 +453,17 @@ spark_smoke() {
     return 0
   fi
 
-  if [[ -n "${token}" ]]; then
-    extra_env+=(--env "AWS_SESSION_TOKEN=${token}")
-  fi
-
   log "running Spark smoke"
-  kubectl run iceberg-spark-probe -n "${TARGET_NS}" --rm -i --restart=Never \
-    --image="${SPARK_PROBE_IMAGE}" \
-    --env SPARK_LOCAL_HOSTNAME=localhost \
-    --env "AWS_REGION=${AWS_REGION}" \
-    --env "AWS_ACCESS_KEY_ID=${ak}" \
-    --env "AWS_SECRET_ACCESS_KEY=${sk}" \
-    "${extra_env[@]}" \
-    --command -- python /dev/stdin <<PY
-from pyspark.sql import SparkSession
-import uuid
+  {
+    cat <<'PY'
+from __future__ import annotations
 
-uri = "${uri}"
-warehouse = "${warehouse}"
+import os
+import uuid
+from pyspark.sql import SparkSession
+
+uri = os.environ["ICEBERG_URI"]
+warehouse = os.environ["ICEBERG_WAREHOUSE"]
 
 spark = (
     SparkSession.builder
@@ -433,7 +479,12 @@ spark = (
     .getOrCreate()
 )
 
-print("=== SHOW NAMESPACES ===")
+print("=== spark catalog conf ===")
+for k, v in sorted(spark.sparkContext.getConf().getAll()):
+    if k.startswith("spark.sql.catalog.iceberg"):
+        print(f"{k}={v}")
+
+print("=== namespaces ===")
 spark.sql("SHOW NAMESPACES IN iceberg").show(truncate=False)
 
 ns = f"mlsecops_probe_{uuid.uuid4().hex[:8]}"
@@ -441,15 +492,27 @@ spark.sql(f"CREATE NAMESPACE IF NOT EXISTS iceberg.{ns}")
 spark.sql(f"DROP NAMESPACE IF EXISTS iceberg.{ns}")
 print("spark_smoke_ok")
 PY
+  } | kubectl -n "${TARGET_NS}" run iceberg-spark-probe --rm -i --restart=Never \
+      --image="${SPARK_PROBE_IMAGE}" \
+      --env SPARK_LOCAL_HOSTNAME=localhost \
+      --env AWS_REGION="${AWS_REGION}" \
+      --env AWS_ACCESS_KEY_ID="${ak}" \
+      --env AWS_SECRET_ACCESS_KEY="${sk}" \
+      ${token:+--env AWS_SESSION_TOKEN="${token}"} \
+      --env ICEBERG_URI="${uri}" \
+      --env ICEBERG_WAREHOUSE="${warehouse}" \
+      --command -- python /dev/stdin
+
   log "Spark smoke passed"
 }
 
-print_connection_details() {
+print_required_envs() {
   local base warehouse
   base="$(rest_base_url)"
   warehouse="$(warehouse_uri)"
 
   printf '\nRequired downstream env:\n\n'
+  printf 'AWS_REGION=%s\n' "${AWS_REGION}"
   printf 'ICEBERG_REST_URI=%s\n' "${base}"
   printf 'ICEBERG_REST_AUTH_TYPE=none\n'
   printf 'ICEBERG_WAREHOUSE=%s\n' "${warehouse}"
@@ -495,7 +558,7 @@ rollout() {
   wait_for_deployment_ready
   rest_smoke
   spark_smoke
-  print_connection_details
+  print_required_envs
   log "[SUCCESS] iceberg rollout complete"
 }
 
