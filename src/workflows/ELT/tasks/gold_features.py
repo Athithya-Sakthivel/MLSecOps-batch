@@ -85,6 +85,7 @@ if ELT_PROFILE == "prod":
     SPARK_SHUFFLE_PARTITIONS = _env_str("SPARK_SHUFFLE_PARTITIONS", "8")
     SPARK_MAX_PARTITION_BYTES = _env_str("SPARK_MAX_PARTITION_BYTES", "134217728")
     SPARK_MAX_RESULT_SIZE = _env_str("SPARK_MAX_RESULT_SIZE", "256m")
+    TASK_RETRIES = _env_int("GOLD_TASK_RETRIES", 1, minimum=0)
 else:
     TASK_LIMITS = Resources(cpu="500m", mem="768Mi")
     GOLD_REPARTITIONS = _env_int("GOLD_REPARTITIONS", 4, minimum=1)
@@ -113,6 +114,29 @@ class GoldFeatureResult:
     write_mode: str
     status: str
 
+
+GOLD_OUTPUT_COLUMNS: list[str] = [
+    "trip_id",
+    "as_of_ts",
+    "as_of_date",
+    "schema_version",
+    "feature_version",
+    "pickup_hour",
+    "pickup_dow",
+    "pickup_month",
+    "pickup_is_weekend",
+    "pickup_borough_id",
+    "pickup_zone_id",
+    "pickup_service_zone_id",
+    "dropoff_borough_id",
+    "dropoff_zone_id",
+    "dropoff_service_zone_id",
+    "route_pair_id",
+    "avg_duration_7d_zone_hour",
+    "avg_fare_30d_zone",
+    "trip_count_90d_zone_hour",
+    "label_trip_duration_seconds",
+]
 
 GOLD_CONTRACT_SCHEMA = StructType(
     [
@@ -196,13 +220,13 @@ def normalize_text_expr(col_name: str) -> F.Column:
 
 def build_borough_map_df(spark) -> DataFrame:
     rows = [
-        {"borough_norm": "unknown", "borough_id": 0, "borough_name": "unknown"},
-        {"borough_norm": "manhattan", "borough_id": 1, "borough_name": "Manhattan"},
-        {"borough_norm": "queens", "borough_id": 2, "borough_name": "Queens"},
-        {"borough_norm": "brooklyn", "borough_id": 3, "borough_name": "Brooklyn"},
-        {"borough_norm": "bronx", "borough_id": 4, "borough_name": "Bronx"},
-        {"borough_norm": "staten island", "borough_id": 5, "borough_name": "Staten Island"},
-        {"borough_norm": "ewr", "borough_id": 6, "borough_name": "EWR"},
+        ("unknown", 0, "unknown"),
+        ("manhattan", 1, "Manhattan"),
+        ("queens", 2, "Queens"),
+        ("brooklyn", 3, "Brooklyn"),
+        ("bronx", 4, "Bronx"),
+        ("staten island", 5, "Staten Island"),
+        ("ewr", 6, "EWR"),
     ]
     return spark.createDataFrame(rows, schema=BOROUGH_MAP_SCHEMA)
 
@@ -221,15 +245,9 @@ def distinct_service_zone_values(silver_df: DataFrame) -> list[str]:
 
 
 def build_service_zone_map_df(spark, service_zone_values: list[str]) -> DataFrame:
-    rows = [{"service_zone_norm": "unknown", "service_zone_id": 0, "service_zone_name": "unknown"}]
+    rows = [("unknown", 0, "unknown")]
     for idx, value in enumerate(service_zone_values, start=1):
-        rows.append(
-            {
-                "service_zone_norm": value,
-                "service_zone_id": idx,
-                "service_zone_name": value,
-            }
-        )
+        rows.append((value, idx, value))
     return spark.createDataFrame(rows, schema=SERVICE_ZONE_MAP_SCHEMA)
 
 
@@ -531,7 +549,7 @@ def build_aggregate_spec(source_silver_table: str) -> list[dict]:
             "name": "avg_duration_7d_zone_hour",
             "source_table": source_silver_table,
             "source_column": "label_trip_duration_seconds",
-            "filter_predicate": "trip_start_ts in [as_of_ts - 7d, as_of_ts)",
+            "filter_predicate": "pickup_ts in [as_of_ts - 7d, as_of_ts)",
             "window_length": "7d",
             "grouping_keys": ["pickup_zone_id", "pickup_hour"],
             "minimum_history_rule": "no prior rows => NaN",
@@ -541,7 +559,7 @@ def build_aggregate_spec(source_silver_table: str) -> list[dict]:
             "name": "avg_fare_30d_zone",
             "source_table": source_silver_table,
             "source_column": "fare_amount",
-            "filter_predicate": "trip_start_ts in [as_of_ts - 30d, as_of_ts)",
+            "filter_predicate": "pickup_ts in [as_of_ts - 30d, as_of_ts)",
             "window_length": "30d",
             "grouping_keys": ["pickup_zone_id"],
             "minimum_history_rule": "no prior rows => NaN",
@@ -551,7 +569,7 @@ def build_aggregate_spec(source_silver_table: str) -> list[dict]:
             "name": "trip_count_90d_zone_hour",
             "source_table": source_silver_table,
             "source_column": "count(*)",
-            "filter_predicate": "trip_start_ts in [as_of_ts - 90d, as_of_ts)",
+            "filter_predicate": "pickup_ts in [as_of_ts - 90d, as_of_ts)",
             "window_length": "90d",
             "grouping_keys": ["pickup_zone_id", "pickup_hour"],
             "minimum_history_rule": "no prior rows => 0",
@@ -721,30 +739,7 @@ def build_training_matrix(
     feature_spec_rows = build_feature_spec_rows(service_zone_values)
     schema_hash = build_schema_hash(feature_spec_rows)
 
-    output_columns = [
-        "trip_id",
-        "as_of_ts",
-        "as_of_date",
-        "schema_version",
-        "feature_version",
-        "pickup_hour",
-        "pickup_dow",
-        "pickup_month",
-        "pickup_is_weekend",
-        "pickup_borough_id",
-        "pickup_zone_id",
-        "pickup_service_zone_id",
-        "dropoff_borough_id",
-        "dropoff_zone_id",
-        "dropoff_service_zone_id",
-        "route_pair_id",
-        "avg_duration_7d_zone_hour",
-        "avg_fare_30d_zone",
-        "trip_count_90d_zone_hour",
-        "label_trip_duration_seconds",
-    ]
-
-    training = base.select(*output_columns)
+    training = base.select(*GOLD_OUTPUT_COLUMNS)
 
     required = {
         "trip_id",
@@ -877,31 +872,7 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
         "inference_runtime": INFERENCE_RUNTIME,
         "gold_table": gold_table,
         "source_silver_table": source_silver_table,
-        "output_columns_json": json.dumps(
-            [
-                "trip_id",
-                "as_of_ts",
-                "as_of_date",
-                "schema_version",
-                "feature_version",
-                "pickup_hour",
-                "pickup_dow",
-                "pickup_month",
-                "pickup_is_weekend",
-                "pickup_borough_id",
-                "pickup_zone_id",
-                "pickup_service_zone_id",
-                "dropoff_borough_id",
-                "dropoff_zone_id",
-                "dropoff_service_zone_id",
-                "route_pair_id",
-                "avg_duration_7d_zone_hour",
-                "avg_fare_30d_zone",
-                "trip_count_90d_zone_hour",
-                "label_trip_duration_seconds",
-            ],
-            separators=(",", ":"),
-        ),
+        "output_columns_json": json.dumps(GOLD_OUTPUT_COLUMNS, separators=(",", ":")),
         "feature_spec_json": feature_spec_json,
         "encoding_spec_json": encoding_spec_json,
         "aggregate_spec_json": aggregate_spec_json,

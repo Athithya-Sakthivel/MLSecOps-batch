@@ -100,7 +100,7 @@ sudo mv gitleaks /usr/local/bin/gitleaks
 curl -LsSf https://astral.sh/ruff/0.14.11/install.sh | sh
 
 
-python3 -m pip install --upgrade --no-cache-dir --break-system-packages pre-commit==4.5.1 && pre-commit install --install-hooks
+python3 -m pip install --no-cache-dir --break-system-packages pre-commit==4.5.1 datasets==4.8.4 && pre-commit install --install-hooks
 
 clear
 echo "gitleaks version $(gitleaks version)"

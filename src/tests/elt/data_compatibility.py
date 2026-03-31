@@ -17,6 +17,7 @@ LOGGER = logging.getLogger("elt")
 
 TRIPS_DATASET_ID = "koorukuroo/yellow_tripdata"
 TAXI_ZONE_LOOKUP_URL = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
+MAX_ROWS_PER_DATASET = 10_000
 
 
 @dataclass(frozen=True)
@@ -32,11 +33,6 @@ def configure_logging(level: str) -> None:
         level=level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-
-
-def env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    return default if value is None or value == "" else int(value)
 
 
 def get_hf_token() -> str | None:
@@ -110,7 +106,7 @@ def load_taxi_zone_lookup_stream(token: str | None):
     return load_dataset("csv", **kwargs)
 
 
-def extract_trips(raw_dir: Path, token: str | None, max_rows: int) -> ExtractedTable:
+def extract_trips(raw_dir: Path, token: str | None) -> ExtractedTable:
     source_label = TRIPS_DATASET_ID
     out_path = raw_dir / "trips.parquet"
 
@@ -120,7 +116,7 @@ def extract_trips(raw_dir: Path, token: str | None, max_rows: int) -> ExtractedT
     preview_iter, write_iter = tee(ds, 2)
     preview_rows(preview_iter, source_label, n=2)
 
-    rows = islice(write_iter, max_rows) if max_rows > 0 else write_iter
+    rows = islice(write_iter, MAX_ROWS_PER_DATASET)
     row_count = write_streaming_parquet(rows, out_path)
 
     return ExtractedTable(
@@ -131,7 +127,7 @@ def extract_trips(raw_dir: Path, token: str | None, max_rows: int) -> ExtractedT
     )
 
 
-def extract_taxi_zones(raw_dir: Path, token: str | None, max_rows: int) -> ExtractedTable:
+def extract_taxi_zones(raw_dir: Path, token: str | None) -> ExtractedTable:
     source_label = "nyc_taxi_zone_lookup"
     out_path = raw_dir / "taxi_zone_lookup.parquet"
 
@@ -141,7 +137,7 @@ def extract_taxi_zones(raw_dir: Path, token: str | None, max_rows: int) -> Extra
     preview_iter, write_iter = tee(ds, 2)
     preview_rows(preview_iter, source_label, n=2)
 
-    rows = islice(write_iter, max_rows) if max_rows > 0 else write_iter
+    rows = islice(write_iter, MAX_ROWS_PER_DATASET)
     row_count = write_streaming_parquet(rows, out_path)
 
     return ExtractedTable(
@@ -199,16 +195,16 @@ def validate_joinability(trips_path: Path, zones_path: Path) -> None:
     LOGGER.info("Join keys verified: trips(PULocationID, DOLocationID) -> zones(LocationID)")
 
 
-def run_etl(raw_dir: Path, warehouse_dir: Path, max_rows: int, token: str | None) -> None:
+def run_etl(raw_dir: Path, warehouse_dir: Path, token: str | None) -> None:
     LOGGER.info("Raw directory: %s", raw_dir)
     LOGGER.info("Warehouse directory: %s", warehouse_dir)
-    LOGGER.info("MAX_ROWS_TO_EXTRACT_FROM_DATASETS=%d", max_rows)
+    LOGGER.info("MAX_ROWS_PER_DATASET=%d", MAX_ROWS_PER_DATASET)
     LOGGER.info("HF token present: %s", bool(token))
 
-    trips = extract_trips(raw_dir, token, max_rows)
+    trips = extract_trips(raw_dir, token)
     LOGGER.info("Extracted trips: %s (%d rows)", trips.path, trips.row_count)
 
-    zones = extract_taxi_zones(raw_dir, token, max_rows)
+    zones = extract_taxi_zones(raw_dir, token)
     LOGGER.info("Extracted taxi zones: %s (%d rows)", zones.path, zones.row_count)
 
     trips_dst, zones_dst = load_warehouse(raw_dir, warehouse_dir)
@@ -222,12 +218,6 @@ def main() -> None:
     parser.add_argument("--raw-dir", default="data/raw", help="Directory for extracted parquet files.")
     parser.add_argument("--warehouse-dir", default="data/warehouse", help="Directory for loaded parquet tables.")
     parser.add_argument(
-        "--max-rows",
-        type=int,
-        default=env_int("MAX_ROWS_TO_EXTRACT_FROM_DATASETS", 0),
-        help="Cap rows extracted from each source. 0 means no cap.",
-    )
-    parser.add_argument(
         "--log-level",
         default=os.getenv("LOG_LEVEL", "INFO"),
         help="Logging level.",
@@ -240,7 +230,7 @@ def main() -> None:
     raw_dir = Path(args.raw_dir)
     warehouse_dir = Path(args.warehouse_dir)
 
-    run_etl(raw_dir=raw_dir, warehouse_dir=warehouse_dir, max_rows=args.max_rows, token=token)
+    run_etl(raw_dir=raw_dir, warehouse_dir=warehouse_dir, token=token)
 
 
 if __name__ == "__main__":

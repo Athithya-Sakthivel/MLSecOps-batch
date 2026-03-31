@@ -4,7 +4,7 @@ import logging
 import math
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from flytekit import Resources, task
@@ -113,7 +113,7 @@ def _present_columns(df: DataFrame, candidates: Sequence[str]) -> list[str]:
 def _coalesced_typed_expr(
     df: DataFrame,
     candidates: Sequence[str],
-    builder,
+    builder: Callable[[F.Column], F.Column],
     *,
     null_type: str,
 ) -> F.Column:
@@ -175,25 +175,25 @@ def ensure_trips_schema(df: DataFrame) -> DataFrame:
     return df.select(
         _coalesced_typed_expr(
             df,
-            ("pickup_ts", "tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_datetime"),
+            ("pickup_ts",),
             _safe_to_timestamp_expr,
             null_type="timestamp",
         ).alias("pickup_ts"),
         _coalesced_typed_expr(
             df,
-            ("dropoff_ts", "tpep_dropoff_datetime", "lpep_dropoff_datetime", "dropoff_datetime"),
+            ("dropoff_ts",),
             _safe_to_timestamp_expr,
             null_type="timestamp",
         ).alias("dropoff_ts"),
         _coalesced_typed_expr(
             df,
-            ("pickup_location_id", "pulocation_id"),
+            ("pickup_location_id",),
             _safe_cast_long_expr,
             null_type="long",
         ).alias("pickup_location_id"),
         _coalesced_typed_expr(
             df,
-            ("dropoff_location_id", "dolocation_id"),
+            ("dropoff_location_id",),
             _safe_cast_long_expr,
             null_type="long",
         ).alias("dropoff_location_id"),
@@ -257,9 +257,7 @@ def ensure_trips_schema(df: DataFrame) -> DataFrame:
 
 
 def ensure_zone_schema(df: DataFrame) -> DataFrame:
-    required = ("location_id", "borough", "zone", "service_zone")
-    require_columns(df, required, "bronze taxi zone table")
-
+    require_columns(df, ("location_id", "borough", "zone", "service_zone"), "bronze taxi zone table")
     return df.select(
         F.col("location_id").cast("long").alias("location_id"),
         F.col("borough").cast("string").alias("borough"),
