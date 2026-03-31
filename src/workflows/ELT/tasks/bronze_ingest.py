@@ -9,7 +9,7 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any
@@ -18,6 +18,7 @@ from flytekit import Resources, current_context, task
 from flytekitplugins.spark import Spark
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StringType, StructField, StructType
 
 LOG = logging.getLogger("elt_bronze_ingest")
 LOG.setLevel(logging.INFO)
@@ -109,8 +110,9 @@ HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
 TASK_IMAGE = os.environ.get(
     "ELT_TASK_IMAGE",
-    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-03-30-07-33--15e04f8",
+    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-03-30-20-31--484f677",
 ).strip()
+
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     value = int(os.environ.get(name, str(default)))
@@ -219,6 +221,55 @@ class BronzeIngestResult:
     taxi_zone_source_ref: str
     trips_write_mode: str
     taxi_zone_write_mode: str
+
+
+TRIPS_SOURCE_FIELDS: tuple[str, ...] = (
+    "raw_record_json",
+    "vendor_id",
+    "tpep_pickup_datetime",
+    "tpep_dropoff_datetime",
+    "lpep_pickup_datetime",
+    "lpep_dropoff_datetime",
+    "pickup_datetime",
+    "dropoff_datetime",
+    "pickup_ts",
+    "dropoff_ts",
+    "pulocation_id",
+    "dolocation_id",
+    "pickup_location_id",
+    "dropoff_location_id",
+    "passenger_count",
+    "trip_distance",
+    "ratecode_id",
+    "store_and_fwd_flag",
+    "payment_type",
+    "fare_amount",
+    "extra",
+    "mta_tax",
+    "tip_amount",
+    "tolls_amount",
+    "ehail_fee",
+    "improvement_surcharge",
+    "total_amount",
+    "congestion_surcharge",
+    "airport_fee",
+    "cbd_congestion_fee",
+    "trip_type",
+    "vendorname",
+    "record_id",
+    "vendor_id_2",
+)
+
+TAXI_ZONE_SOURCE_FIELDS: tuple[str, ...] = (
+    "raw_record_json",
+    "location_id",
+    "borough",
+    "zone",
+    "service_zone",
+)
+
+TRIPS_SOURCE_SCHEMA = StructType([StructField(field, StringType(), True) for field in TRIPS_SOURCE_FIELDS])
+TAXI_ZONE_SOURCE_SCHEMA = StructType([StructField(field, StringType(), True) for field in TAXI_ZONE_SOURCE_FIELDS])
 
 
 def log_json(**payload: Any) -> None:
@@ -518,61 +569,61 @@ def iter_preview_rows(stream: Iterable[dict], n: int = 2) -> tuple[list[dict], I
     return preview, iterator
 
 
+def _stringify_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _project_row_to_schema(row: dict[str, Any], *, fields: Sequence[str]) -> dict[str, str | None]:
+    return {field: _stringify_value(row.get(field)) for field in fields}
+
+
+def build_trip_source_row(row: dict[str, Any]) -> dict[str, str | None]:
+    normalized = normalize_record(dict(row))
+    projected = _project_row_to_schema(normalized, fields=TRIPS_SOURCE_FIELDS)
+    projected["raw_record_json"] = json.dumps(normalized, default=str, sort_keys=True)
+    return projected
+
+
+def build_taxi_zone_source_row(row: dict[str, Any]) -> dict[str, str | None]:
+    normalized = normalize_record(dict(row))
+    projected = _project_row_to_schema(normalized, fields=TAXI_ZONE_SOURCE_FIELDS)
+    projected["raw_record_json"] = json.dumps(normalized, default=str, sort_keys=True)
+    return projected
+
+
 def stream_to_dataframe(
     spark: SparkSession,
     rows: Iterable[dict],
     *,
     label: str,
+    schema: StructType,
+    row_builder: Callable[[dict[str, Any]], dict[str, str | None]],
     chunk_size: int = BRONZE_CHUNK_SIZE,
 ) -> tuple[DataFrame, int]:
     accumulated_df: DataFrame | None = None
-    schema = None
     total_rows = 0
-    batch: list[dict] = []
+    batch: list[dict[str, str | None]] = []
 
-    def flush_batch(current_batch: list[dict], current_schema: Any) -> tuple[DataFrame, Any]:
+    def flush_batch(current_batch: list[dict[str, str | None]]) -> DataFrame:
         if not current_batch:
             raise RuntimeError(f"attempted to flush an empty batch for {label}")
-        batch_df = spark.createDataFrame(current_batch, schema=current_schema)
-        return batch_df, batch_df.schema
+        return spark.createDataFrame(current_batch, schema=schema)
 
     for row in rows:
-        batch.append(normalize_record(dict(row)))
+        batch.append(row_builder(dict(row)))
         total_rows += 1
         if len(batch) >= chunk_size:
-            batch_df, schema = flush_batch(batch, schema)
-            accumulated_df = (
-                batch_df
-                if accumulated_df is None
-                else accumulated_df.unionByName(
-                    batch_df,
-                    allowMissingColumns=True,
-                )
-            )
-            log_json(
-                msg="materialized_batch",
-                label=label,
-                rows=total_rows,
-                batch_rows=len(batch),
-            )
+            batch_df = flush_batch(batch)
+            accumulated_df = batch_df if accumulated_df is None else accumulated_df.unionByName(batch_df)
+            log_json(msg="materialized_batch", label=label, rows=total_rows, batch_rows=len(batch))
             batch.clear()
 
     if batch:
-        batch_df, schema = flush_batch(batch, schema)
-        accumulated_df = (
-            batch_df
-            if accumulated_df is None
-            else accumulated_df.unionByName(
-                batch_df,
-                allowMissingColumns=True,
-            )
-        )
-        log_json(
-            msg="materialized_final_batch",
-            label=label,
-            rows=total_rows,
-            batch_rows=len(batch),
-        )
+        batch_df = flush_batch(batch)
+        accumulated_df = batch_df if accumulated_df is None else accumulated_df.unionByName(batch_df)
+        log_json(msg="materialized_final_batch", label=label, rows=total_rows, batch_rows=len(batch))
         batch.clear()
 
     if accumulated_df is None or total_rows == 0:
@@ -587,15 +638,23 @@ def cast_if_present(df: DataFrame, column: str, spark_type: str) -> DataFrame:
     return df
 
 
+def _safe_to_timestamp(column: F.Column) -> F.Column:
+    return F.coalesce(
+        F.to_timestamp(column),
+        F.to_timestamp(column, "yyyy-MM-dd HH:mm:ss"),
+        F.to_timestamp(column, "yyyy-MM-dd'T'HH:mm:ss"),
+    )
+
+
 def add_trip_bronze_columns(df: DataFrame, *, run_id: str, source_ref: str) -> DataFrame:
-    pickup_col = first_existing(df.columns, ("lpep_pickup_datetime", "tpep_pickup_datetime", "pickup_ts"))
-    dropoff_col = first_existing(df.columns, ("lpep_dropoff_datetime", "tpep_dropoff_datetime", "dropoff_ts"))
+    pickup_col = first_existing(df.columns, ("lpep_pickup_datetime", "tpep_pickup_datetime", "pickup_ts", "pickup_datetime"))
+    dropoff_col = first_existing(df.columns, ("lpep_dropoff_datetime", "tpep_dropoff_datetime", "dropoff_ts", "dropoff_datetime"))
     pickup_location_col = first_existing(df.columns, ("pulocation_id", "pickup_location_id"))
     dropoff_location_col = first_existing(df.columns, ("dolocation_id", "dropoff_location_id"))
 
     df = (
-        df.withColumn("pickup_ts", F.to_timestamp(F.col(pickup_col)))
-        .withColumn("dropoff_ts", F.to_timestamp(F.col(dropoff_col)))
+        df.withColumn("pickup_ts", _safe_to_timestamp(F.col(pickup_col)))
+        .withColumn("dropoff_ts", _safe_to_timestamp(F.col(dropoff_col)))
         .withColumn("pickup_location_id", F.col(pickup_location_col).cast("long"))
         .withColumn("dropoff_location_id", F.col(dropoff_location_col).cast("long"))
         .withColumn("event_date", F.to_date(F.coalesce(F.col("pickup_ts"), F.col("dropoff_ts"))))
@@ -620,6 +679,7 @@ def add_trip_bronze_columns(df: DataFrame, *, run_id: str, source_ref: str) -> D
         "total_amount",
         "congestion_surcharge",
         "cbd_congestion_fee",
+        "airport_fee",
     )
     integer_cols = (
         "vendor_id",
@@ -659,6 +719,7 @@ def add_zone_bronze_columns(df: DataFrame, *, run_id: str, source_ref: str) -> D
             F.col("borough").cast("string").alias("borough"),
             F.col("zone").cast("string").alias("zone"),
             F.col("service_zone").cast("string").alias("service_zone"),
+            F.col("raw_record_json").cast("string").alias("raw_record_json"),
         )
         .withColumn("ingestion_ts", F.current_timestamp())
         .withColumn("run_id", F.lit(run_id))
@@ -683,14 +744,13 @@ def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_colu
         .tableProperty("format-version", "2")
         .tableProperty("write.format.default", "parquet")
         .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
-        .partitionedBy(F.col(partition_column))
     )
 
     if table_exists(df.sparkSession, table_id):
         writer.overwritePartitions()
         return "overwrite_partitions"
 
-    writer.create()
+    writer.partitionedBy(F.col(partition_column)).create()
     return "create"
 
 
@@ -824,6 +884,8 @@ def bronze_ingest() -> BronzeIngestResult:
         spark,
         trips_iter,
         label="trips",
+        schema=TRIPS_SOURCE_SCHEMA,
+        row_builder=build_trip_source_row,
         chunk_size=BRONZE_CHUNK_SIZE,
     )
     trips_df = add_trip_bronze_columns(trips_raw_df, run_id=run_id, source_ref=trips_source_ref)
@@ -834,6 +896,8 @@ def bronze_ingest() -> BronzeIngestResult:
         spark,
         taxi_iter,
         label="taxi_zone_lookup",
+        schema=TAXI_ZONE_SOURCE_SCHEMA,
+        row_builder=build_taxi_zone_source_row,
         chunk_size=min(BRONZE_CHUNK_SIZE, 1000),
     )
     taxi_zone_df = add_zone_bronze_columns(

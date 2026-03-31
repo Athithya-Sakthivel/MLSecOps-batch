@@ -50,9 +50,19 @@ ELT_PROFILE = (
     .lower()
 )
 
-ICEBERG_EXPIRE_DAYS = int(os.environ.get("ICEBERG_EXPIRE_DAYS", "7"))
-ICEBERG_ORPHAN_DAYS = int(os.environ.get("ICEBERG_ORPHAN_DAYS", "3"))
-ICEBERG_RETAIN_LAST = max(1, int(os.environ.get("ICEBERG_RETAIN_LAST", "2")))
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    value = int(os.environ.get(name, str(default)))
+    return max(value, minimum)
+
+
+def _env_str(name: str, default: str) -> str:
+    return os.environ.get(name, default).strip()
+
+
+ICEBERG_EXPIRE_DAYS = _env_int("ICEBERG_EXPIRE_DAYS", 7, minimum=0)
+ICEBERG_ORPHAN_DAYS = _env_int("ICEBERG_ORPHAN_DAYS", 3, minimum=0)
+ICEBERG_RETAIN_LAST = _env_int("ICEBERG_RETAIN_LAST", 2, minimum=1)
 
 DEFAULT_REWRITE_WHERE = "as_of_date >= date_sub(current_date(), 30)"
 
@@ -90,6 +100,11 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
     return out
 
 
+def append_unique(items: list[str], item: str) -> None:
+    if item not in items:
+        items.append(item)
+
+
 def utc_cutoff_string(days: int) -> str:
     if days < 0:
         raise RuntimeError(f"days must be non-negative, got {days}")
@@ -98,7 +113,7 @@ def utc_cutoff_string(days: int) -> str:
 
 
 def execute_sql_action(spark: SparkSession, statement: str) -> None:
-    spark.sql(statement).collect()
+    spark.sql(statement).rdd.foreachPartition(lambda _: None)
 
 
 def expire_snapshots_call(table_id: str, older_than: str) -> str:
@@ -182,27 +197,27 @@ def default_rewrite_predicates() -> dict[str, str]:
 
 def maintenance_spark_conf() -> dict[str, str]:
     if ELT_PROFILE == "prod":
-        spark_driver_memory = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
-        spark_executor_memory = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
-        spark_driver_memory_overhead = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
-        spark_executor_memory_overhead = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
-        spark_executor_cores = os.environ.get("SPARK_EXECUTOR_CORES", "1")
-        spark_executor_instances = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
-        spark_driver_cores = os.environ.get("SPARK_DRIVER_CORES", "1")
-        spark_shuffle_partitions = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
-        spark_max_partition_bytes = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
-        spark_max_result_size = os.environ.get("SPARK_MAX_RESULT_SIZE", "256m")
+        spark_driver_memory = _env_str("SPARK_DRIVER_MEMORY", "1g")
+        spark_executor_memory = _env_str("SPARK_EXECUTOR_MEMORY", "1g")
+        spark_driver_memory_overhead = _env_str("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
+        spark_executor_memory_overhead = _env_str("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
+        spark_executor_cores = _env_str("SPARK_EXECUTOR_CORES", "1")
+        spark_executor_instances = _env_str("SPARK_EXECUTOR_INSTANCES", "1")
+        spark_driver_cores = _env_str("SPARK_DRIVER_CORES", "1")
+        spark_shuffle_partitions = _env_str("SPARK_SHUFFLE_PARTITIONS", "4")
+        spark_max_partition_bytes = _env_str("SPARK_MAX_PARTITION_BYTES", "134217728")
+        spark_max_result_size = _env_str("SPARK_MAX_RESULT_SIZE", "256m")
     else:
-        spark_driver_memory = os.environ.get("SPARK_DRIVER_MEMORY", "768m")
-        spark_executor_memory = os.environ.get("SPARK_EXECUTOR_MEMORY", "512m")
-        spark_driver_memory_overhead = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
-        spark_executor_memory_overhead = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
-        spark_executor_cores = os.environ.get("SPARK_EXECUTOR_CORES", "1")
-        spark_executor_instances = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
-        spark_driver_cores = os.environ.get("SPARK_DRIVER_CORES", "1")
-        spark_shuffle_partitions = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
-        spark_max_partition_bytes = os.environ.get("SPARK_MAX_PARTITION_BYTES", "67108864")
-        spark_max_result_size = os.environ.get("SPARK_MAX_RESULT_SIZE", "128m")
+        spark_driver_memory = _env_str("SPARK_DRIVER_MEMORY", "768m")
+        spark_executor_memory = _env_str("SPARK_EXECUTOR_MEMORY", "512m")
+        spark_driver_memory_overhead = _env_str("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
+        spark_executor_memory_overhead = _env_str("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
+        spark_executor_cores = _env_str("SPARK_EXECUTOR_CORES", "1")
+        spark_executor_instances = _env_str("SPARK_EXECUTOR_INSTANCES", "1")
+        spark_driver_cores = _env_str("SPARK_DRIVER_CORES", "1")
+        spark_shuffle_partitions = _env_str("SPARK_SHUFFLE_PARTITIONS", "4")
+        spark_max_partition_bytes = _env_str("SPARK_MAX_PARTITION_BYTES", "67108864")
+        spark_max_result_size = _env_str("SPARK_MAX_RESULT_SIZE", "128m")
 
     return build_spark_conf(
         spark_driver_memory=spark_driver_memory,
@@ -226,10 +241,10 @@ def maintenance_spark_conf() -> dict[str, str]:
     ),
     container_image=TASK_IMAGE,
     environment=build_task_environment(),
-    retries=int(os.environ.get("MAINTENANCE_TASK_RETRIES", "1")),
+    retries=_env_int("MAINTENANCE_TASK_RETRIES", 1, minimum=0),
     limits=Resources(
         cpu="1000m" if ELT_PROFILE == "prod" else "500m",
-        mem="768Mi" if ELT_PROFILE != "prod" else "1024Mi",
+        mem="1024Mi" if ELT_PROFILE == "prod" else "768Mi",
     ),
 )
 def maintenance_optimize() -> MaintenanceResult:
@@ -270,7 +285,8 @@ def maintenance_optimize() -> MaintenanceResult:
     if not rewrite_where_by_table:
         rewrite_where_by_table = default_rewrite_predicates()
 
-    for table_id in dedupe_preserve_order(expire_tables + orphan_tables + rewrite_tables):
+    all_tables = dedupe_preserve_order(expire_tables + orphan_tables + rewrite_tables)
+    for table_id in all_tables:
         catalog_name, namespace, _ = parse_table_id(table_id)
         ensure_namespace(spark, catalog_name, namespace)
 
@@ -298,9 +314,11 @@ def maintenance_optimize() -> MaintenanceResult:
     expire_before = utc_cutoff_string(ICEBERG_EXPIRE_DAYS)
     orphan_before = utc_cutoff_string(ICEBERG_ORPHAN_DAYS)
 
+    orphan_only_tables = [table_id for table_id in orphan_tables if table_id not in expire_tables]
+
     for table_id in expire_tables:
         if not table_exists(spark, table_id):
-            skipped.append(table_id)
+            append_unique(skipped, table_id)
             table_results.append(
                 table_op_result(
                     table_id=table_id,
@@ -316,6 +334,15 @@ def maintenance_optimize() -> MaintenanceResult:
             log_json(msg="maintenance_expire_start", table=table_id, older_than=expire_before)
             execute_sql_action(spark, expire_snapshots_call(table_id, expire_before))
             log_json(msg="maintenance_expire_done", table=table_id)
+            expired_done.append(table_id)
+            table_results.append(
+                table_op_result(
+                    table_id=table_id,
+                    operation="expire_snapshots",
+                    status="ok",
+                    message="completed",
+                )
+            )
 
             if table_id in orphan_tables:
                 log_json(
@@ -325,18 +352,16 @@ def maintenance_optimize() -> MaintenanceResult:
                 )
                 execute_sql_action(spark, remove_orphan_files_call(table_id, orphan_before))
                 log_json(msg="maintenance_orphan_cleanup_done", table=table_id)
-
-            expired_done.append(table_id)
-            table_results.append(
-                table_op_result(
-                    table_id=table_id,
-                    operation="expire_orphan",
-                    status="ok",
-                    message="completed",
+                table_results.append(
+                    table_op_result(
+                        table_id=table_id,
+                        operation="remove_orphan_files",
+                        status="ok",
+                        message="completed",
+                    )
                 )
-            )
         except Exception as exc:
-            failed.append(table_id)
+            append_unique(failed, table_id)
             table_results.append(
                 table_op_result(
                     table_id=table_id,
@@ -353,9 +378,57 @@ def maintenance_optimize() -> MaintenanceResult:
             if not continue_on_error:
                 raise
 
+    for table_id in orphan_only_tables:
+        if not table_exists(spark, table_id):
+            append_unique(skipped, table_id)
+            table_results.append(
+                table_op_result(
+                    table_id=table_id,
+                    operation="remove_orphan_files",
+                    status="skipped",
+                    message="table_missing",
+                )
+            )
+            log_json(msg="maintenance_skip_missing_table", table=table_id, phase="remove_orphan_files")
+            continue
+
+        try:
+            log_json(
+                msg="maintenance_orphan_cleanup_start",
+                table=table_id,
+                older_than=orphan_before,
+            )
+            execute_sql_action(spark, remove_orphan_files_call(table_id, orphan_before))
+            log_json(msg="maintenance_orphan_cleanup_done", table=table_id)
+            table_results.append(
+                table_op_result(
+                    table_id=table_id,
+                    operation="remove_orphan_files",
+                    status="ok",
+                    message="completed",
+                )
+            )
+        except Exception as exc:
+            append_unique(failed, table_id)
+            table_results.append(
+                table_op_result(
+                    table_id=table_id,
+                    operation="remove_orphan_files",
+                    status="failed",
+                    message=str(exc),
+                )
+            )
+            log_json(
+                msg="maintenance_orphan_cleanup_failed",
+                table=table_id,
+                error=str(exc),
+            )
+            if not continue_on_error:
+                raise
+
     for table_id in rewrite_tables:
         if not table_exists(spark, table_id):
-            skipped.append(table_id)
+            append_unique(skipped, table_id)
             table_results.append(
                 table_op_result(
                     table_id=table_id,
@@ -369,7 +442,7 @@ def maintenance_optimize() -> MaintenanceResult:
 
         where_clause = rewrite_where_by_table.get(table_id, "").strip()
         if not where_clause:
-            skipped.append(table_id)
+            append_unique(skipped, table_id)
             table_results.append(
                 table_op_result(
                     table_id=table_id,
@@ -383,7 +456,7 @@ def maintenance_optimize() -> MaintenanceResult:
 
         try:
             if "as_of_date" in where_clause and not table_has_column(spark, table_id, "as_of_date"):
-                skipped.append(table_id)
+                append_unique(skipped, table_id)
                 table_results.append(
                     table_op_result(
                         table_id=table_id,
@@ -413,7 +486,7 @@ def maintenance_optimize() -> MaintenanceResult:
                 )
             )
         except Exception as exc:
-            failed.append(table_id)
+            append_unique(failed, table_id)
             table_results.append(
                 table_op_result(
                     table_id=table_id,

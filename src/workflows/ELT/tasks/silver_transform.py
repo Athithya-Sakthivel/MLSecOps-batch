@@ -17,6 +17,7 @@ from src.workflows.ELT.tasks.bronze_ingest import (
     BRONZE_NAMESPACE,
     CATALOG_NAME,
     GOLD_NAMESPACE,
+    ICEBERG_TARGET_FILE_SIZE_BYTES,
     SILVER_NAMESPACE,
     SILVER_TRIPS_TABLE,
     TASK_IMAGE,
@@ -49,34 +50,44 @@ ELT_PROFILE = (
     .lower()
 )
 
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    value = int(os.environ.get(name, str(default)))
+    return max(value, minimum)
+
+
+def _env_str(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
 if ELT_PROFILE == "prod":
     TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
-    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "2g")
-    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "2g")
-    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "512m")
-    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "512m")
-    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
-    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
-    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
-    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8")
-    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "134217728")
-    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "256m")
-    TASK_RETRIES = int(os.environ.get("SILVER_TASK_RETRIES", "1"))
-    SILVER_ROWS_PER_PARTITION = int(os.environ.get("SILVER_ROWS_PER_PARTITION", "100000"))
+    SPARK_DRIVER_MEMORY = _env_str("SPARK_DRIVER_MEMORY", "2g")
+    SPARK_EXECUTOR_MEMORY = _env_str("SPARK_EXECUTOR_MEMORY", "2g")
+    SPARK_DRIVER_MEMORY_OVERHEAD = _env_str("SPARK_DRIVER_MEMORY_OVERHEAD", "512m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = _env_str("SPARK_EXECUTOR_MEMORY_OVERHEAD", "512m")
+    SPARK_EXECUTOR_CORES = str(_env_int("SPARK_EXECUTOR_CORES", 1, minimum=1))
+    SPARK_EXECUTOR_INSTANCES = str(_env_int("SPARK_EXECUTOR_INSTANCES", 1, minimum=1))
+    SPARK_DRIVER_CORES = str(_env_int("SPARK_DRIVER_CORES", 1, minimum=1))
+    SPARK_SHUFFLE_PARTITIONS = str(_env_int("SPARK_SHUFFLE_PARTITIONS", 8, minimum=1))
+    SPARK_MAX_PARTITION_BYTES = _env_str("SPARK_MAX_PARTITION_BYTES", "134217728")
+    SPARK_MAX_RESULT_SIZE = _env_str("SPARK_MAX_RESULT_SIZE", "256m")
+    TASK_RETRIES = _env_int("SILVER_TASK_RETRIES", 1, minimum=0)
+    SILVER_ROWS_PER_PARTITION = _env_int("SILVER_ROWS_PER_PARTITION", 100000, minimum=1)
 else:
     TASK_LIMITS = Resources(cpu="500m", mem="768Mi")
-    SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
-    SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
-    SPARK_DRIVER_MEMORY_OVERHEAD = os.environ.get("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
-    SPARK_EXECUTOR_MEMORY_OVERHEAD = os.environ.get("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
-    SPARK_EXECUTOR_CORES = os.environ.get("SPARK_EXECUTOR_CORES", "1")
-    SPARK_EXECUTOR_INSTANCES = os.environ.get("SPARK_EXECUTOR_INSTANCES", "1")
-    SPARK_DRIVER_CORES = os.environ.get("SPARK_DRIVER_CORES", "1")
-    SPARK_SHUFFLE_PARTITIONS = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4")
-    SPARK_MAX_PARTITION_BYTES = os.environ.get("SPARK_MAX_PARTITION_BYTES", "67108864")
-    SPARK_MAX_RESULT_SIZE = os.environ.get("SPARK_MAX_RESULT_SIZE", "128m")
-    TASK_RETRIES = int(os.environ.get("SILVER_TASK_RETRIES", "1"))
-    SILVER_ROWS_PER_PARTITION = int(os.environ.get("SILVER_ROWS_PER_PARTITION", "50000"))
+    SPARK_DRIVER_MEMORY = _env_str("SPARK_DRIVER_MEMORY", "1g")
+    SPARK_EXECUTOR_MEMORY = _env_str("SPARK_EXECUTOR_MEMORY", "1g")
+    SPARK_DRIVER_MEMORY_OVERHEAD = _env_str("SPARK_DRIVER_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_MEMORY_OVERHEAD = _env_str("SPARK_EXECUTOR_MEMORY_OVERHEAD", "256m")
+    SPARK_EXECUTOR_CORES = str(_env_int("SPARK_EXECUTOR_CORES", 1, minimum=1))
+    SPARK_EXECUTOR_INSTANCES = str(_env_int("SPARK_EXECUTOR_INSTANCES", 1, minimum=1))
+    SPARK_DRIVER_CORES = str(_env_int("SPARK_DRIVER_CORES", 1, minimum=1))
+    SPARK_SHUFFLE_PARTITIONS = str(_env_int("SPARK_SHUFFLE_PARTITIONS", 4, minimum=1))
+    SPARK_MAX_PARTITION_BYTES = _env_str("SPARK_MAX_PARTITION_BYTES", "67108864")
+    SPARK_MAX_RESULT_SIZE = _env_str("SPARK_MAX_RESULT_SIZE", "128m")
+    TASK_RETRIES = _env_int("SILVER_TASK_RETRIES", 1, minimum=0)
+    SILVER_ROWS_PER_PARTITION = _env_int("SILVER_ROWS_PER_PARTITION", 50000, minimum=1)
 
 
 @dataclass(frozen=True)
@@ -95,55 +106,154 @@ def require_columns(df: DataFrame, required: Sequence[str], label: str) -> None:
         raise RuntimeError(f"{label} is missing required columns: {sorted(missing)}")
 
 
-def ensure_column(df: DataFrame, column: str, spark_type: str) -> DataFrame:
-    if column in df.columns:
-        return df.withColumn(column, F.col(column).cast(spark_type))
-    return df.withColumn(column, F.lit(None).cast(spark_type))
+def _present_columns(df: DataFrame, candidates: Sequence[str]) -> list[str]:
+    return [candidate for candidate in candidates if candidate in df.columns]
+
+
+def _coalesced_typed_expr(
+    df: DataFrame,
+    candidates: Sequence[str],
+    builder,
+    *,
+    null_type: str,
+) -> F.Column:
+    present = _present_columns(df, candidates)
+    if not present:
+        return F.lit(None).cast(null_type)
+    return F.coalesce(*[builder(F.col(column)) for column in present])
+
+
+def _safe_to_timestamp_expr(value: F.Column) -> F.Column:
+    raw = F.trim(value.cast("string"))
+    return F.when(
+        raw.isNull() | (raw == ""),
+        F.lit(None).cast("timestamp"),
+    ).otherwise(
+        F.coalesce(
+            F.to_timestamp(raw),
+            F.to_timestamp(raw, "yyyy-MM-dd HH:mm:ss"),
+            F.to_timestamp(raw, "yyyy-MM-dd HH:mm:ss.SSS"),
+            F.to_timestamp(raw, "yyyy-MM-dd'T'HH:mm:ss"),
+            F.to_timestamp(raw, "yyyy-MM-dd'T'HH:mm:ss.SSS"),
+        )
+    )
+
+
+def _safe_cast_long_expr(value: F.Column) -> F.Column:
+    raw = F.trim(value.cast("string"))
+    return F.when(
+        raw.isNull() | (raw == ""),
+        F.lit(None).cast("long"),
+    ).when(
+        raw.rlike(r"^[+-]?\d+$"),
+        raw.cast("long"),
+    ).otherwise(F.lit(None).cast("long"))
+
+
+def _safe_cast_double_expr(value: F.Column) -> F.Column:
+    raw = F.trim(value.cast("string"))
+    return F.when(
+        raw.isNull() | (raw == ""),
+        F.lit(None).cast("double"),
+    ).when(
+        raw.rlike(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$"),
+        raw.cast("double"),
+    ).otherwise(F.lit(None).cast("double"))
 
 
 def ensure_trips_schema(df: DataFrame) -> DataFrame:
     required = (
-        "pickup_ts",
-        "dropoff_ts",
-        "pickup_location_id",
-        "dropoff_location_id",
-        "trip_distance",
-        "fare_amount",
-        "total_amount",
         "run_id",
         "source_revision",
         "source_file",
         "source_uri",
+        "source_kind",
         "ingestion_ts",
     )
     require_columns(df, required, "bronze trips table")
 
-    cast_map = {
-        "pickup_location_id": "long",
-        "dropoff_location_id": "long",
-        "trip_distance": "double",
-        "fare_amount": "double",
-        "tip_amount": "double",
-        "total_amount": "double",
-        "extra": "double",
-        "mta_tax": "double",
-        "tolls_amount": "double",
-        "improvement_surcharge": "double",
-        "congestion_surcharge": "double",
-        "cbd_congestion_fee": "double",
-        "vendor_id": "long",
-        "ratecode_id": "long",
-        "passenger_count": "long",
-        "payment_type": "long",
-        "trip_type": "long",
-        "store_and_fwd_flag": "string",
-    }
-
-    normalized = df
-    for col_name, spark_type in cast_map.items():
-        normalized = ensure_column(normalized, col_name, spark_type)
-
-    return normalized
+    return df.select(
+        _coalesced_typed_expr(
+            df,
+            ("pickup_ts", "tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_datetime"),
+            _safe_to_timestamp_expr,
+            null_type="timestamp",
+        ).alias("pickup_ts"),
+        _coalesced_typed_expr(
+            df,
+            ("dropoff_ts", "tpep_dropoff_datetime", "lpep_dropoff_datetime", "dropoff_datetime"),
+            _safe_to_timestamp_expr,
+            null_type="timestamp",
+        ).alias("dropoff_ts"),
+        _coalesced_typed_expr(
+            df,
+            ("pickup_location_id", "pulocation_id"),
+            _safe_cast_long_expr,
+            null_type="long",
+        ).alias("pickup_location_id"),
+        _coalesced_typed_expr(
+            df,
+            ("dropoff_location_id", "dolocation_id"),
+            _safe_cast_long_expr,
+            null_type="long",
+        ).alias("dropoff_location_id"),
+        _coalesced_typed_expr(df, ("vendor_id",), _safe_cast_long_expr, null_type="long").alias("vendor_id"),
+        _coalesced_typed_expr(df, ("ratecode_id",), _safe_cast_long_expr, null_type="long").alias("ratecode_id"),
+        _coalesced_typed_expr(
+            df,
+            ("passenger_count",),
+            _safe_cast_long_expr,
+            null_type="long",
+        ).alias("passenger_count"),
+        _coalesced_typed_expr(df, ("payment_type",), _safe_cast_long_expr, null_type="long").alias("payment_type"),
+        _coalesced_typed_expr(df, ("trip_type",), _safe_cast_long_expr, null_type="long").alias("trip_type"),
+        _coalesced_typed_expr(df, ("trip_distance",), _safe_cast_double_expr, null_type="double").alias("trip_distance"),
+        _coalesced_typed_expr(df, ("fare_amount",), _safe_cast_double_expr, null_type="double").alias("fare_amount"),
+        _coalesced_typed_expr(df, ("tip_amount",), _safe_cast_double_expr, null_type="double").alias("tip_amount"),
+        _coalesced_typed_expr(df, ("total_amount",), _safe_cast_double_expr, null_type="double").alias("total_amount"),
+        _coalesced_typed_expr(df, ("extra",), _safe_cast_double_expr, null_type="double").alias("extra"),
+        _coalesced_typed_expr(df, ("mta_tax",), _safe_cast_double_expr, null_type="double").alias("mta_tax"),
+        _coalesced_typed_expr(df, ("tolls_amount",), _safe_cast_double_expr, null_type="double").alias("tolls_amount"),
+        _coalesced_typed_expr(df, ("ehail_fee",), _safe_cast_double_expr, null_type="double").alias("ehail_fee"),
+        _coalesced_typed_expr(
+            df,
+            ("improvement_surcharge",),
+            _safe_cast_double_expr,
+            null_type="double",
+        ).alias("improvement_surcharge"),
+        _coalesced_typed_expr(
+            df,
+            ("congestion_surcharge",),
+            _safe_cast_double_expr,
+            null_type="double",
+        ).alias("congestion_surcharge"),
+        _coalesced_typed_expr(df, ("airport_fee",), _safe_cast_double_expr, null_type="double").alias("airport_fee"),
+        _coalesced_typed_expr(
+            df,
+            ("cbd_congestion_fee",),
+            _safe_cast_double_expr,
+            null_type="double",
+        ).alias("cbd_congestion_fee"),
+        _coalesced_typed_expr(df, ("store_and_fwd_flag",), lambda c: c.cast("string"), null_type="string").alias(
+            "store_and_fwd_flag"
+        ),
+        _coalesced_typed_expr(df, ("source_uri",), lambda c: c.cast("string"), null_type="string").alias("source_uri"),
+        _coalesced_typed_expr(
+            df,
+            ("source_revision",),
+            lambda c: c.cast("string"),
+            null_type="string",
+        ).alias("source_revision"),
+        _coalesced_typed_expr(df, ("source_file",), lambda c: c.cast("string"), null_type="string").alias("source_file"),
+        _coalesced_typed_expr(df, ("source_kind",), lambda c: c.cast("string"), null_type="string").alias("source_kind"),
+        _coalesced_typed_expr(df, ("run_id",), lambda c: c.cast("string"), null_type="string").alias("run_id"),
+        _coalesced_typed_expr(
+            df,
+            ("ingestion_ts",),
+            _safe_to_timestamp_expr,
+            null_type="timestamp",
+        ).alias("ingestion_ts"),
+    )
 
 
 def ensure_zone_schema(df: DataFrame) -> DataFrame:
@@ -162,19 +272,19 @@ def stable_trip_id_expr() -> F.Column:
     return F.sha2(
         F.concat_ws(
             "||",
-            F.coalesce(F.col("t.pickup_ts").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.dropoff_ts").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.pickup_location_id").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.dropoff_location_id").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.vendor_id").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.ratecode_id").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.passenger_count").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.payment_type").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.trip_distance").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.fare_amount").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.total_amount").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.source_revision").cast("string"), F.lit("")),
-            F.coalesce(F.col("t.source_file").cast("string"), F.lit("")),
+            F.coalesce(F.col("pickup_ts").cast("string"), F.lit("")),
+            F.coalesce(F.col("dropoff_ts").cast("string"), F.lit("")),
+            F.coalesce(F.col("pickup_location_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("dropoff_location_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("vendor_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("ratecode_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("passenger_count").cast("string"), F.lit("")),
+            F.coalesce(F.col("payment_type").cast("string"), F.lit("")),
+            F.coalesce(F.col("trip_distance").cast("string"), F.lit("")),
+            F.coalesce(F.col("fare_amount").cast("string"), F.lit("")),
+            F.coalesce(F.col("total_amount").cast("string"), F.lit("")),
+            F.coalesce(F.col("source_revision").cast("string"), F.lit("")),
+            F.coalesce(F.col("source_file").cast("string"), F.lit("")),
         ),
         256,
     )
@@ -182,18 +292,18 @@ def stable_trip_id_expr() -> F.Column:
 
 def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_column: str) -> str:
     table_id = qualify_table_id(table_id)
-    if table_exists(df.sparkSession, table_id):
-        df.writeTo(table_id).overwritePartitions()
-        return "overwrite_partitions"
-
-    (
+    writer = (
         df.writeTo(table_id)
         .tableProperty("format-version", "2")
         .tableProperty("write.format.default", "parquet")
-        .tableProperty("write.target-file-size-bytes", "268435456")
-        .partitionedBy(F.col(partition_column))
-        .create()
+        .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
     )
+
+    if table_exists(df.sparkSession, table_id):
+        writer.overwritePartitions()
+        return "overwrite_partitions"
+
+    writer.partitionedBy(F.col(partition_column)).create()
     return "create"
 
 
@@ -232,43 +342,43 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
         )
     )
 
-    canonical = joined.select(
-        F.col("t.run_id").alias("bronze_run_id"),
-        F.col("t.source_uri"),
-        F.col("t.source_revision"),
-        F.col("t.source_file"),
-        F.col("t.source_kind"),
-        F.col("t.ingestion_ts"),
-        F.col("t.pickup_ts"),
-        F.col("t.dropoff_ts"),
-        F.col("t.pickup_location_id"),
-        F.col("t.dropoff_location_id"),
-        F.col("t.vendor_id"),
-        F.col("t.ratecode_id"),
-        F.col("t.passenger_count"),
-        F.col("t.payment_type"),
-        F.col("t.trip_type"),
-        F.col("t.store_and_fwd_flag"),
-        F.col("t.trip_distance"),
-        F.col("t.fare_amount"),
-        F.col("t.tip_amount"),
-        F.col("t.total_amount"),
-        F.col("t.extra"),
-        F.col("t.mta_tax"),
-        F.col("t.tolls_amount"),
-        F.col("t.improvement_surcharge"),
-        F.col("t.congestion_surcharge"),
-        F.col("t.cbd_congestion_fee"),
-        F.col("pickup_borough"),
-        F.col("pickup_zone"),
-        F.col("pickup_service_zone"),
-        F.col("dropoff_borough"),
-        F.col("dropoff_zone"),
-        F.col("dropoff_service_zone"),
-    ).withColumn("trip_id", stable_trip_id_expr())
-
     canonical = (
-        canonical.withColumn("pickup_date", F.to_date(F.col("pickup_ts")))
+        joined.select(
+            F.col("t.run_id").alias("bronze_run_id"),
+            F.col("t.source_uri"),
+            F.col("t.source_revision"),
+            F.col("t.source_file"),
+            F.col("t.source_kind"),
+            F.col("t.ingestion_ts"),
+            F.col("t.pickup_ts"),
+            F.col("t.dropoff_ts"),
+            F.col("t.pickup_location_id"),
+            F.col("t.dropoff_location_id"),
+            F.col("t.vendor_id"),
+            F.col("t.ratecode_id"),
+            F.col("t.passenger_count"),
+            F.col("t.payment_type"),
+            F.col("t.trip_type"),
+            F.col("t.store_and_fwd_flag"),
+            F.col("t.trip_distance"),
+            F.col("t.fare_amount"),
+            F.col("t.tip_amount"),
+            F.col("t.total_amount"),
+            F.col("t.extra"),
+            F.col("t.mta_tax"),
+            F.col("t.tolls_amount"),
+            F.col("t.improvement_surcharge"),
+            F.col("t.congestion_surcharge"),
+            F.col("t.cbd_congestion_fee"),
+            F.col("pickup_borough"),
+            F.col("pickup_zone"),
+            F.col("pickup_service_zone"),
+            F.col("dropoff_borough"),
+            F.col("dropoff_zone"),
+            F.col("dropoff_service_zone"),
+        )
+        .withColumn("trip_id", stable_trip_id_expr())
+        .withColumn("pickup_date", F.to_date(F.col("pickup_ts")))
         .withColumn("pickup_hour", F.hour(F.col("pickup_ts")).cast("int"))
         .withColumn("pickup_dow", F.dayofweek(F.col("pickup_ts")).cast("int"))
         .withColumn("pickup_month", F.month(F.col("pickup_ts")).cast("int"))
@@ -280,10 +390,7 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
             "trip_duration_seconds",
             (F.col("dropoff_ts").cast("long") - F.col("pickup_ts").cast("long")).cast("long"),
         )
-        .withColumn(
-            "trip_duration_minutes",
-            F.round(F.col("trip_duration_seconds") / F.lit(60.0), 3),
-        )
+        .withColumn("trip_duration_minutes", F.round(F.col("trip_duration_seconds") / F.lit(60.0), 3))
         .withColumn("silver_run_id", F.lit(run_id))
     )
 
@@ -415,6 +522,9 @@ def silver_transform(bronze: BronzeIngestResult) -> SilverTransformResult:
         bronze_taxi_zone_table=bronze_taxi_zone_table,
         silver_table=silver_table,
         bronze_trips_rows=bronze.trips_rows,
+        bronze_taxi_zone_rows=bronze.taxi_zone_rows,
+        source_trips_table=bronze_trips_table,
+        source_taxi_zone_table=bronze_taxi_zone_table,
     )
 
     trips_df = spark.table(bronze_trips_table)

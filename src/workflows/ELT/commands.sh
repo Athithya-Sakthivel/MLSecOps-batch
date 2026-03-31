@@ -1,4 +1,4 @@
-export ELT_TASK_IMAGE="ghcr.io/athithya-sakthivel/flyte-elt-task:2026-03-30-07-33--15e04f8"
+export ELT_TASK_IMAGE="ghcr.io/athithya-sakthivel/flyte-elt-task:2026-03-30-20-31--484f677"
 source .venv_elt/bin/activate
 export ELT_PROFILE="staging"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
