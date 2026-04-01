@@ -9,5 +9,5 @@ mountOptions:
   - noatime
   - nodiratime
 reclaimPolicy: Delete
-volumeBindingMode: Immediate
+volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: true

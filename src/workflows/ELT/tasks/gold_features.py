@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -53,6 +54,10 @@ ELT_PROFILE = (
     .strip()
     .lower()
 )
+
+SPARK_ICEBERG_MERGE_SCHEMA_CONF = "spark.sql.iceberg.merge-schema"
+ICEBERG_ACCEPT_ANY_SCHEMA_PROPERTY = "write.spark.accept-any-schema"
+_SPARK_CONF_UNSET_SENTINEL = "__spark_conf_unset__"
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -179,38 +184,72 @@ def require_columns(df: DataFrame, required: Sequence[str], label: str) -> None:
         raise RuntimeError(f"{label} is missing required columns: {sorted(missing)}")
 
 
-def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_column: str) -> str:
-    table_id = qualify_table_id(table_id)
-    writer = (
-        df.writeTo(table_id)
-        .tableProperty("format-version", "2")
-        .tableProperty("write.format.default", "parquet")
-        .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
+@contextmanager
+def _iceberg_merge_schema_enabled(spark):
+    previous = spark.conf.get(SPARK_ICEBERG_MERGE_SCHEMA_CONF, _SPARK_CONF_UNSET_SENTINEL)
+    spark.conf.set(SPARK_ICEBERG_MERGE_SCHEMA_CONF, "true")
+    try:
+        yield
+    finally:
+        if previous == _SPARK_CONF_UNSET_SENTINEL:
+            try:
+                spark.conf.unset(SPARK_ICEBERG_MERGE_SCHEMA_CONF)
+            except Exception:
+                pass
+        else:
+            spark.conf.set(SPARK_ICEBERG_MERGE_SCHEMA_CONF, previous)
+
+
+def ensure_iceberg_accept_any_schema(spark, table_id: str) -> None:
+    qualified_table_id = qualify_table_id(table_id)
+    if not table_exists(spark, qualified_table_id):
+        return
+    spark.sql(
+        f"ALTER TABLE {qualified_table_id} SET TBLPROPERTIES "
+        f"('{ICEBERG_ACCEPT_ANY_SCHEMA_PROPERTY}'='true')"
     )
 
-    if table_exists(df.sparkSession, table_id):
-        writer.overwritePartitions()
-        return "overwrite_partitions"
 
-    writer.partitionedBy(F.col(partition_column)).create()
-    return "create"
+def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_column: str) -> str:
+    table_id = qualify_table_id(table_id)
+    with _iceberg_merge_schema_enabled(df.sparkSession):
+        ensure_iceberg_accept_any_schema(df.sparkSession, table_id)
+        writer = (
+            df.writeTo(table_id)
+            .option("mergeSchema", "true")
+            .tableProperty("format-version", "2")
+            .tableProperty("write.spark.accept-any-schema", "true")
+            .tableProperty("write.format.default", "parquet")
+            .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
+        )
+
+        if table_exists(df.sparkSession, table_id):
+            writer.overwritePartitions()
+            return "overwrite_partitions"
+
+        writer.partitionedBy(F.col(partition_column)).create()
+        return "create"
 
 
 def write_versioned_contract_table(df: DataFrame, table_id: str) -> str:
     table_id = qualify_table_id(table_id)
-    writer = (
-        df.writeTo(table_id)
-        .tableProperty("format-version", "2")
-        .tableProperty("write.format.default", "parquet")
-        .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
-    )
+    with _iceberg_merge_schema_enabled(df.sparkSession):
+        ensure_iceberg_accept_any_schema(df.sparkSession, table_id)
+        writer = (
+            df.writeTo(table_id)
+            .option("mergeSchema", "true")
+            .tableProperty("format-version", "2")
+            .tableProperty("write.spark.accept-any-schema", "true")
+            .tableProperty("write.format.default", "parquet")
+            .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
+        )
 
-    if table_exists(df.sparkSession, table_id):
-        writer.overwritePartitions()
-        return "overwrite_partitions"
+        if table_exists(df.sparkSession, table_id):
+            writer.append()
+            return "append"
 
-    writer.partitionedBy(F.col("feature_version")).create()
-    return "create"
+        writer.partitionedBy(F.col("feature_version")).create()
+        return "create"
 
 
 def normalize_text_expr(col_name: str) -> F.Column:
@@ -238,8 +277,11 @@ def distinct_service_zone_values(silver_df: DataFrame) -> list[str]:
         .where(F.col("service_zone_norm") != "")
         .distinct()
         .orderBy("service_zone_norm")
+        .limit(1001)
         .collect()
     )
+    if len(rows) > 1000:
+        raise RuntimeError("service_zone cardinality exceeded safety bound of 1000 distinct values")
     return [row["service_zone_norm"] for row in rows]
 
 
@@ -269,33 +311,192 @@ def route_pair_bucket_expr(pickup_zone_id_col: F.Column, dropoff_zone_id_col: F.
     )
 
 
+def _safe_nan_double() -> F.Column:
+    return F.lit(float("nan")).cast("double")
+
+
 def build_window_features(df: DataFrame) -> DataFrame:
-    df = df.withColumn("as_of_ts_sec", F.col("as_of_ts").cast("long"))
-
-    w_zone_hour_7d = (
-        Window.partitionBy("pickup_zone_id", "pickup_hour").orderBy("as_of_ts_sec").rangeBetween(-7 * 24 * 60 * 60, -1)
-    )
-    w_zone_30d = Window.partitionBy("pickup_zone_id").orderBy("as_of_ts_sec").rangeBetween(-30 * 24 * 60 * 60, -1)
-    w_zone_hour_90d = (
-        Window.partitionBy("pickup_zone_id", "pickup_hour").orderBy("as_of_ts_sec").rangeBetween(-90 * 24 * 60 * 60, -1)
+    base = (
+        df.withColumn("as_of_ts_sec", F.col("as_of_ts").cast("long"))
+        .withColumn("as_of_date_sec", F.col("as_of_date").cast("timestamp").cast("long"))
+        .withColumn("trip_duration_seconds_value", F.col("label_trip_duration_seconds").cast("double"))
+        .withColumn("fare_amount_value", F.col("fare_amount").cast("double"))
     )
 
-    return (
-        df.withColumn(
+    w_same_day_zone_hour = (
+        Window.partitionBy("pickup_zone_id", "pickup_hour", "as_of_date")
+        .orderBy("as_of_ts_sec")
+        .rowsBetween(Window.unboundedPreceding, -1)
+    )
+    w_same_day_zone = (
+        Window.partitionBy("pickup_zone_id", "as_of_date")
+        .orderBy("as_of_ts_sec")
+        .rowsBetween(Window.unboundedPreceding, -1)
+    )
+
+    same_day = (
+        base.withColumn(
+            "same_day_duration_sum_zone_hour",
+            F.coalesce(F.sum("trip_duration_seconds_value").over(w_same_day_zone_hour), F.lit(0.0)),
+        )
+        .withColumn(
+            "same_day_duration_count_zone_hour",
+            F.coalesce(F.count(F.lit(1)).over(w_same_day_zone_hour), F.lit(0)).cast("double"),
+        )
+        .withColumn(
+            "same_day_fare_sum_zone",
+            F.coalesce(F.sum("fare_amount_value").over(w_same_day_zone), F.lit(0.0)),
+        )
+        .withColumn(
+            "same_day_fare_count_zone",
+            F.coalesce(F.count(F.lit(1)).over(w_same_day_zone), F.lit(0)).cast("double"),
+        )
+    )
+
+    zone_hour_daily = (
+        same_day.groupBy("pickup_zone_id", "pickup_hour", "as_of_date")
+        .agg(
+            F.sum("trip_duration_seconds_value").alias("day_duration_sum_zone_hour"),
+            F.count(F.lit(1)).alias("day_trip_count_zone_hour"),
+        )
+        .withColumn("as_of_date_sec", F.col("as_of_date").cast("timestamp").cast("long"))
+    )
+
+    zone_daily = (
+        same_day.groupBy("pickup_zone_id", "as_of_date")
+        .agg(
+            F.sum("fare_amount_value").alias("day_fare_sum_zone"),
+            F.count(F.lit(1)).alias("day_fare_count_zone"),
+        )
+        .withColumn("as_of_date_sec", F.col("as_of_date").cast("timestamp").cast("long"))
+    )
+
+    w_prev_7d_zone_hour = (
+        Window.partitionBy("pickup_zone_id", "pickup_hour")
+        .orderBy("as_of_date_sec")
+        .rangeBetween(-7 * 24 * 60 * 60, -1)
+    )
+    w_prev_90d_zone_hour = (
+        Window.partitionBy("pickup_zone_id", "pickup_hour")
+        .orderBy("as_of_date_sec")
+        .rangeBetween(-90 * 24 * 60 * 60, -1)
+    )
+    w_prev_30d_zone = Window.partitionBy("pickup_zone_id").orderBy("as_of_date_sec").rangeBetween(-30 * 24 * 60 * 60, -1)
+
+    zone_hour_history = (
+        zone_hour_daily.withColumn(
+            "prev_7d_duration_sum_zone_hour",
+            F.coalesce(F.sum("day_duration_sum_zone_hour").over(w_prev_7d_zone_hour), F.lit(0.0)),
+        )
+        .withColumn(
+            "prev_7d_duration_count_zone_hour",
+            F.coalesce(F.sum("day_trip_count_zone_hour").over(w_prev_7d_zone_hour), F.lit(0.0)).cast("double"),
+        )
+        .withColumn(
+            "prev_90d_trip_count_zone_hour",
+            F.coalesce(F.sum("day_trip_count_zone_hour").over(w_prev_90d_zone_hour), F.lit(0.0)).cast("double"),
+        )
+        .select(
+            "pickup_zone_id",
+            "pickup_hour",
+            "as_of_date",
+            "prev_7d_duration_sum_zone_hour",
+            "prev_7d_duration_count_zone_hour",
+            "prev_90d_trip_count_zone_hour",
+        )
+    )
+
+    zone_history = (
+        zone_daily.withColumn(
+            "prev_30d_fare_sum_zone",
+            F.coalesce(F.sum("day_fare_sum_zone").over(w_prev_30d_zone), F.lit(0.0)),
+        )
+        .withColumn(
+            "prev_30d_fare_count_zone",
+            F.coalesce(F.sum("day_fare_count_zone").over(w_prev_30d_zone), F.lit(0.0)).cast("double"),
+        )
+        .select(
+            "pickup_zone_id",
+            "as_of_date",
+            "prev_30d_fare_sum_zone",
+            "prev_30d_fare_count_zone",
+        )
+    )
+
+    enriched = (
+        same_day.join(
+            zone_hour_history,
+            on=["pickup_zone_id", "pickup_hour", "as_of_date"],
+            how="left",
+        )
+        .join(
+            zone_history,
+            on=["pickup_zone_id", "as_of_date"],
+            how="left",
+        )
+        .withColumn(
             "avg_duration_7d_zone_hour",
-            F.coalesce(F.avg(F.col("label_trip_duration_seconds")).over(w_zone_hour_7d), F.lit(float("nan"))).cast(
-                "double"
-            ),
+            F.when(
+                (
+                    F.coalesce(F.col("prev_7d_duration_count_zone_hour"), F.lit(0.0))
+                    + F.coalesce(F.col("same_day_duration_count_zone_hour"), F.lit(0.0))
+                )
+                > 0,
+                (
+                    F.coalesce(F.col("prev_7d_duration_sum_zone_hour"), F.lit(0.0))
+                    + F.coalesce(F.col("same_day_duration_sum_zone_hour"), F.lit(0.0))
+                )
+                / (
+                    F.coalesce(F.col("prev_7d_duration_count_zone_hour"), F.lit(0.0))
+                    + F.coalesce(F.col("same_day_duration_count_zone_hour"), F.lit(0.0))
+                ),
+            ).otherwise(_safe_nan_double()).cast("double"),
         )
         .withColumn(
             "avg_fare_30d_zone",
-            F.coalesce(F.avg(F.col("fare_amount")).over(w_zone_30d), F.lit(float("nan"))).cast("double"),
+            F.when(
+                (
+                    F.coalesce(F.col("prev_30d_fare_count_zone"), F.lit(0.0))
+                    + F.coalesce(F.col("same_day_fare_count_zone"), F.lit(0.0))
+                )
+                > 0,
+                (
+                    F.coalesce(F.col("prev_30d_fare_sum_zone"), F.lit(0.0))
+                    + F.coalesce(F.col("same_day_fare_sum_zone"), F.lit(0.0))
+                )
+                / (
+                    F.coalesce(F.col("prev_30d_fare_count_zone"), F.lit(0.0))
+                    + F.coalesce(F.col("same_day_fare_count_zone"), F.lit(0.0))
+                ),
+            ).otherwise(_safe_nan_double()).cast("double"),
         )
         .withColumn(
             "trip_count_90d_zone_hour",
-            F.coalesce(F.count(F.lit(1)).over(w_zone_hour_90d), F.lit(0)).cast("double"),
+            (
+                F.coalesce(F.col("prev_90d_trip_count_zone_hour"), F.lit(0.0))
+                + F.coalesce(F.col("same_day_duration_count_zone_hour"), F.lit(0.0))
+            ).cast("double"),
         )
-        .drop("as_of_ts_sec")
+    )
+
+    return enriched.drop(
+        "as_of_ts_sec",
+        "as_of_date_sec",
+        "trip_duration_seconds_value",
+        "fare_amount_value",
+        "same_day_duration_sum_zone_hour",
+        "same_day_duration_count_zone_hour",
+        "same_day_fare_sum_zone",
+        "same_day_fare_count_zone",
+        "prev_7d_duration_sum_zone_hour",
+        "prev_7d_duration_count_zone_hour",
+        "prev_90d_trip_count_zone_hour",
+        "prev_30d_fare_sum_zone",
+        "prev_30d_fare_count_zone",
+        "day_duration_sum_zone_hour",
+        "day_trip_count_zone_hour",
+        "day_fare_sum_zone",
+        "day_fare_count_zone",
     )
 
 
@@ -719,6 +920,8 @@ def build_training_matrix(
         .withColumn("label_trip_duration_seconds", F.col("trip_duration_seconds").cast("double"))
     )
 
+    base = base.filter(F.col("label_trip_duration_seconds").isNotNull() & (F.col("label_trip_duration_seconds") > 0))
+
     service_zone_values = distinct_service_zone_values(base)
     service_zone_map_df = build_service_zone_map_df(base.sparkSession, service_zone_values)
     base = encode_categories(base, service_zone_map_df)
@@ -876,7 +1079,7 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
         "encoding_spec_json": encoding_spec_json,
         "aggregate_spec_json": aggregate_spec_json,
         "label_spec_json": label_spec_json,
-        "created_ts": datetime.now(UTC),
+        "created_ts": datetime.now(UTC).replace(tzinfo=None),
     }
 
     contract_df = _build_contract_df(spark, row=contract_row)

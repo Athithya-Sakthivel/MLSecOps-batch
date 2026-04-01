@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from flytekit import Resources, task
 from flytekitplugins.spark import Spark
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.functions import broadcast
 
@@ -48,6 +48,10 @@ ELT_PROFILE = (
     .strip()
     .lower()
 )
+
+SPARK_ICEBERG_MERGE_SCHEMA_CONF = "spark.sql.iceberg.merge-schema"
+ICEBERG_ACCEPT_ANY_SCHEMA_PROPERTY = "write.spark.accept-any-schema"
+_SPARK_CONF_UNSET_SENTINEL = "__spark_conf_unset__"
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -158,6 +162,35 @@ def _safe_cast_double_expr(value: F.Column) -> F.Column:
         raw.rlike(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$"),
         raw.cast("double"),
     ).otherwise(F.lit(None).cast("double"))
+
+
+def _non_empty_string(column: F.Column) -> F.Column:
+    return F.length(F.trim(F.coalesce(column.cast("string"), F.lit("")))) > 0
+
+
+def _iceberg_merge_schema_enabled(spark: SparkSession):
+    previous = spark.conf.get(SPARK_ICEBERG_MERGE_SCHEMA_CONF, _SPARK_CONF_UNSET_SENTINEL)
+    spark.conf.set(SPARK_ICEBERG_MERGE_SCHEMA_CONF, "true")
+    try:
+        yield
+    finally:
+        if previous == _SPARK_CONF_UNSET_SENTINEL:
+            try:
+                spark.conf.unset(SPARK_ICEBERG_MERGE_SCHEMA_CONF)
+            except Exception:
+                pass
+        else:
+            spark.conf.set(SPARK_ICEBERG_MERGE_SCHEMA_CONF, previous)
+
+
+def ensure_iceberg_accept_any_schema(spark: SparkSession, table_id: str) -> None:
+    qualified_table_id = qualify_table_id(table_id)
+    if not table_exists(spark, qualified_table_id):
+        return
+    spark.sql(
+        f"ALTER TABLE {qualified_table_id} SET TBLPROPERTIES "
+        f"('{ICEBERG_ACCEPT_ANY_SCHEMA_PROPERTY}'='true')"
+    )
 
 
 def ensure_trips_schema(df: DataFrame) -> DataFrame:
@@ -287,21 +320,89 @@ def stable_trip_id_expr() -> F.Column:
     )
 
 
+def validate_silver_data(df: DataFrame, label: str = "silver_canonical") -> None:
+    if not df.take(1):
+        raise RuntimeError(f"{label} is empty")
+
+    invalid_condition = (
+        F.col("trip_id").isNull()
+        | F.col("pickup_date").isNull()
+        | F.col("pickup_ts").isNull()
+        | F.col("dropoff_ts").isNull()
+        | F.col("pickup_location_id").isNull()
+        | F.col("dropoff_location_id").isNull()
+        | F.col("pickup_borough").isNull()
+        | F.col("pickup_zone").isNull()
+        | F.col("dropoff_borough").isNull()
+        | F.col("dropoff_zone").isNull()
+        | F.col("trip_duration_seconds").isNull()
+        | (F.col("trip_duration_seconds") <= 0)
+        | F.col("trip_distance").isNull()
+        | (F.col("trip_distance") < 0)
+        | F.col("fare_amount").isNull()
+        | (F.col("fare_amount") < 0)
+        | F.col("total_amount").isNull()
+        | (F.col("total_amount") < 0)
+        | F.col("source_uri").isNull()
+        | F.col("source_revision").isNull()
+        | F.col("source_file").isNull()
+        | F.col("source_kind").isNull()
+        | F.col("ingestion_ts").isNull()
+        | F.col("bronze_run_id").isNull()
+        | F.col("silver_run_id").isNull()
+    )
+    sample = (
+        df.filter(invalid_condition)
+        .select(
+            "trip_id",
+            "pickup_date",
+            "pickup_ts",
+            "dropoff_ts",
+            "pickup_location_id",
+            "dropoff_location_id",
+            "pickup_borough",
+            "pickup_zone",
+            "dropoff_borough",
+            "dropoff_zone",
+            "trip_duration_seconds",
+            "trip_distance",
+            "fare_amount",
+            "total_amount",
+            "source_uri",
+            "source_revision",
+            "source_file",
+            "source_kind",
+            "ingestion_ts",
+            "bronze_run_id",
+            "silver_run_id",
+        )
+        .take(1)
+    )
+    if sample:
+        raise RuntimeError(
+            f"[{label}] Data quality failed: invalid row example={sample[0].asDict(recursive=True)}"
+        )
+
+
 def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_column: str) -> str:
     table_id = qualify_table_id(table_id)
-    writer = (
-        df.writeTo(table_id)
-        .tableProperty("format-version", "2")
-        .tableProperty("write.format.default", "parquet")
-        .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
-    )
+    with _iceberg_merge_schema_enabled(df.sparkSession):
+        ensure_iceberg_accept_any_schema(df.sparkSession, table_id)
+        writer = (
+            df.writeTo(table_id)
+            .option("mergeSchema", "true")
+            .tableProperty("format-version", "2")
+            .tableProperty(ICEBERG_ACCEPT_ANY_SCHEMA_PROPERTY, "true")
+            .tableProperty("write.format.default", "parquet")
+            .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
+        )
 
-    if table_exists(df.sparkSession, table_id):
-        writer.overwritePartitions()
-        return "overwrite_partitions"
+        if table_exists(df.sparkSession, table_id):
+            writer.overwritePartitions()
+            return "overwrite_partitions"
 
-    writer.partitionedBy(F.col(partition_column)).create()
-    return "create"
+        writer.partitionedBy(F.col(partition_column)).create()
+        return "create"
 
 
 def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str) -> DataFrame:
@@ -444,8 +545,10 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
         "dropoff_location_id",
         "pickup_borough",
         "pickup_zone",
+        "pickup_service_zone",
         "dropoff_borough",
         "dropoff_zone",
+        "dropoff_service_zone",
         "trip_duration_seconds",
         "trip_distance",
         "fare_amount",
@@ -453,6 +556,10 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
         "source_uri",
         "source_revision",
         "source_file",
+        "source_kind",
+        "ingestion_ts",
+        "bronze_run_id",
+        "silver_run_id",
     }
     missing = required - set(canonical.columns)
     if missing:
@@ -463,6 +570,11 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
         & F.col("dropoff_ts").isNotNull()
         & F.col("pickup_location_id").isNotNull()
         & F.col("dropoff_location_id").isNotNull()
+        & F.col("pickup_borough").isNotNull()
+        & F.col("pickup_zone").isNotNull()
+        & F.col("dropoff_borough").isNotNull()
+        & F.col("dropoff_zone").isNotNull()
+        & F.col("trip_duration_seconds").isNotNull()
         & (F.col("trip_duration_seconds") > 0)
         & (F.col("trip_distance") >= 0)
         & (F.col("fare_amount") >= 0)
@@ -527,6 +639,7 @@ def silver_transform(bronze: BronzeIngestResult) -> SilverTransformResult:
     zones_df = spark.table(bronze_taxi_zone_table)
 
     canonical_df = build_canonical_frame(trips_df, zones_df, bronze.run_id)
+    validate_silver_data(canonical_df)
 
     target_partitions = max(1, math.ceil(max(bronze.trips_rows, 1) / SILVER_ROWS_PER_PARTITION))
     canonical_df = canonical_df.repartition(target_partitions, F.col("pickup_date"))

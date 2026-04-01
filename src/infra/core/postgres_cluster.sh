@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Zero-touch deployment script that installs CloudNativePG operator, provisions a PostgreSQL cluster, and configures a PgBouncer pooler on any Kubernetes environment (kind or cloud).
-# Verifies CSI/storage drivers, and ensures a portable StorageClass using WaitForFirstConsumer to prevent PVC scheduling failures.
-# Generates deterministic manifests under src/manifests/postgres and archives the exact operator YAML under src/scripts/archive for reproducible deployments.
-# Performs server-side schema validation before applying manifests, waits for cluster readiness, then deploys the pooler and exposes connection URIs derived from the CNPG secret.
-# Executes automated end-to-end PostgreSQL CRUD tests through the pooler using ephemeral test pods to verify storage, networking, authentication, and query functionality.
+# Zero-touch deployment script for CloudNativePG.
+# Delegates storage class management to src/infra/core/default_storage_class.sh.
+# Installs operator, provisions cluster/pooler, and generates manifests.
 
 set -euo pipefail
 
-K8S_CLUSTER="${K8S_CLUSTER:-kind}" # or eks|gke|aks
+# --- Configuration ---
+K8S_CLUSTER="${K8S_CLUSTER:-kind}"
 TARGET_NS="${TARGET_NS:-default}"
 ARCHIVE_DIR="src/scripts/archive"
 MANIFEST_DIR="src/manifests/postgres"
@@ -25,12 +24,14 @@ OPERATOR_TIMEOUT="${OPERATOR_TIMEOUT:-300}"
 POD_TIMEOUT="${POD_TIMEOUT:-900}"
 SECRET_TIMEOUT="${SECRET_TIMEOUT:-180}"
 
+# Uses the standardized name ensured by default_storage_class.sh
 STORAGE_CLASS_NAME="${STORAGE_CLASS_NAME:-default-storage-class}"
 
 INITDB_DB="${INITDB_DB:-flyte_admin}"
-ADDITIONAL_DBS=(datacatalog mlflow)
+ADDITIONAL_DBS=(datacatalog mlflow feast)
 ALL_DBS=("${INITDB_DB}" "${ADDITIONAL_DBS[@]}")
 
+# Resource Profiles
 if [[ "${K8S_CLUSTER}" == "kind" ]]; then
   INSTANCES=1
   CPU_REQUEST="250m"; CPU_LIMIT="1000m"
@@ -52,164 +53,48 @@ fi
 ANNOTATION_CLUSTER_KEY="mlsecops.cnpg.cluster-checksum"
 ANNOTATION_POOLER_KEY="mlsecops.cnpg.pooler-checksum"
 
+# --- Logging & Utils ---
 log(){ printf '[%s] [cnpg] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
 fatal(){ printf '[%s] [cnpg][FATAL] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
 require_bin(){ command -v "$1" >/dev/null 2>&1 || fatal "$1 required in PATH"; }
 
-trap 'rc=$?; echo; echo "[DIAG] exit_code=$rc"; echo "[DIAG] kubectl context: $(kubectl config current-context 2>/dev/null || true)"; echo "[DIAG] pods (ns ${TARGET_NS}):"; kubectl -n "${TARGET_NS}" get pods -o wide || true; echo "[DIAG] pvc (ns ${TARGET_NS}):"; kubectl -n "${TARGET_NS}" get pvc || true; echo "[DIAG] events (last 200):"; kubectl get events -A --sort-by=.lastTimestamp | tail -n 200 || true; exit $rc' ERR
+trap 'rc=$?; echo; echo "[DIAG] exit_code=$rc"; echo "[DIAG] kubectl context: $(kubectl config current-context 2>/dev/null || true)"; echo "[DIAG] pods (ns ${TARGET_NS}):"; kubectl -n "${TARGET_NS}" get pods -o wide || true; echo "[DIAG] pvc (ns ${TARGET_NS}):"; kubectl -n "${TARGET_NS}" get pvc || true; exit $rc' ERR
 
+# --- Prerequisites & Storage Delegate ---
 require_prereqs(){
   require_bin kubectl
   require_bin curl
   require_bin sha256sum
+  require_bin bash # Ensure bash is available for sourcing/delegating
+  
   kubectl version --client >/dev/null 2>&1 || fatal "kubectl client unavailable"
   kubectl cluster-info >/dev/null 2>&1 || fatal "kubectl cannot reach cluster"
+  
   mkdir -p "${ARCHIVE_DIR}" "${MANIFEST_DIR}"
 }
 
-detect_provider(){
-  if [[ -n "${K8S_CLUSTER:-}" ]]; then
-    echo "${K8S_CLUSTER}"
-    return 0
+ensure_storage_infrastructure(){
+  log "delegating storage class verification to default_storage_class.sh"
+  
+  local script_path="src/infra/core/default_storage_class.sh"
+  if [[ ! -f "${script_path}" ]]; then
+    fatal "Storage helper script not found at ${script_path}. Cannot ensure StorageClass."
   fi
-  if ! kubectl version --request-timeout=5s >/dev/null 2>&1; then
-    fatal "kubectl cannot reach cluster to detect provider"
+
+  # Run the external script to ensure 'default-storage-class' exists and is valid
+  # We pass K8S_CLUSTER explicitly so it doesn't re-detect unnecessarily
+  if ! K8S_CLUSTER="${K8S_CLUSTER}" bash "${script_path}" --setup; then
+    fatal "Failed to ensure storage infrastructure"
   fi
-  local nodeName providerID
-  nodeName="$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  providerID="$(kubectl get node "${nodeName}" -o jsonpath='{.spec.providerID}' 2>/dev/null || true)"
-  if [[ "${providerID}" == aws* || "${providerID}" == aws://* ]] || kubectl get csidrivers 2>/dev/null | grep -q 'ebs.csi.aws.com'; then
-    echo "eks"
-    return 0
+  
+  # Verify the specific SC we need exists now
+  if ! kubectl get storageclass "${STORAGE_CLASS_NAME}" >/dev/null 2>&1; then
+    fatal "StorageClass '${STORAGE_CLASS_NAME}' still missing after delegation script ran."
   fi
-  if [[ "${providerID}" == gce* || "${providerID}" == gce://* ]] || kubectl get csidrivers 2>/dev/null | grep -q 'pd.csi.storage.gke.io'; then
-    echo "gke"
-    return 0
-  fi
-  if [[ "${providerID}" == azure* || "${providerID}" == azure://* ]] || kubectl get csidrivers 2>/dev/null | grep -q 'disk.csi.azure.com'; then
-    echo "aks"
-    return 0
-  fi
-  if [[ -z "${providerID}" ]] && ([[ "${nodeName:-}" =~ kind- ]] || kubectl get ns local-path-storage >/dev/null 2>&1); then
-    echo "kind"
-    return 0
-  fi
-  echo "unknown"
+  log "StorageClass '${STORAGE_CLASS_NAME}' verified ready."
 }
 
-check_cloud_csi(){
-  case "${K8S_CLUSTER}" in
-    eks)
-      log "checking for AWS EBS CSI driver"
-      if kubectl get csidrivers -o name 2>/dev/null | grep -q 'ebs.csi.aws.com'; then log "EBS CSI driver detected"; return 0; fi
-      fatal "EBS CSI driver 'ebs.csi.aws.com' not found"
-      ;;
-    gke)
-      log "checking for GCE PD CSI driver"
-      if kubectl get csidrivers -o name 2>/dev/null | grep -q 'pd.csi.storage.gke.io'; then log "GCE PD CSI driver detected"; return 0; fi
-      fatal "GCE PD CSI driver not found"
-      ;;
-    aks)
-      log "checking for Azure Disk CSI driver"
-      if kubectl get csidrivers -o name 2>/dev/null | grep -q 'disk.csi.azure.com'; then log "Azure Disk CSI driver detected"; return 0; fi
-      fatal "Azure Disk CSI driver not found"
-      ;;
-    kind)
-      log "kind cluster: skipping CSI checks"
-      return 0
-      ;;
-    *)
-      log "unknown cluster type; skipping CSI checks"
-      return 0
-      ;;
-  esac
-}
-
-install_local_path_provisioner(){
-  if kubectl -n local-path-storage get deploy local-path-provisioner >/dev/null 2>&1; then
-    log "local-path-provisioner already installed"
-    return 0
-  fi
-  log "installing local-path-provisioner"
-  kubectl apply -f "https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml" >/dev/null 2>&1 || fatal "failed to install local-path-provisioner"
-  kubectl -n local-path-storage rollout status deployment/local-path-provisioner --timeout=180s >/dev/null || log "local-path-provisioner rollout issue"
-}
-
-create_storageclass_kind(){
-  cat <<EOF | kubectl apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: ${STORAGE_CLASS_NAME}
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
-provisioner: rancher.io/local-path
-mountOptions:
-  - noatime
-  - nodiratime
-reclaimPolicy: Delete
-volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
-EOF
-  log "created storageclass ${STORAGE_CLASS_NAME} for kind"
-}
-
-create_storageclass_eks(){
-  cat <<EOF | kubectl apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: ${STORAGE_CLASS_NAME}
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
-provisioner: ebs.csi.aws.com
-parameters:
-  type: gp3
-  encrypted: "true"
-  csi.storage.k8s.io/fstype: ext4
-reclaimPolicy: Delete
-volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
-EOF
-  log "created storageclass ${STORAGE_CLASS_NAME} for eks"
-}
-
-ensure_storage_class(){
-  log "ensuring storageclass '${STORAGE_CLASS_NAME}' with WaitForFirstConsumer"
-  if kubectl get storageclass "${STORAGE_CLASS_NAME}" >/dev/null 2>&1; then
-    local prov mode pv_count
-    prov="$(kubectl get storageclass "${STORAGE_CLASS_NAME}" -o jsonpath='{.provisioner}' 2>/dev/null || true)"
-    mode="$(kubectl get storageclass "${STORAGE_CLASS_NAME}" -o jsonpath='{.volumeBindingMode}' 2>/dev/null || echo '')"
-    pv_count="$(kubectl get pv -o jsonpath='{range .items[?(@.spec.storageClassName=="'"${STORAGE_CLASS_NAME}"'")]}{.metadata.name}{"\n"}{end}' 2>/dev/null | wc -l)"
-    log "found StorageClass ${STORAGE_CLASS_NAME} (provisioner=${prov}, mode=${mode}, pv_count=${pv_count})"
-    if [[ "${mode}" == "WaitForFirstConsumer" ]]; then
-      kubectl patch storageclass "${STORAGE_CLASS_NAME}" -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}' >/dev/null || true
-      return 0
-    fi
-    if [[ "${prov}" == "rancher.io/local-path" || "${K8S_CLUSTER}" == "kind" ]]; then
-      if [[ "${pv_count}" -gt 0 ]]; then fatal "StorageClass ${STORAGE_CLASS_NAME} has PVs and cannot be safely recreated"; fi
-      kubectl delete storageclass "${STORAGE_CLASS_NAME}" >/dev/null 2>&1 || true
-      install_local_path_provisioner
-      create_storageclass_kind
-      return 0
-    fi
-    if [[ "${pv_count}" -gt 0 ]]; then
-      STORAGE_CLASS_NAME="${STORAGE_CLASS_NAME}-wffc"
-      log "existing SC has PVs; using ${STORAGE_CLASS_NAME}"
-      create_storageclass_eks
-      return 0
-    fi
-  fi
-  case "${K8S_CLUSTER}" in
-    kind) install_local_path_provisioner; create_storageclass_kind ;;
-    eks) create_storageclass_eks ;;
-    gke) fatal "GKE automatic storageclass creation not implemented" ;;
-    aks) fatal "AKS automatic storageclass creation not implemented" ;;
-    *) create_storageclass_kind ;;
-  esac
-  log "storageclass ensured: ${STORAGE_CLASS_NAME}"
-}
-
+# --- CNPG Operator Logic ---
 validate_operand_major(){
   local img="${POSTGRES_IMAGE##*:}"
   local major="${img%%.*}"
@@ -224,17 +109,22 @@ validate_operand_major(){
 install_cnpg_operator(){
   log "installing CloudNativePG operator ${CNPG_VERSION}"
   kubectl get ns "${CNPG_NAMESPACE}" >/dev/null 2>&1 || kubectl create ns "${CNPG_NAMESPACE}" >/dev/null
+  
   local branch url archive_file
   branch="${CNPG_VERSION%.*}"
   url="https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-${branch}/releases/cnpg-${CNPG_VERSION}.yaml"
   archive_file="$(printf "${OPERATOR_ARCHIVE_TEMPLATE}" "${CNPG_VERSION}")"
+  
   curl -fsSL -o "${archive_file}" "${url}" || fatal "download operator manifest failed"
+  
   if kubectl apply --server-side -f "${archive_file}" >/dev/null 2>&1; then
     log "operator applied (server-side)"
   else
     kubectl apply -f "${archive_file}" >/dev/null || fatal "kubectl apply operator failed"
   fi
+  
   kubectl -n "${CNPG_NAMESPACE}" rollout status deployment/cnpg-controller-manager --timeout="${OPERATOR_TIMEOUT}s" >/dev/null || fatal "cnpg-controller-manager rollout failed"
+  
   local start now elapsed
   start=$(date +%s)
   while true; do
@@ -246,9 +136,16 @@ install_cnpg_operator(){
   log "operator ready"
 }
 
+# --- Manifest Rendering ---
 render_cluster_manifest(){
   log "rendering cluster manifest -> ${CLUSTER_FILE}"
   mkdir -p "$(dirname "${CLUSTER_FILE}")"
+  
+  local post_init_sql=""
+  for db in "${ADDITIONAL_DBS[@]}"; do 
+    post_init_sql+="        - CREATE DATABASE ${db} OWNER app;"$'\n'
+  done
+
   cat > "${CLUSTER_FILE}" <<EOF
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -263,8 +160,7 @@ spec:
       database: ${INITDB_DB}
       owner: app
       postInitSQL:
-$(for db in "${ADDITIONAL_DBS[@]}"; do printf "        - CREATE DATABASE %s OWNER app;\n" "${db}"; done)
-      postInitApplicationSQL:
+${post_init_sql}      postInitApplicationSQL:
         - ALTER SCHEMA public OWNER TO app;
   storage:
     storageClass: ${STORAGE_CLASS_NAME}
@@ -299,14 +195,11 @@ kind: Pooler
 metadata:
   name: ${POOLER_NAME}
   namespace: ${TARGET_NS}
-
 spec:
   cluster:
     name: ${CLUSTER_NAME}
-
   instances: ${POOLER_INSTANCES}
   type: rw
-
   pgbouncer:
     poolMode: transaction
     parameters:
@@ -315,18 +208,15 @@ spec:
       min_pool_size: "5"
       reserve_pool_size: "10"
       server_idle_timeout: "600"
-
   template:
     spec:
       securityContext:
         runAsNonRoot: true
-
       containers:
       - name: pgbouncer
         securityContext:
           runAsNonRoot: true
           allowPrivilegeEscalation: false
-
         resources:
           requests:
             cpu: ${POOLER_CPU_REQUEST}
@@ -335,42 +225,36 @@ spec:
             cpu: ${POOLER_CPU_LIMIT}
             memory: ${POOLER_MEM_LIMIT}
 EOF
-
   log "wrote ${POOLER_FILE}"
 }
 
+# --- Apply & Wait Logic ---
 manifest_hash(){
   local file="$1"
   sha256sum "$file" | awk '{print $1}'
 }
 
 get_annotation(){
-  local kind="$1"
-  local name="$2"
-  local key="$3"
+  local kind="$1" name="$2" key="$3"
   kubectl -n "${TARGET_NS}" get "${kind}" "${name}" -o "jsonpath={.metadata.annotations['${key}']}" 2>/dev/null || true
 }
 
 set_annotation(){
-  local kind="$1"
-  local name="$2"
-  local key="$3"
-  local value="$4"
+  local kind="$1" name="$2" key="$3" value="$4"
   kubectl -n "${TARGET_NS}" patch "${kind}" "${name}" --type=merge -p "{\"metadata\":{\"annotations\":{\"${key}\":\"${value}\"}}}" >/dev/null 2>&1 || true
 }
 
 apply_manifest_if_changed(){
-  local file="$1"
-  local kind="$2"
-  local name="$3"
-  local ann_key="$4"
+  local file="$1" kind="$2" name="$3" ann_key="$4"
   local h existing
   h=$(manifest_hash "${file}")
   existing=$(get_annotation "${kind}" "${name}" "${ann_key}")
+  
   if [[ -n "${existing}" && "${existing}" == "${h}" ]]; then
     log "manifest ${file} unchanged (annotation match); skipping apply for ${kind}/${name}"
     return 0
   fi
+  
   log "applying manifest ${file} for ${kind}/${name}"
   if kubectl -n "${TARGET_NS}" get "${kind}" "${name}" >/dev/null 2>&1; then
     kubectl apply --server-side --force-conflicts --field-manager=mlsecops-cnpg -f "${file}" >/dev/null || fatal "apply failed for ${file}"
@@ -388,9 +272,11 @@ wait_for_cluster_ready(){
   while true; do
     now=$(date +%s); elapsed=$((now - start))
     if [[ "${elapsed}" -ge "${POD_TIMEOUT}" ]]; then fatal "timeout waiting for cluster readiness"; fi
+    
     local ready expected
     ready=$(kubectl -n "${TARGET_NS}" get cluster "${CLUSTER_NAME}" -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo 0)
     expected=$(kubectl -n "${TARGET_NS}" get cluster "${CLUSTER_NAME}" -o jsonpath='{.spec.instances}' 2>/dev/null || echo "${INSTANCES}")
+    
     if [[ -n "${ready}" && -n "${expected}" && "${ready}" -ge "${expected}" ]]; then
       log "cluster ready ${ready}/${expected}"
       return 0
@@ -424,6 +310,7 @@ ensure_database_exists(){
   local primary db exists
   primary="$(get_primary_pod)"
   if [[ -z "${primary}" ]]; then fatal "primary pod not found to run DB creation"; fi
+  
   for db in "$@"; do
     exists=$(kubectl -n "${TARGET_NS}" exec "${primary}" -- psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db}';" 2>/dev/null || echo "")
     if [[ "${exists}" =~ 1 ]]; then
@@ -456,9 +343,11 @@ deploy_pooler_and_wait(){
     now=$(date +%s); elapsed=$((now - start))
     local pods ready need svc
     pods=$(kubectl -n "${TARGET_NS}" get pods -l "cnpg.io/poolerName=${POOLER_NAME}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+    
     if [[ -n "${pods}" ]]; then
       ready=$(for p in ${pods}; do kubectl -n "${TARGET_NS}" get pod "$p" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo false; done | grep -c true || true)
       need=$(kubectl -n "${TARGET_NS}" get pooler "${POOLER_NAME}" -o jsonpath='{.spec.instances}' 2>/dev/null || echo "${POOLER_INSTANCES}")
+      
       if [[ "${ready}" -ge "${need}" && "${need}" -gt 0 ]]; then
         svc=$(kubectl -n "${TARGET_NS}" get svc "${POOLER_NAME}" -o jsonpath='{.metadata.name}' 2>/dev/null || true)
         if [[ -n "${svc}" ]]; then log "pooler ready"; return 0; fi
@@ -478,12 +367,15 @@ print_connection_uris(){
   local secret user pw port host raw masked
   secret="$(kubectl -n "${TARGET_NS}" get secret -l "cnpg.io/cluster=${CLUSTER_NAME},cnpg.io/userType=app" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
   [[ -n "${secret}" ]] || fatal "app secret not found for connection URI output"
+  
   user="$(kubectl -n "${TARGET_NS}" get secret "${secret}" -o jsonpath='{.data.username}' 2>/dev/null | base64 -d)"
   pw="$(kubectl -n "${TARGET_NS}" get secret "${secret}" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)"
   port="$(kubectl -n "${TARGET_NS}" get secret "${secret}" -o jsonpath='{.data.port}' 2>/dev/null | base64 -d || echo 5432)"
   host="${POOLER_NAME}.${TARGET_NS}"
+  
   raw="postgresql://${user}:${pw}@${host}:${port}"
   masked=$(mask_uri "${raw}")
+  
   printf "\nConnection URIs (masked):\n\n"
   for db in "${ALL_DBS[@]}"; do
     printf "%s/%s\n" "${masked}" "${db}"
@@ -504,80 +396,33 @@ delete_all(){
   log "deleted cnpg resources; preserved PV data"
 }
 
-run_crud_tests_via_pooler(){
-  log "running CRUD tests via pooler"
-  local secret user pw port host db pod start phase
-  secret="$(kubectl -n "${TARGET_NS}" get secret -l "cnpg.io/cluster=${CLUSTER_NAME},cnpg.io/userType=app" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  [[ -n "${secret}" ]] || fatal "app secret not found for CRUD tests"
-  user="$(kubectl -n "${TARGET_NS}" get secret "${secret}" -o jsonpath='{.data.username}' 2>/dev/null | base64 -d)"
-  pw="$(kubectl -n "${TARGET_NS}" get secret "${secret}" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)"
-  port="$(kubectl -n "${TARGET_NS}" get secret "${secret}" -o jsonpath='{.data.port}' 2>/dev/null | base64 -d || echo 5432)"
-  host="${POOLER_NAME}.${TARGET_NS}"
-
-  for db in "${ALL_DBS[@]}"; do
-    pod="e2e-pgtest-${db//_/-}"
-    kubectl -n "${TARGET_NS}" delete pod "${pod}" --ignore-not-found >/dev/null 2>&1 || true
-    kubectl run "${pod}" -n "${TARGET_NS}" --restart=Never --image=postgres:16 \
-      --env="PGUSER=${user}" \
-      --env="PGPASSWORD=${pw}" \
-      --env="PGHOST=${host}" \
-      --env="PGPORT=${port}" \
-      --env="PGDATABASE=${db}" \
-      --command -- sh -c "psql -h \"\$PGHOST\" -U \"\$PGUSER\" -p \"\$PGPORT\" -d \"\$PGDATABASE\" -v ON_ERROR_STOP=1 -c \"CREATE TABLE IF NOT EXISTS e2e_test (id SERIAL PRIMARY KEY, v TEXT); INSERT INTO e2e_test(v) VALUES ('insert_test');\" && psql -h \"\$PGHOST\" -U \"\$PGUSER\" -p \"\$PGPORT\" -d \"\$PGDATABASE\" -c \"SELECT 'READ_AFTER_INSERT', count(*) FROM e2e_test;\" && psql -h \"\$PGHOST\" -U \"\$PGUSER\" -p \"\$PGPORT\" -d \"\$PGDATABASE\" -c \"UPDATE e2e_test SET v='updated_test' WHERE v='insert_test';\" && psql -h \"\$PGHOST\" -U \"\$PGUSER\" -p \"\$PGPORT\" -d \"\$PGDATABASE\" -c \"DELETE FROM e2e_test;\""
-
-    start=$(date +%s)
-    while true; do
-      if kubectl -n "${TARGET_NS}" get pod "${pod}" -o jsonpath='{.status.phase}' >/dev/null 2>&1; then
-        phase=$(kubectl -n "${TARGET_NS}" get pod "${pod}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-        if [[ "${phase}" == "Succeeded" ]]; then
-          log "pod ${pod} succeeded; logs:"
-          kubectl -n "${TARGET_NS}" logs "${pod}" --tail=200 || true
-          kubectl -n "${TARGET_NS}" delete pod "${pod}" --ignore-not-found >/dev/null 2>&1 || true
-          log "CRUD passed for ${db}"
-          break
-        fi
-        if [[ "${phase}" == "Failed" ]]; then
-          log "pod ${pod} failed; logs:"
-          kubectl -n "${TARGET_NS}" logs "${pod}" --tail=200 || true
-          kubectl -n "${TARGET_NS}" delete pod "${pod}" --ignore-not-found >/dev/null 2>&1 || true
-          fatal "CRUD failed for ${db}"
-        fi
-      fi
-      if [[ $(( $(date +%s) - start )) -gt 180 ]]; then
-        log "timeout waiting for ${pod}; logs:"
-        kubectl -n "${TARGET_NS}" logs "${pod}" --tail=200 || true
-        kubectl -n "${TARGET_NS}" delete pod "${pod}" --ignore-not-found >/dev/null 2>&1 || true
-        fatal "CRUD timeout for ${db}"
-      fi
-      sleep 2
-    done
-  done
-  log "all CRUD tests via pooler passed"
-  return 0
-}
-
+# --- Main Execution ---
 main(){
   require_prereqs
   log "starting postgres cluster rollout (cluster=${K8S_CLUSTER}, ns=${TARGET_NS})"
-  local detected app_secret
-  detected="$(detect_provider)"
-  log "provider detection result: ${detected}"
-  check_cloud_csi || true
-  ensure_storage_class
+  # 2. Validate & Install Operator
   validate_operand_major
   install_cnpg_operator
+  
+  # 3. Render & Apply
   render_cluster_manifest
   render_pooler_manifest
   apply_manifest_if_changed "${CLUSTER_FILE}" cluster "${CLUSTER_NAME}" "${ANNOTATION_CLUSTER_KEY}"
+  
+  # 4. Wait & Configure
   wait_for_cluster_ready
+  local app_secret
   app_secret="$(wait_for_app_secret)"
   ensure_database_exists "${ALL_DBS[@]}"
   fix_database_schema_ownership
+  
+  # 5. Pooler & Output
   deploy_pooler_and_wait
   persist_artifacts
   print_connection_uris
-  run_crud_tests_via_pooler || log "CRUD tests were skipped or failed; inspect above logs"
+  
   printf "\n[SUCCESS] CNPG deploy complete. Manifests: %s\n" "${MANIFEST_DIR}"
+  log "To run validation tests, execute: bash src/tests/infra/validate_postgres_cluster.sh"
 }
 
 case "${1:-}" in

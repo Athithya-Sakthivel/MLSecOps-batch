@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# =============================================================================
+# Iceberg REST Catalog Deployment Orchestrator
+# Usage: ./iceberg.sh [--rollout [--validate]] | --delete | --help
+# =============================================================================
+
 TARGET_NS="${TARGET_NS:-default}"
 MANIFEST_DIR="${MANIFEST_DIR:-src/manifests/iceberg}"
 
@@ -26,6 +31,8 @@ AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}"
 READY_TIMEOUT="${READY_TIMEOUT:-300}"
 VALIDATE_SCRIPT="${VALIDATE_SCRIPT:-src/tests/elt/iceberg_server_validate.sh}"
 
+# --- Logging ------------------------------------------------------------------
+
 log() {
   printf '[%s] [iceberg] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
 }
@@ -34,6 +41,8 @@ fatal() {
   printf '[%s] [iceberg][FATAL] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
   exit 1
 }
+
+# --- Prerequisites ------------------------------------------------------------
 
 require_bin() {
   command -v "$1" >/dev/null 2>&1 || fatal "$1 required in PATH"
@@ -47,10 +56,13 @@ require_prereqs() {
   kubectl cluster-info >/dev/null 2>&1 || fatal "kubectl cannot reach cluster"
 }
 
+# --- Helpers ------------------------------------------------------------------
+
 ensure_namespace() {
   if kubectl get ns "${TARGET_NS}" >/dev/null 2>&1; then
     return 0
   fi
+  log "creating namespace ${TARGET_NS}"
   kubectl create ns "${TARGET_NS}" >/dev/null
 }
 
@@ -83,8 +95,7 @@ rest_base_url() {
 }
 
 normalized_s3_endpoint() {
-  local endpoint
-  endpoint="${S3_ENDPOINT}"
+  local endpoint="${S3_ENDPOINT}"
   if [[ -z "${endpoint}" ]]; then
     endpoint="https://s3.${AWS_REGION}.amazonaws.com"
   elif [[ "${endpoint}" != http://* && "${endpoint}" != https://* ]]; then
@@ -115,6 +126,8 @@ for part in parts:
 print(h.hexdigest())
 PY
 }
+
+# --- K8s Resource Management --------------------------------------------------
 
 apply_secret() {
   if [[ -z "${AWS_ACCESS_KEY_ID}" || -z "${AWS_SECRET_ACCESS_KEY}" ]]; then
@@ -328,24 +341,26 @@ apply_manifests() {
   log "applied manifests and wrote annotation ${ANNOTATION_KEY}=${hash}"
 }
 
+# --- Diagnostics --------------------------------------------------------------
+
 dump_diagnostics() {
   log "diagnostics: pods"
-  kubectl -n "${TARGET_NS}" get pods -o wide || true
+  kubectl -n "${TARGET_NS}" get pods -o wide 2>&1 || true
 
   log "diagnostics: deployment"
-  kubectl -n "${TARGET_NS}" describe deployment "${DEPLOYMENT_NAME}" || true
+  kubectl -n "${TARGET_NS}" describe deployment "${DEPLOYMENT_NAME}" 2>&1 || true
 
   log "diagnostics: service"
-  kubectl -n "${TARGET_NS}" get svc "${SERVICE_NAME}" -o wide || true
+  kubectl -n "${TARGET_NS}" get svc "${SERVICE_NAME}" -o wide 2>&1 || true
 
   log "diagnostics: endpoints"
-  kubectl -n "${TARGET_NS}" get endpoints "${SERVICE_NAME}" -o wide || true
+  kubectl -n "${TARGET_NS}" get endpoints "${SERVICE_NAME}" -o wide 2>&1 || true
 
   log "diagnostics: recent events"
-  kubectl get events -A --sort-by=.lastTimestamp | tail -n 80 || true
+  kubectl get events -A --sort-by=.lastTimestamp 2>&1 | tail -n 80 || true
 
   log "diagnostics: logs"
-  kubectl -n "${TARGET_NS}" logs deployment/"${DEPLOYMENT_NAME}" --tail=200 || true
+  kubectl -n "${TARGET_NS}" logs deployment/"${DEPLOYMENT_NAME}" --tail=200 2>&1 || true
 }
 
 on_err() {
@@ -354,15 +369,18 @@ on_err() {
   exit "$rc"
 }
 
-trap on_err ERR
-
 wait_for_deployment_ready() {
+  log "waiting for deployment readiness (timeout=${READY_TIMEOUT}s)"
   kubectl -n "${TARGET_NS}" rollout status deployment/"${DEPLOYMENT_NAME}" --timeout="${READY_TIMEOUT}s" >/dev/null \
     || fatal "timeout waiting for deployment readiness"
   log "deployment ready"
 }
 
+# --- Main Operations ----------------------------------------------------------
+
 rollout() {
+  local run_validate="${1:-false}"
+
   require_prereqs
   mkdir -p "${MANIFEST_DIR}"
   ensure_namespace
@@ -376,7 +394,7 @@ rollout() {
   log "s3_endpoint=$(normalized_s3_endpoint)"
   log "s3_path_style_access=${S3_PATH_STYLE_ACCESS}"
   log "secret_name=${SECRET_NAME}"
-  log "spark_probe_image=${SPARK_PROBE_IMAGE:-<unset>}"
+  log "validate=${run_validate}"
 
   apply_secret
   render_serviceaccount
@@ -385,20 +403,25 @@ rollout() {
   apply_manifests
   wait_for_deployment_ready
 
-  if [[ -x "${VALIDATE_SCRIPT}" ]]; then
-    log "running validation script ${VALIDATE_SCRIPT}"
-    bash "${VALIDATE_SCRIPT}"
-  elif [[ -f "${VALIDATE_SCRIPT}" ]]; then
-    log "running validation script ${VALIDATE_SCRIPT}"
-    bash "${VALIDATE_SCRIPT}"
+  if [[ "${run_validate}" == "true" ]]; then
+    if [[ -x "${VALIDATE_SCRIPT}" ]]; then
+      log "running validation script ${VALIDATE_SCRIPT}"
+      bash "${VALIDATE_SCRIPT}"
+    elif [[ -f "${VALIDATE_SCRIPT}" ]]; then
+      log "running validation script ${VALIDATE_SCRIPT}"
+      bash "${VALIDATE_SCRIPT}"
+    else
+      fatal "validation script not found: ${VALIDATE_SCRIPT}"
+    fi
   else
-    fatal "validation script not found: ${VALIDATE_SCRIPT}"
+    log "skipping validation (pass --validate to enable)"
   fi
 
   log "[SUCCESS] iceberg rollout complete"
 }
 
 delete_all() {
+  log "deleting iceberg resources"
   kubectl -n "${TARGET_NS}" delete deployment "${DEPLOYMENT_NAME}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "${TARGET_NS}" delete svc "${SERVICE_NAME}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "${TARGET_NS}" delete sa "${SERVICE_ACCOUNT_NAME}" --ignore-not-found >/dev/null 2>&1 || true
@@ -410,9 +433,62 @@ delete_all() {
   log "deleted iceberg resources; data in object storage preserved"
 }
 
-case "${1:-}" in
-  --rollout|"") rollout ;;
-  --delete) delete_all ;;
-  --help|-h) printf 'Usage: %s [--rollout|--delete]\n' "$0" ;;
-  *) fatal "unknown argument: $1" ;;
-esac
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --rollout [--validate]   Deploy Iceberg REST catalog (optionally run validation)
+  --delete                 Remove all Iceberg resources
+  --help, -h               Show this help message
+
+Examples:
+  $0 --rollout                    # Deploy without validation
+  $0 --rollout --validate         # Deploy and run validation
+  $0 --delete                     # Clean up resources
+EOF
+}
+
+# --- Entry Point --------------------------------------------------------------
+
+main() {
+  local run_validate="false"
+  local action=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --rollout)
+        action="rollout"
+        shift
+        ;;
+      --validate)
+        run_validate="true"
+        shift
+        ;;
+      --delete)
+        action="delete"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        fatal "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  if [[ -z "${action}" ]]; then
+    action="rollout"
+  fi
+
+  trap on_err ERR
+
+  case "${action}" in
+    rollout) rollout "${run_validate}" ;;
+    delete) delete_all ;;
+  esac
+}
+
+main "$@"
