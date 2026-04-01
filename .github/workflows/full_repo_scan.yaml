@@ -31,19 +31,20 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Check out repository with full history
+      - name: Checkout repository (full history)
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Prepare writable cache directories
+      - name: Prepare cache directories
         run: |
           set -euo pipefail
+          echo "[INFO] Creating cache directories"
           install -d -m 0777 "$RUNNER_TEMP/trivy-cache"
           install -d -m 0777 "$RUNNER_TEMP/opengrep-cache"
 
-      - name: Run OpenGrep, Gitleaks, and Trivy
+      - name: Run security scanners
         env:
           PYTHONWARNINGS: ignore
           TRIVY_CACHE_DIR: /home/appuser/.cache/trivy
@@ -51,21 +52,13 @@ jobs:
           set -euo pipefail
 
           REPO_ROOT="$GITHUB_WORKSPACE"
-          ELT_RULE_DIR="$REPO_ROOT/src/static_analysis/elt"
+          ELT_RULE_FILE="$REPO_ROOT/src/static_analysis/elt.yaml"
 
-          for rule_file in \
-            "$ELT_RULE_DIR/security.yaml" \
-            "$ELT_RULE_DIR/data_quality.yaml" \
-            "$ELT_RULE_DIR/reliability.yaml" \
-            "$ELT_RULE_DIR/workflow_reliability.yaml" \
-            "$ELT_RULE_DIR/spark_performance.yaml" \
-            "$ELT_RULE_DIR/iceberg_safety.yaml"
-          do
-            if [[ ! -s "$rule_file" ]]; then
-              echo "::error::Missing or empty OpenGrep rule file: $rule_file"
-              exit 1
-            fi
-          done
+          echo "[INFO] Validating OpenGrep rule file"
+          if [[ ! -s "$ELT_RULE_FILE" ]]; then
+            echo "::error::Missing or empty OpenGrep rule file: $ELT_RULE_FILE"
+            exit 1
+          fi
 
           docker run --rm \
             -e HOME=/home/appuser \
@@ -80,9 +73,10 @@ jobs:
             --entrypoint /bin/sh \
             "$SCANNER_IMAGE" \
             -ec '
+
               set -eu
 
-              echo "=== OpenGrep SAST Scan ==="
+              echo "[INFO] === OpenGrep SAST Scan (general rules) ==="
               opengrep scan \
                 --verbose \
                 --config p/owasp-top-ten \
@@ -105,15 +99,10 @@ jobs:
                 --exclude node_modules \
                 /workspace
 
-              echo "=== OpenGrep ELT Scan ==="
+              echo "[INFO] === OpenGrep ELT Scan (custom rules) ==="
               opengrep scan \
                 --verbose \
-                --config /workspace/src/static_analysis/elt/security.yaml \
-                --config /workspace/src/static_analysis/elt/data_quality.yaml \
-                --config /workspace/src/static_analysis/elt/reliability.yaml \
-                --config /workspace/src/static_analysis/elt/workflow_reliability.yaml \
-                --config /workspace/src/static_analysis/elt/spark_performance.yaml \
-                --config /workspace/src/static_analysis/elt/iceberg_safety.yaml \
+                --config /workspace/src/static_analysis/elt.yaml \
                 --error \
                 --max-target-bytes 2000000 \
                 --exclude .spark-ci-artifacts \
@@ -128,8 +117,9 @@ jobs:
                 --exclude node_modules \
                 /workspace/src/workflows/ELT/
 
-              echo "=== Gitleaks Full History Scan ==="
+              echo "[INFO] === Gitleaks Full History Scan ==="
               if [ -s /workspace/.gitleaks.toml ]; then
+                echo "[INFO] Using custom Gitleaks config"
                 gitleaks git \
                   --config /workspace/.gitleaks.toml \
                   --log-opts="--all --full-history" \
@@ -137,6 +127,7 @@ jobs:
                   --redact \
                   --exit-code 1
               else
+                echo "[WARN] No custom Gitleaks config found, using defaults"
                 gitleaks git \
                   --log-opts="--all --full-history" \
                   --no-banner \
@@ -144,7 +135,7 @@ jobs:
                   --exit-code 1
               fi
 
-              echo "=== Trivy Filesystem Scan ==="
+              echo "[INFO] === Trivy Filesystem Scan ==="
               trivy fs \
                 --cache-dir "$TRIVY_CACHE_DIR" \
                 --scanners vuln,misconfig \
@@ -154,4 +145,6 @@ jobs:
                 --skip-dirs src/opengrep \
                 --exit-code 1 \
                 /workspace
+
+              echo "[SUCCESS] All scans completed"
             '
