@@ -1,5 +1,5 @@
-# Flyte task image for ELT runtime.
-# Base image: Apache Spark 4.0.2 + Java 21 + Scala 2.13 + Python 3 on Ubuntu
+# Flyte task image for ELT runtime
+# Base image: Apache Spark 4.0.2 + Scala 2.13 + Java 21 + Python 3 on Ubuntu
 # The image adds:
 # - minimal Python dependencies
 # - Iceberg + Hadoop AWS runtime jars

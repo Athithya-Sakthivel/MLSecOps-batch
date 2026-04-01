@@ -10,7 +10,6 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Iterable, Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any
@@ -108,10 +107,6 @@ TAXI_ZONE_LOOKUP_URL = os.environ.get(
     "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv",
 ).strip()
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or None
-
-SPARK_ICEBERG_MERGE_SCHEMA_CONF = "spark.sql.iceberg.merge-schema"
-ICEBERG_ACCEPT_ANY_SCHEMA_PROPERTY = "write.spark.accept-any-schema"
-_SPARK_CONF_UNSET_SENTINEL = "__spark_conf_unset__"
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -379,22 +374,6 @@ def _spark_s3a_credential_provider() -> str:
             else "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
         )
     return "com.amazonaws.auth.DefaultAWSCredentialsProviderChain"
-
-
-@contextmanager
-def _iceberg_merge_schema_enabled(spark: SparkSession):
-    previous = spark.conf.get(SPARK_ICEBERG_MERGE_SCHEMA_CONF, _SPARK_CONF_UNSET_SENTINEL)
-    spark.conf.set(SPARK_ICEBERG_MERGE_SCHEMA_CONF, "true")
-    try:
-        yield
-    finally:
-        if previous == _SPARK_CONF_UNSET_SENTINEL:
-            try:
-                spark.conf.unset(SPARK_ICEBERG_MERGE_SCHEMA_CONF)
-            except Exception:
-                pass
-        else:
-            spark.conf.set(SPARK_ICEBERG_MERGE_SCHEMA_CONF, previous)
 
 
 def build_task_environment() -> dict[str, str]:
@@ -680,10 +659,6 @@ def cast_if_present(df: DataFrame, column: str, spark_type: str) -> DataFrame:
     return df
 
 
-def _non_empty_string(column: F.Column) -> F.Column:
-    return F.length(F.trim(F.coalesce(column.cast("string"), F.lit("")))) > 0
-
-
 def _safe_to_timestamp(column: F.Column) -> F.Column:
     raw = F.trim(column.cast("string"))
     return F.coalesce(
@@ -763,40 +738,6 @@ def add_trip_bronze_columns(df: DataFrame, *, run_id: str, source_ref: str) -> D
     return df
 
 
-def validate_trip_bronze_data(df: DataFrame) -> None:
-    invalid_condition = (
-        F.col("pickup_ts").isNull()
-        | F.col("dropoff_ts").isNull()
-        | F.col("pickup_location_id").isNull()
-        | F.col("dropoff_location_id").isNull()
-        | F.col("trip_distance").isNull()
-        | (F.col("trip_distance") < 0)
-        | F.col("fare_amount").isNull()
-        | (F.col("fare_amount") < 0)
-        | F.col("total_amount").isNull()
-        | (F.col("total_amount") < 0)
-        | (F.col("dropoff_ts") < F.col("pickup_ts"))
-    )
-    sample = (
-        df.filter(invalid_condition)
-        .select(
-            "pickup_ts",
-            "dropoff_ts",
-            "pickup_location_id",
-            "dropoff_location_id",
-            "trip_distance",
-            "fare_amount",
-            "total_amount",
-        )
-        .limit(1)
-        .collect()
-    )
-    if sample:
-        raise RuntimeError(
-            f"[trips_bronze] Data quality failed: invalid row example={sample[0].asDict(recursive=True)}"
-        )
-
-
 def add_zone_bronze_columns(df: DataFrame, *, run_id: str, source_ref: str) -> DataFrame:
     df = (
         df.select(
@@ -822,75 +763,38 @@ def add_zone_bronze_columns(df: DataFrame, *, run_id: str, source_ref: str) -> D
     return df
 
 
-def validate_taxi_zone_bronze_data(df: DataFrame) -> None:
-    invalid_condition = (
-        F.col("location_id").isNull()
-        | (F.col("location_id") <= 0)
-        | ~_non_empty_string(F.col("borough"))
-        | ~_non_empty_string(F.col("zone"))
-        | ~_non_empty_string(F.col("service_zone"))
-    )
-    sample = (
-        df.filter(invalid_condition)
-        .select("location_id", "borough", "zone", "service_zone")
-        .limit(1)
-        .collect()
-    )
-    if sample:
-        raise RuntimeError(
-            f"[taxi_zone_bronze] Data quality failed: invalid row example={sample[0].asDict(recursive=True)}"
-        )
-
-
-def ensure_iceberg_accept_any_schema(spark: SparkSession, table_id: str) -> None:
-    qualified_table_id = qualify_table_id(table_id)
-    if not table_exists(spark, qualified_table_id):
-        return
-    spark.sql(
-        f"ALTER TABLE {qualified_table_id} SET TBLPROPERTIES ('{ICEBERG_ACCEPT_ANY_SCHEMA_PROPERTY}'='true')"
-    )
-
-
 def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_column: str) -> str:
     table_id = qualify_table_id(table_id)
-    with _iceberg_merge_schema_enabled(df.sparkSession):
-        ensure_iceberg_accept_any_schema(df.sparkSession, table_id)
-        writer = (
-            df.writeTo(table_id)
-            .option("mergeSchema", "true")
-            .tableProperty("format-version", "2")
-            .tableProperty(ICEBERG_ACCEPT_ANY_SCHEMA_PROPERTY, "true")
-            .tableProperty("write.format.default", "parquet")
-            .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
-        )
+    writer = (
+        df.writeTo(table_id)
+        .tableProperty("format-version", "2")
+        .tableProperty("write.format.default", "parquet")
+        .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
+    )
 
-        if table_exists(df.sparkSession, table_id):
-            writer.overwritePartitions()
-            return "overwrite_partitions"
+    if table_exists(df.sparkSession, table_id):
+        writer.overwritePartitions()
+        return "overwrite_partitions"
 
-        writer.partitionedBy(F.col(partition_column)).create()
-        return "create"
+    writer.partitionedBy(F.col(partition_column)).create()
+    return "create"
 
 
 def write_replace_iceberg_table(df: DataFrame, table_id: str) -> str:
     table_id = qualify_table_id(table_id)
-    with _iceberg_merge_schema_enabled(df.sparkSession):
-        ensure_iceberg_accept_any_schema(df.sparkSession, table_id)
-        writer = (
-            df.writeTo(table_id)
-            .option("mergeSchema", "true")
-            .tableProperty("format-version", "2")
-            .tableProperty(ICEBERG_ACCEPT_ANY_SCHEMA_PROPERTY, "true")
-            .tableProperty("write.format.default", "parquet")
-            .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
-        )
+    writer = (
+        df.writeTo(table_id)
+        .tableProperty("format-version", "2")
+        .tableProperty("write.format.default", "parquet")
+        .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
+    )
 
-        if table_exists(df.sparkSession, table_id):
-            writer.overwrite(F.lit(True))
-            return "overwrite"
+    if table_exists(df.sparkSession, table_id):
+        writer.overwrite(F.lit(True))
+        return "overwrite"
 
-        writer.create()
-        return "create"
+    writer.create()
+    return "create"
 
 
 def detect_aws_credential_mode() -> str:
@@ -1010,7 +914,6 @@ def bronze_ingest() -> BronzeIngestResult:
         chunk_size=BRONZE_CHUNK_SIZE,
     )
     trips_df = add_trip_bronze_columns(trips_raw_df, run_id=run_id, source_ref=trips_source_ref)
-    validate_trip_bronze_data(trips_df)
     trips_partitions = max(1, math.ceil(trips_rows / BRONZE_ROWS_PER_PARTITION))
     trips_df = trips_df.repartition(trips_partitions, F.col("event_date"))
 
@@ -1026,9 +929,7 @@ def bronze_ingest() -> BronzeIngestResult:
         taxi_zone_raw_df,
         run_id=run_id,
         source_ref=taxi_zone_source_ref,
-    )
-    validate_taxi_zone_bronze_data(taxi_zone_df)
-    taxi_zone_df = taxi_zone_df.coalesce(1)
+    ).coalesce(1)
 
     trips_write_mode = write_partitioned_iceberg_table(
         trips_df,
