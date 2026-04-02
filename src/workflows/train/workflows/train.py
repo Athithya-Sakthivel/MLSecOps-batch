@@ -1,3 +1,4 @@
+# src/workflows/train/workflows/train.py
 from __future__ import annotations
 
 from flytekit import workflow
@@ -31,7 +32,7 @@ def train(
     random_seed: int = DEFAULT_RANDOM_SEED,
     num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
     early_stopping_rounds: int = DEFAULT_EARLY_STOPPING_ROUNDS,
-) -> dict[str, float]:
+) -> dict[str, float | int]:
     """
     Production training workflow for the ETA regression model.
     """

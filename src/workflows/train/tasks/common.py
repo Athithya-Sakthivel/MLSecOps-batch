@@ -1,3 +1,4 @@
+# src/workflows/train/tasks/common.py
 from __future__ import annotations
 
 import hashlib
@@ -12,6 +13,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from flytekit import Resources
+from pyarrow import fs as pa_fs
+from pyarrow import parquet as pq
 
 DEFAULT_MLFLOW_EXPERIMENT = "trip_duration_eta_lgbm"
 
@@ -261,26 +264,82 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+def _filesystem_and_path(dataset_uri: str) -> tuple[pa_fs.FileSystem, str]:
+    uri = (dataset_uri or "").strip()
+    if not uri:
+        raise ValueError("dataset_uri must not be empty")
+
+    filesystem, abstract_path = pa_fs.FileSystem.from_uri(uri)
+    abstract_path = filesystem.normalize_path(abstract_path)
+    return filesystem, abstract_path
+
+
+def _is_parquet_file(path: str) -> bool:
+    name = Path(path).name
+    return name.endswith(".parquet") and not name.startswith((".", "_"))
+
+
+def _discover_parquet_files(filesystem: pa_fs.FileSystem, base_path: str) -> list[str]:
+    info = filesystem.get_file_info(base_path)
+    if info.type == pa_fs.FileType.NotFound:
+        raise FileNotFoundError(base_path)
+
+    if info.type == pa_fs.FileType.File:
+        return [base_path] if _is_parquet_file(base_path) else []
+
+    selector = pa_fs.FileSelector(base_path, allow_not_found=False, recursive=True)
+    discovered = filesystem.get_file_info(selector)
+    files = sorted(
+        fi.path
+        for fi in discovered
+        if fi.type == pa_fs.FileType.File and _is_parquet_file(fi.path)
+    )
+    return files
+
+
+def _read_parquet_frame(
+    filesystem: pa_fs.FileSystem,
+    path: str,
+    *,
+    columns: list[str] | None,
+) -> pd.DataFrame:
+    table = pq.read_table(
+        path,
+        filesystem=filesystem,
+        columns=columns,
+        use_threads=True,
+        pre_buffer=True,
+        use_pandas_metadata=True,
+    )
+    return table.to_pandas()
+
+
 def load_gold_frame(dataset_uri: str, columns: list[str] | None = None) -> pd.DataFrame:
     """
-    Scalable parquet loader that prefers pyarrow.dataset, including S3 paths.
+    Read the Gold dataset from a directory or file URI using explicit Arrow filesystem
+    discovery. This avoids implicit dataset crawling and schema inference across mixed
+    partitions, which is the failure mode that caused schema merge errors.
     """
-    try:
-        import pyarrow.dataset as ds
-        import pyarrow.fs as pafs
+    filesystem, base_path = _filesystem_and_path(dataset_uri)
+    parquet_files = _discover_parquet_files(filesystem, base_path)
 
-        uri = str(dataset_uri)
-        if uri.startswith("s3://"):
-            region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-            filesystem = pafs.S3FileSystem(region=region) if region else pafs.S3FileSystem()
-            dataset = ds.dataset(uri, filesystem=filesystem, format="parquet")
-        else:
-            dataset = ds.dataset(uri, format="parquet")
+    if not parquet_files:
+        raise FileNotFoundError(f"no parquet files found under {dataset_uri!r}")
 
-        table = dataset.to_table(columns=columns)
-        return table.to_pandas()
-    except Exception:
-        return pd.read_parquet(dataset_uri, columns=columns, engine="pyarrow")
+    frames: list[pd.DataFrame] = []
+    for file_path in parquet_files:
+        frame = _read_parquet_frame(filesystem, file_path, columns=columns)
+        frames.append(frame)
+
+    if len(frames) == 1:
+        out = frames[0].copy()
+    else:
+        out = pd.concat(frames, ignore_index=True, copy=False)
+
+    if "as_of_date" in out.columns:
+        out["as_of_date"] = pd.to_datetime(out["as_of_date"], errors="raise").dt.date
+
+    return out
 
 
 def validate_required_columns(df: pd.DataFrame, required_columns: Iterable[str] = REQUIRED_COLUMNS) -> None:
