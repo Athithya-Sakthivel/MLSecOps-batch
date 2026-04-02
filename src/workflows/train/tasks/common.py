@@ -695,6 +695,10 @@ def build_contract_summary(
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     feature_spec = build_feature_spec()
+    encoding_spec = build_encoding_spec()
+    aggregate_spec = build_aggregate_spec(source_silver_table=source_silver_table)
+    label_spec = build_label_spec(source_silver_table=source_silver_table)
+
     summary: dict[str, Any] = {
         "run_id": run_id,
         "dataset_uri": dataset_uri,
@@ -706,11 +710,14 @@ def build_contract_summary(
         "schema_hash": build_schema_hash(feature_spec),
         "model_family": model_family,
         "inference_runtime": inference_runtime,
-        "output_columns_json": [row["name"] for row in feature_spec["output_columns"]],
-        "feature_spec_json": feature_spec,
-        "encoding_spec_json": build_encoding_spec(),
-        "aggregate_spec_json": build_aggregate_spec(source_silver_table=source_silver_table),
-        "label_spec_json": build_label_spec(source_silver_table=source_silver_table),
+        "output_columns_json": json.dumps(
+            [row["name"] for row in feature_spec["output_columns"]],
+            separators=(",", ":"),
+        ),
+        "feature_spec_json": json.dumps(feature_spec, sort_keys=True, separators=(",", ":")),
+        "encoding_spec_json": json.dumps(encoding_spec, sort_keys=True, separators=(",", ":")),
+        "aggregate_spec_json": json.dumps(aggregate_spec, sort_keys=True, separators=(",", ":")),
+        "label_spec_json": json.dumps(label_spec, sort_keys=True, separators=(",", ":")),
         "created_ts": created_ts or datetime.now(UTC),
     }
     if cutoff_ts is not None:

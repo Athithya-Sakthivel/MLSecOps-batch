@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any
 
 from flytekit import task
 from flytekit.types.directory import FlyteDirectory
@@ -31,6 +31,11 @@ from workflows.train.tasks.common import (
     validate_value_contracts,
 )
 
+EvaluationMetrics = dict[str, float]
+
+def _json_text(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
 
 @task(
     cache=False,
@@ -42,7 +47,7 @@ def evaluate_model(
     train_artifacts_dir: FlyteDirectory,
     gold_dataset: FlyteFile,
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
-) -> dict[str, Any]:
+) -> EvaluationMetrics:
     """
     Evaluate the fitted LightGBM booster on the exact chronological validation split.
 
@@ -61,14 +66,19 @@ def evaluate_model(
 
     current_feature_spec = build_feature_spec()
     current_schema_hash = build_schema_hash(current_feature_spec)
+    expected_feature_spec_json = _json_text(current_feature_spec)
 
     if artifact_feature_spec != current_feature_spec:
         raise ValueError("Training feature_spec does not match the current Gold contract")
-    if artifact_contract.get("schema_hash") != current_schema_hash:
+
+    artifact_schema_hash = artifact_contract.get("schema_hash")
+    if artifact_schema_hash != current_schema_hash:
         raise ValueError("Training contract hash does not match the current Gold contract")
+
     if list(manifest.get("feature_columns", [])) != FEATURE_COLUMNS:
         raise ValueError("Training feature column order does not match the current Gold contract")
-    if list(manifest.get("categorical_features", [])) != [
+
+    expected_categorical_features = [
         "pickup_borough_id",
         "pickup_zone_id",
         "pickup_service_zone_id",
@@ -76,8 +86,14 @@ def evaluate_model(
         "dropoff_zone_id",
         "dropoff_service_zone_id",
         "route_pair_id",
-    ]:
+    ]
+    if list(manifest.get("categorical_features", [])) != expected_categorical_features:
         raise ValueError("Training categorical feature contract does not match the current Gold contract")
+
+    artifact_feature_spec_json = artifact_contract.get("feature_spec_json")
+    if artifact_feature_spec_json is not None and str(artifact_feature_spec_json).strip():
+        if _json_text(artifact_feature_spec_json) != expected_feature_spec_json:
+            raise ValueError("Training artifact feature_spec_json does not match the current Gold contract")
 
     gold_uri = str(gold_dataset)
     log_json(
@@ -110,36 +126,46 @@ def evaluate_model(
     manifest_cutoff = manifest.get("cutoff_ts")
     if manifest_cutoff is not None and str(manifest_cutoff) != str(split.cutoff_ts):
         raise ValueError(
-            f"Validation split cutoff drifted from training: "
+            "Validation split cutoff drifted from training: "
             f"training_cutoff={manifest_cutoff}, current_cutoff={split.cutoff_ts}"
         )
 
-    # If the current Gold dataset has a sidecar contract, it must also match.
     current_dataset_contract = read_json_if_exists(artifact_sidecar_path(gold_uri, ".contract.json"))
     if current_dataset_contract is not None:
-        if current_dataset_contract.get("schema_hash") != current_schema_hash:
+        dataset_schema_hash = current_dataset_contract.get("schema_hash")
+        if dataset_schema_hash != current_schema_hash:
             raise ValueError("Current Gold dataset contract hash does not match the training contract")
-        if current_dataset_contract.get("feature_spec_json") not in {None, current_feature_spec}:
-            raise ValueError("Current Gold dataset feature spec does not match the training contract")
+
+        dataset_feature_spec_json = current_dataset_contract.get("feature_spec_json")
+        if dataset_feature_spec_json is not None and str(dataset_feature_spec_json).strip():
+            if _json_text(dataset_feature_spec_json) != expected_feature_spec_json:
+                raise ValueError("Current Gold dataset feature spec does not match the training contract")
 
     features = prepare_model_input_frame(valid_df)
     y_true = valid_df[LABEL_COLUMN].to_numpy(dtype="float64")
     y_pred = booster.predict(features, num_iteration=booster.best_iteration or None)
 
-    metrics: dict[str, Any] = compute_regression_metrics(y_true, y_pred)
+    metrics: EvaluationMetrics = compute_regression_metrics(y_true, y_pred)
     metrics.update(
         {
-            "validation_rows": len(valid_df),
-            "train_rows": len(split.train_df),
-            "manifest_best_iteration": int(manifest.get("boost_rounds", 0)),
-            "schema_hash": current_schema_hash,
-            "feature_version": current_feature_spec["feature_version"],
-            "schema_version": current_feature_spec["schema_version"],
-            "cutoff_ts": split.cutoff_ts,
-            "gold_table": manifest.get("gold_table", ""),
-            "source_silver_table": manifest.get("source_silver_table", SOURCE_SILVER_TABLE),
+            "validation_rows": float(len(valid_df)),
+            "train_rows": float(len(split.train_df)),
+            "manifest_best_iteration": float(int(manifest.get("boost_rounds", 0))),
         }
     )
 
-    log_json(msg="evaluate_model_success", **metrics)
+    log_json(
+        msg="evaluate_model_success",
+        train_artifacts_dir=str(artifact_dir),
+        gold_dataset=gold_uri,
+        schema_hash=current_schema_hash,
+        feature_version=current_feature_spec["feature_version"],
+        schema_version=current_feature_spec["schema_version"],
+        validation_rows=len(valid_df),
+        train_rows=len(split.train_df),
+        cutoff_ts=str(split.cutoff_ts),
+        gold_table=str(manifest.get("gold_table", "")),
+        source_silver_table=str(manifest.get("source_silver_table", SOURCE_SILVER_TABLE)),
+        **metrics,
+    )
     return metrics

@@ -1,7 +1,7 @@
+# src/workflows/train/tasks/register_model.py
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from flytekit import task
 from flytekit.types.directory import FlyteDirectory
@@ -29,17 +29,11 @@ from workflows.train.tasks.common import (
 def register_model(
     train_artifacts_dir: FlyteDirectory,
     onnx_artifacts_dir: FlyteDirectory,
-    evaluation_metrics: dict[str, Any],
+    evaluation_metrics: dict[str, float],
     mlflow_experiment_name: str = DEFAULT_MLFLOW_EXPERIMENT,
 ) -> None:
     """
     Log the model, contracts, and parity artifacts to MLflow as the final registry step.
-
-    This task is strict about contract drift:
-    - the saved feature spec must match the current Gold contract,
-    - the saved contract hash must match the current Gold contract hash,
-    - the manifest must carry the expected lineage fields,
-    - and all model/ONNX artifacts are logged together for reproducibility.
     """
     import mlflow
 
@@ -84,26 +78,27 @@ def register_model(
 
     mlflow.set_experiment(mlflow_experiment_name)
     with mlflow.start_run():
-        tags = {
-            "problem_type": "trip_duration_regression",
-            "prediction_timing": "pre_trip",
-            "model_family": str(manifest.get("model_family", "lightgbm")),
-            "inference_runtime": str(manifest.get("inference_runtime", "onnxruntime")),
-            "feature_version": str(manifest.get("feature_version", current_feature_spec["feature_version"])),
-            "schema_version": str(manifest.get("schema_version", current_feature_spec["schema_version"])),
-            "schema_hash": str(manifest.get("schema_hash", current_schema_hash)),
-            "gold_table": str(manifest.get("gold_table", "")),
-            "source_silver_table": str(manifest.get("source_silver_table", "")),
-            "train_cutoff_ts": str(manifest.get("cutoff_ts", "")),
-            "validation_fraction": str(manifest.get("validation_fraction", "")),
-            "train_profile": str(manifest.get("train_profile", TRAIN_PROFILE)),
-            "ray_num_workers": str(manifest.get("ray_num_workers", "")),
-            "ray_worker_cpu": str(manifest.get("ray_worker_cpu", "")),
-            "ray_worker_mem": str(manifest.get("ray_worker_mem", "")),
-            "feature_contract_version": "frozen_gold_contract_v1",
-            "orchestration": "flyte",
-        }
-        mlflow.set_tags(tags)
+        mlflow.set_tags(
+            {
+                "problem_type": "trip_duration_regression",
+                "prediction_timing": "pre_trip",
+                "model_family": str(manifest.get("model_family", "lightgbm")),
+                "inference_runtime": str(manifest.get("inference_runtime", "onnxruntime")),
+                "feature_version": str(manifest.get("feature_version", current_feature_spec["feature_version"])),
+                "schema_version": str(manifest.get("schema_version", current_feature_spec["schema_version"])),
+                "schema_hash": str(manifest.get("schema_hash", current_schema_hash)),
+                "gold_table": str(manifest.get("gold_table", "")),
+                "source_silver_table": str(manifest.get("source_silver_table", "")),
+                "train_cutoff_ts": str(manifest.get("cutoff_ts", "")),
+                "validation_fraction": str(manifest.get("validation_fraction", "")),
+                "train_profile": str(manifest.get("train_profile", TRAIN_PROFILE)),
+                "ray_num_workers": str(manifest.get("ray_num_workers", "")),
+                "ray_worker_cpu": str(manifest.get("ray_worker_cpu", "")),
+                "ray_worker_mem": str(manifest.get("ray_worker_mem", "")),
+                "feature_contract_version": "frozen_gold_contract_v1",
+                "orchestration": "flyte",
+            }
+        )
 
         mlflow.log_params({f"flaml__{k}": v for k, v in best_config.items()})
         mlflow.log_params(
@@ -115,9 +110,7 @@ def register_model(
         )
 
         mlflow.log_metrics({f"train__{k}": float(v) for k, v in train_metrics.items() if isinstance(v, (int, float))})
-        mlflow.log_metrics(
-            {f"eval__{k}": float(v) for k, v in evaluation_metrics.items() if isinstance(v, (int, float))}
-        )
+        mlflow.log_metrics({f"eval__{k}": float(v) for k, v in evaluation_metrics.items()})
         mlflow.log_metrics({f"onnx_parity__{k}": float(v) for k, v in onnx_parity.items() if isinstance(v, (int, float))})
 
         mlflow.log_artifact(str(manifest_path), artifact_path="model")

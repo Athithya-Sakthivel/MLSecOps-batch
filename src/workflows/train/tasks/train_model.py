@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import os
 import tempfile
+import uuid
 from pathlib import Path
+from typing import TypedDict
 
 import pandas as pd
 from flytekit import Resources, task
 from flytekit.types.directory import FlyteDirectory
 from flytekit.types.file import FlyteFile
 from flyteplugins.ray import HeadNodeConfig, RayJobConfig, WorkerNodeConfig
-from tasks.common import (
+
+from workflows.train.tasks.common import (
     CATEGORICAL_FEATURES,
     DEFAULT_EARLY_STOPPING_ROUNDS,
     DEFAULT_FLAML_MAX_ITER,
@@ -45,6 +48,18 @@ from tasks.common import (
     validate_value_contracts,
     write_json,
 )
+
+LightGBMParam = str | int | float | bool | list[str]
+
+
+class TrainLoopConfig(TypedDict):
+    params: dict[str, LightGBMParam]
+    num_boost_round: int
+    early_stopping_rounds: int
+    feature_columns: list[str]
+    categorical_features: list[str]
+    label_column: str
+    num_threads: int
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -85,7 +100,22 @@ else:
     EARLY_STOPPING_ROUNDS = _env_int("EARLY_STOPPING_ROUNDS", 100, minimum=10)
     TASK_RETRIES = _env_int("TRAIN_TASK_RETRIES", 1, minimum=0)
 
-def _worker_train_loop(config: dict[str, float]) -> None:
+
+def _normalize_lgb_params(params) -> dict[str, LightGBMParam]:
+    normalized: dict[str, LightGBMParam] = {}
+    for key, value in params.items():
+        if isinstance(value, (str, int, float, bool)):
+            normalized[str(key)] = value
+        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+            normalized[str(key)] = [str(item) for item in value]
+        elif value is None:
+            continue
+        else:
+            normalized[str(key)] = str(value)
+    return normalized
+
+
+def _worker_train_loop(config: TrainLoopConfig) -> None:
     import lightgbm as lgb
     import ray
     from ray.train.lightgbm import RayTrainReportCallback, get_network_params
@@ -98,9 +128,9 @@ def _worker_train_loop(config: dict[str, float]) -> None:
     train_df = train_shard.materialize().to_pandas()
     valid_df = valid_shard.materialize().to_pandas()
 
-    feature_columns: list[str] = list(config["feature_columns"])
-    categorical_features: list[str] = list(config["categorical_features"])
-    label_column = str(config["label_column"])
+    feature_columns = config["feature_columns"]
+    categorical_features = config["categorical_features"]
+    label_column = config["label_column"]
     num_boost_round = int(config["num_boost_round"])
     early_stopping_rounds = int(config["early_stopping_rounds"])
     params = dict(config["params"])
@@ -145,8 +175,10 @@ def _worker_train_loop(config: dict[str, float]) -> None:
         valid_sets=[valid_set],
         valid_names=["validation"],
         num_boost_round=num_boost_round,
-        callbacks=[RayTrainReportCallback()],
-        early_stopping_rounds=early_stopping_rounds,
+        callbacks=[
+            RayTrainReportCallback(),
+            lgb.early_stopping(early_stopping_rounds, verbose=False),
+        ],
     )
 
 
@@ -190,9 +222,12 @@ def train_model(
     from ray.train import ScalingConfig
     from ray.train.lightgbm import LightGBMTrainer, RayTrainReportCallback
 
+    run_id = os.environ.get("RUN_ID") or os.environ.get("FLYTE_INTERNAL_EXECUTION_ID") or uuid.uuid4().hex
     dataset_uri = str(gold_dataset)
+
     log_json(
         msg="train_model_start",
+        run_id=run_id,
         train_profile=TRAIN_PROFILE,
         dataset_uri=dataset_uri,
         validation_fraction=validation_fraction,
@@ -209,6 +244,19 @@ def train_model(
         gold_schema_version=GOLD_SCHEMA_VERSION,
     )
 
+    current_feature_spec = build_feature_spec()
+    current_schema_hash = build_schema_hash(current_feature_spec)
+    expected_feature_spec_path = artifact_sidecar_path(dataset_uri, ".feature_spec.json")
+    expected_contract_path = artifact_sidecar_path(dataset_uri, ".contract.json")
+
+    current_dataset_feature_spec = read_json_if_exists(expected_feature_spec_path)
+    if current_dataset_feature_spec is not None and current_dataset_feature_spec != current_feature_spec:
+        raise ValueError("Gold feature_spec sidecar does not match the current training contract")
+
+    current_dataset_contract = read_json_if_exists(expected_contract_path)
+    if current_dataset_contract is not None and current_dataset_contract.get("schema_hash") not in {None, current_schema_hash}:
+        raise ValueError("Gold contract sidecar schema hash does not match the current training contract")
+
     raw_df = load_gold_frame(dataset_uri)
     validate_gold_contract(raw_df, strict_dtypes=False, label="Gold input frame")
 
@@ -216,14 +264,6 @@ def train_model(
     validate_gold_contract(df, strict_dtypes=True, label="Gold canonical frame")
     validate_value_contracts(df)
     df = df.sort_values(TIMESTAMP_COLUMN, kind="mergesort").reset_index(drop=True)
-
-    current_feature_spec = build_feature_spec()
-    current_schema_hash = build_schema_hash(current_feature_spec)
-
-    # Optional local sidecars from an unwrapped local snapshot; not required for correctness.
-    feature_spec_sidecar = read_json_if_exists(artifact_sidecar_path(dataset_uri, ".feature_spec.json"))
-    if feature_spec_sidecar is not None and feature_spec_sidecar != current_feature_spec:
-        raise ValueError("Gold feature_spec sidecar does not match the current training contract")
 
     split = split_by_time(df, validation_fraction=validation_fraction)
     if len(split.train_df) < 100 or len(split.valid_df) < 10:
@@ -251,7 +291,7 @@ def train_model(
     best_config = dict(automl.best_config)
     safe_best_config = {k: v for k, v in best_config.items() if not str(k).startswith("FLAML_")}
     flaml_estimator = LGBMEstimator(task="regression", **safe_best_config)
-    worker_params = dict(flaml_estimator.params)
+    worker_params = _normalize_lgb_params(flaml_estimator.params)
 
     boost_rounds = int(worker_params.pop("n_estimators", num_boost_round) or num_boost_round)
     if boost_rounds <= 0:
@@ -274,8 +314,8 @@ def train_model(
             "params": worker_params,
             "num_boost_round": boost_rounds,
             "early_stopping_rounds": early_stopping_rounds,
-            "feature_columns": FEATURE_COLUMNS,
-            "categorical_features": CATEGORICAL_FEATURES,
+            "feature_columns": list(FEATURE_COLUMNS),
+            "categorical_features": list(CATEGORICAL_FEATURES),
             "label_column": LABEL_COLUMN,
             "num_threads": RAY_WORKER_CPU,
         },
@@ -287,6 +327,9 @@ def train_model(
         ),
     )
     result = trainer.fit()
+    if result.checkpoint is None:
+        raise RuntimeError("Ray training did not produce a checkpoint")
+
     booster = RayTrainReportCallback.get_model(result.checkpoint)
 
     valid_features = prepare_model_input_frame(split.valid_df)
@@ -296,16 +339,15 @@ def train_model(
     metrics = compute_regression_metrics(y_valid, preds)
     metrics.update(
         {
-            "best_iteration": int(getattr(booster, "best_iteration", 0) or 0),
-            "train_rows": len(split.train_df),
-            "valid_rows": len(split.valid_df),
-            "flaml_time_budget_seconds": int(flaml_time_budget_seconds),
-            "flaml_max_iter": int(flaml_max_iter),
-            "cutoff_ts": split.cutoff_ts,
+            "best_iteration": float(int(getattr(booster, "best_iteration", 0) or 0)),
+            "train_rows": float(len(split.train_df)),
+            "valid_rows": float(len(split.valid_df)),
+            "flaml_time_budget_seconds": float(flaml_time_budget_seconds),
+            "flaml_max_iter": float(flaml_max_iter),
+            "cutoff_ts": str(split.cutoff_ts),
             "train_profile": TRAIN_PROFILE,
-            "ray_num_workers": RAY_NUM_WORKERS,
-            "ray_worker_cpu": RAY_WORKER_CPU,
-            "ray_worker_mem": RAY_WORKER_MEM,
+            "ray_num_workers": float(RAY_NUM_WORKERS),
+            "ray_worker_cpu": float(RAY_WORKER_CPU),
             "feature_version": current_feature_spec["feature_version"],
             "schema_version": current_feature_spec["schema_version"],
             "schema_hash": current_schema_hash,
@@ -327,6 +369,7 @@ def train_model(
         dataframe=df,
         gold_table=GOLD_TRAINING_TABLE,
         source_silver_table=SOURCE_SILVER_TABLE,
+        run_id=run_id,
         cutoff_ts=split.cutoff_ts,
         extra={
             "train_profile": TRAIN_PROFILE,
@@ -356,8 +399,8 @@ def train_model(
         "metrics": metrics,
         "ray_train_result_metrics": getattr(result, "metrics", {}),
         "dataset_source": dataset_uri,
-        "feature_columns": FEATURE_COLUMNS,
-        "categorical_features": CATEGORICAL_FEATURES,
+        "feature_columns": list(FEATURE_COLUMNS),
+        "categorical_features": list(CATEGORICAL_FEATURES),
         "label_column": LABEL_COLUMN,
         "validation_sample_rows": len(parity_sample),
         "validation_sample_path": str(out_dir / "validation_sample.parquet"),
@@ -372,6 +415,7 @@ def train_model(
     write_json(
         out_dir / "runtime_config.json",
         {
+            "run_id": run_id,
             "train_profile": TRAIN_PROFILE,
             "ray_num_workers": RAY_NUM_WORKERS,
             "ray_worker_cpu": RAY_WORKER_CPU,
@@ -384,11 +428,11 @@ def train_model(
 
     log_json(
         msg="train_model_success",
-        run_id=manifest.get("run_id"),
+        run_id=run_id,
         schema_hash=current_schema_hash,
-        best_iteration=metrics["best_iteration"],
-        train_rows=metrics["train_rows"],
-        valid_rows=metrics["valid_rows"],
+        best_iteration=int(metrics["best_iteration"]),
+        train_rows=int(metrics["train_rows"]),
+        valid_rows=int(metrics["valid_rows"]),
         output_dir=str(out_dir),
     )
 

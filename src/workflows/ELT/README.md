@@ -27,14 +27,6 @@ It contains:
 * Hadoop S3 support
 * Python libraries needed by the bronze extractor and downstream Spark tasks
 
-It does not contain application source code.
-
-### Code delivery
-
-Workflow code is shipped by Flyte at registration/execution time, not baked into the image.
-
-The image is the runtime; the repository snapshot is the code.
-
 ### Versioning
 
 * Image version is separate from code version.

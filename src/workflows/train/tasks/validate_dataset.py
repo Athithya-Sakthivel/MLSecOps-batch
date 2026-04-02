@@ -42,12 +42,6 @@ def validate_dataset(
     """
     Validate the Gold dataset against the frozen ML contract, then emit a canonical,
     timestamp-ordered parquet snapshot and a validation sidecar.
-
-    This task is intentionally narrow:
-    - it validates the Gold contract first,
-    - it canonicalizes dtypes only after the contract check,
-    - it ensures a deterministic chronological split is possible,
-    - and it writes the validated snapshot plus validation metadata.
     """
     dataset_uri = str(gold_dataset)
     log_json(
@@ -93,10 +87,14 @@ def validate_dataset(
         },
     )
 
-    write_json(artifact_sidecar_path(out_path, ".feature_spec.json"), feature_spec)
-    write_json(artifact_sidecar_path(out_path, ".contract.json"), contract)
+    feature_spec_path = artifact_sidecar_path(out_path, ".feature_spec.json")
+    contract_path = artifact_sidecar_path(out_path, ".contract.json")
+    validation_report_path = artifact_sidecar_path(out_path, ".validation_report.json")
+
+    write_json(feature_spec_path, feature_spec)
+    write_json(contract_path, contract)
     write_json(
-        artifact_sidecar_path(out_path, ".validation_report.json"),
+        validation_report_path,
         {
             "dataset_uri": dataset_uri,
             "schema_hash": schema_hash,
@@ -109,8 +107,8 @@ def validate_dataset(
             "timestamp_column": TIMESTAMP_COLUMN,
             "gold_table": GOLD_TRAINING_TABLE,
             "source_silver_table": SOURCE_SILVER_TABLE,
-            "contract_sidecar": str(artifact_sidecar_path(out_path, ".contract.json")),
-            "feature_spec_sidecar": str(artifact_sidecar_path(out_path, ".feature_spec.json")),
+            "contract_sidecar": str(contract_path),
+            "feature_spec_sidecar": str(feature_spec_path),
         },
     )
 

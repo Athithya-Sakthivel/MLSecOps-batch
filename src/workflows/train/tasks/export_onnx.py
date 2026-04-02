@@ -118,7 +118,6 @@ def export_onnx(
     validate_gold_contract(sample_df, strict_dtypes=True, label="Validation parity sample")
     validate_value_contracts(sample_df)
 
-    # Predict using the exact model input coercions used during training.
     booster_features = prepare_model_input_frame(sample_df)
     onnx_features = align_model_features(sample_df).to_numpy(dtype=np.float32)
 

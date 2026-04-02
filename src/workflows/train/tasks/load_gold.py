@@ -6,6 +6,8 @@ from flytekit import task
 from flytekit.types.file import FlyteFile
 
 from workflows.train.tasks.common import (
+    GOLD_FEATURE_VERSION,
+    GOLD_SCHEMA_VERSION,
     GOLD_TRAINING_TABLE,
     LIGHT_TASK_LIMITS,
     LIGHT_TASK_RETRIES,
@@ -36,12 +38,6 @@ def load_gold(dataset_uri: str, output_path: str = "/tmp/gold_canonical.parquet"
     """
     Read the Gold dataset, validate the frozen contract, canonicalize dtypes,
     and materialize a deterministic parquet snapshot with sidecar contract files.
-
-    This task is intentionally narrow:
-    - it validates the Gold contract first,
-    - it canonicalizes dtypes only after the contract check,
-    - it sorts deterministically by as_of_ts,
-    - and it writes the validated snapshot plus contract metadata.
     """
     log_json(msg="load_gold_start", dataset_uri=dataset_uri, output_path=output_path)
 
@@ -67,14 +63,19 @@ def load_gold(dataset_uri: str, output_path: str = "/tmp/gold_canonical.parquet"
         gold_table=GOLD_TRAINING_TABLE,
         source_silver_table=SOURCE_SILVER_TABLE,
         extra={
-            "output_path": str(out_path),
             "task": "load_gold",
+            "output_path": str(out_path),
             "validated_columns": list(df.columns),
+            "gold_feature_version": GOLD_FEATURE_VERSION,
+            "gold_schema_version": GOLD_SCHEMA_VERSION,
         },
     )
 
-    write_json(artifact_sidecar_path(out_path, ".feature_spec.json"), feature_spec)
-    write_json(artifact_sidecar_path(out_path, ".contract.json"), contract)
+    feature_spec_path = artifact_sidecar_path(out_path, ".feature_spec.json")
+    contract_path = artifact_sidecar_path(out_path, ".contract.json")
+
+    write_json(feature_spec_path, feature_spec)
+    write_json(contract_path, contract)
 
     log_json(
         msg="load_gold_success",
@@ -84,8 +85,10 @@ def load_gold(dataset_uri: str, output_path: str = "/tmp/gold_canonical.parquet"
         schema_hash=schema_hash,
         feature_version=feature_spec["feature_version"],
         schema_version=feature_spec["schema_version"],
-        contract_sidecar=str(artifact_sidecar_path(out_path, ".contract.json")),
-        feature_spec_sidecar=str(artifact_sidecar_path(out_path, ".feature_spec.json")),
+        contract_sidecar=str(contract_path),
+        feature_spec_sidecar=str(feature_spec_path),
+        gold_table=GOLD_TRAINING_TABLE,
+        source_silver_table=SOURCE_SILVER_TABLE,
     )
 
     return FlyteFile(path=str(out_path))
