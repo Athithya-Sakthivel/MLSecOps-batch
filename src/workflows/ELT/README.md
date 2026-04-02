@@ -10,7 +10,7 @@ Object store (S3)    ───────► immutable data files
 Catalog DB           ───────► Iceberg metadata/state
 ```
 
-Flyte tasks run in Kubernetes pods, and the Spark task plugin provides the Spark session and Spark runtime needed by each task. In the current setup, the repository does not use a `run.sh` submission path. Instead, the code is organized around registered workflows and launch plans: Flyte generates a default launch plan for each workflow when it is registered, and launch plans are the invocation mechanism for executions. Launch plans can also define fixed inputs, schedules, and other execution-time settings. ([Flyte][1])
+Flyte tasks run in Kubernetes pods, and the Spark task plugin provides the Spark session and Spark runtime needed by each task. The code is organized around registered workflows and launch plans: Flyte generates a default launch plan for each workflow when it is registered, and launch plans are the invocation mechanism for executions. Launch plans can also define fixed inputs, schedules, and other execution-time settings. ([Flyte][1])
 
 ## 1) Core contracts
 

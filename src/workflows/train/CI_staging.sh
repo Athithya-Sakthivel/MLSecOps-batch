@@ -11,7 +11,7 @@ TRAIN_TASK_IMAGE="ghcr.io/${GHCR_USER}/flyte-train-task:${IMAGE_TAG}"
 
 echo "${GIT_PAT}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
 
-docker build \
+docker build --no-cache \
   -t "${TRAIN_TASK_IMAGE}" \
   -f src/workflows/train/Dockerfile.task_image \
   .

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from flytekit import Resources, task
@@ -13,25 +15,141 @@ from tasks.common import (
     DEFAULT_EARLY_STOPPING_ROUNDS,
     DEFAULT_FLAML_MAX_ITER,
     DEFAULT_FLAML_TIME_BUDGET_SECONDS,
+    DEFAULT_MLFLOW_EXPERIMENT,
     DEFAULT_NUM_BOOST_ROUND,
     DEFAULT_RANDOM_SEED,
     DEFAULT_SAMPLE_ROWS,
     DEFAULT_VALIDATION_FRACTION,
     FEATURE_COLUMNS,
+    GOLD_FEATURE_VERSION,
+    GOLD_SCHEMA_VERSION,
+    GOLD_TRAINING_TABLE,
     LABEL_COLUMN,
+    SOURCE_SILVER_TABLE,
     TIMESTAMP_COLUMN,
-    assert_no_leakage_columns,
+    TRAIN_PROFILE,
+    artifact_sidecar_path,
+    build_contract_summary,
     build_feature_spec,
+    build_schema_hash,
+    build_task_environment,
     coerce_contract_dtypes,
     compute_regression_metrics,
     ensure_directory,
     load_gold_frame,
+    log_json,
+    prepare_model_input_frame,
+    read_json_if_exists,
     sample_frame,
     split_by_time,
-    validate_required_columns,
+    validate_gold_contract,
     validate_value_contracts,
     write_json,
 )
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    value = int(os.environ.get(name, str(default)))
+    return max(value, minimum)
+
+
+def _env_str(name: str, default: str) -> str:
+    return os.environ.get(name, default).strip()
+
+
+if TRAIN_PROFILE == "prod":
+    TASK_LIMITS = Resources(
+        cpu=_env_str("TRAIN_TASK_CPU", "1000m"),
+        mem=_env_str("TRAIN_TASK_MEM", "1024Mi"),
+    )
+    RAY_NUM_WORKERS = _env_int("RAY_NUM_WORKERS", 4, minimum=1)
+    RAY_WORKER_CPU = _env_int("RAY_WORKER_CPU", 2, minimum=1)
+    RAY_WORKER_MEM = _env_str("RAY_WORKER_MEM", "4Gi")
+    FLAML_TIME_BUDGET_SECONDS = _env_int("FLAML_TIME_BUDGET_SECONDS", 900, minimum=60)
+    FLAML_MAX_ITER = _env_int("FLAML_MAX_ITER", 100, minimum=10)
+    SAMPLE_ROWS = _env_int("SAMPLE_ROWS", 100_000, minimum=100)
+    NUM_BOOST_ROUND = _env_int("NUM_BOOST_ROUND", 3000, minimum=100)
+    EARLY_STOPPING_ROUNDS = _env_int("EARLY_STOPPING_ROUNDS", 200, minimum=10)
+    TASK_RETRIES = _env_int("TRAIN_TASK_RETRIES", 1, minimum=0)
+else:
+    TASK_LIMITS = Resources(
+        cpu=_env_str("TRAIN_TASK_CPU", "500m"),
+        mem=_env_str("TRAIN_TASK_MEM", "768Mi"),
+    )
+    RAY_NUM_WORKERS = _env_int("RAY_NUM_WORKERS", 2, minimum=1)
+    RAY_WORKER_CPU = _env_int("RAY_WORKER_CPU", 1, minimum=1)
+    RAY_WORKER_MEM = _env_str("RAY_WORKER_MEM", "2Gi")
+    FLAML_TIME_BUDGET_SECONDS = _env_int("FLAML_TIME_BUDGET_SECONDS", 120, minimum=30)
+    FLAML_MAX_ITER = _env_int("FLAML_MAX_ITER", 20, minimum=5)
+    SAMPLE_ROWS = _env_int("SAMPLE_ROWS", 25_000, minimum=100)
+    NUM_BOOST_ROUND = _env_int("NUM_BOOST_ROUND", 1500, minimum=100)
+    EARLY_STOPPING_ROUNDS = _env_int("EARLY_STOPPING_ROUNDS", 100, minimum=10)
+    TASK_RETRIES = _env_int("TRAIN_TASK_RETRIES", 1, minimum=0)
+
+
+def _worker_train_loop(config: dict[str, Any]) -> None:
+    import lightgbm as lgb
+    import ray
+    from ray.train.lightgbm import RayTrainReportCallback, get_network_params
+
+    train_shard = ray.train.get_dataset_shard("train")
+    valid_shard = ray.train.get_dataset_shard("validation")
+    if train_shard is None or valid_shard is None:
+        raise RuntimeError("Ray dataset shards are unavailable inside the LightGBM worker")
+
+    train_df = train_shard.materialize().to_pandas()
+    valid_df = valid_shard.materialize().to_pandas()
+
+    feature_columns: list[str] = list(config["feature_columns"])
+    categorical_features: list[str] = list(config["categorical_features"])
+    label_column = str(config["label_column"])
+    num_boost_round = int(config["num_boost_round"])
+    early_stopping_rounds = int(config["early_stopping_rounds"])
+    params = dict(config["params"])
+
+    for frame in (train_df, valid_df):
+        for col in categorical_features:
+            frame[col] = pd.to_numeric(frame[col], errors="raise").astype("int32").astype("category")
+        for col in [c for c in feature_columns if c not in categorical_features]:
+            frame[col] = pd.to_numeric(frame[col], errors="raise").astype("float64")
+        frame[label_column] = pd.to_numeric(frame[label_column], errors="raise").astype("float64")
+
+    train_set = lgb.Dataset(
+        train_df[feature_columns],
+        label=train_df[label_column],
+        categorical_feature=categorical_features,
+        free_raw_data=False,
+    )
+    valid_set = lgb.Dataset(
+        valid_df[feature_columns],
+        label=valid_df[label_column],
+        categorical_feature=categorical_features,
+        free_raw_data=False,
+    )
+
+    params.update(
+        {
+            "objective": "regression",
+            "metric": ["l1", "rmse"],
+            "verbosity": -1,
+            "tree_learner": "data_parallel",
+            "pre_partition": True,
+            **get_network_params(),
+        }
+    )
+
+    if "num_threads" not in params:
+        params["num_threads"] = max(1, int(config["num_threads"]))
+
+    lgb.train(
+        params,
+        train_set,
+        valid_sets=[valid_set],
+        valid_names=["validation"],
+        num_boost_round=num_boost_round,
+        callbacks=[RayTrainReportCallback()],
+        early_stopping_rounds=early_stopping_rounds,
+    )
 
 
 @task(
@@ -41,15 +159,18 @@ from tasks.common import (
         worker_node_config=[
             WorkerNodeConfig(
                 group_name="ml-workers",
-                replicas=2,
-                requests=Resources(cpu="2", mem="2Gi"),
-                limits=Resources(cpu="2", mem="2Gi"),
+                replicas=RAY_NUM_WORKERS,
+                requests=Resources(cpu=str(RAY_WORKER_CPU), mem=RAY_WORKER_MEM),
+                limits=Resources(cpu=str(RAY_WORKER_CPU), mem=RAY_WORKER_MEM),
             )
         ],
         enable_autoscaling=False,
         shutdown_after_job_finishes=True,
         ttl_seconds_after_finished=300,
     ),
+    environment=build_task_environment(),
+    retries=TASK_RETRIES,
+    limits=TASK_LIMITS,
 )
 def train_model(
     gold_dataset: FlyteFile,
@@ -61,33 +182,58 @@ def train_model(
     num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
     early_stopping_rounds: int = DEFAULT_EARLY_STOPPING_ROUNDS,
 ) -> FlyteDirectory:
-    """Train a LightGBM regression model using FLAML and Ray Train."""
-
+    """
+    Train a LightGBM regression model against the frozen Gold contract and emit
+    model + contract artifacts.
+    """
     import ray
     from flaml import AutoML
     from flaml.automl.model import LGBMEstimator
     from ray.train import ScalingConfig
     from ray.train.lightgbm import LightGBMTrainer, RayTrainReportCallback
 
-    df = load_gold_frame(
-        str(gold_dataset),
-        columns=[*FEATURE_COLUMNS, LABEL_COLUMN, TIMESTAMP_COLUMN, "trip_id"],
+    dataset_uri = str(gold_dataset)
+    log_json(
+        msg="train_model_start",
+        train_profile=TRAIN_PROFILE,
+        dataset_uri=dataset_uri,
+        validation_fraction=validation_fraction,
+        flaml_time_budget_seconds=flaml_time_budget_seconds,
+        flaml_max_iter=flaml_max_iter,
+        sample_rows=sample_rows,
+        random_seed=random_seed,
+        num_boost_round=num_boost_round,
+        early_stopping_rounds=early_stopping_rounds,
+        ray_num_workers=RAY_NUM_WORKERS,
+        ray_worker_cpu=RAY_WORKER_CPU,
+        ray_worker_mem=RAY_WORKER_MEM,
+        gold_feature_version=GOLD_FEATURE_VERSION,
+        gold_schema_version=GOLD_SCHEMA_VERSION,
     )
-    validate_required_columns(df)
-    assert_no_leakage_columns(df)
-    df = coerce_contract_dtypes(df)
+
+    raw_df = load_gold_frame(dataset_uri)
+    validate_gold_contract(raw_df, strict_dtypes=False, label="Gold input frame")
+
+    df = coerce_contract_dtypes(raw_df)
+    validate_gold_contract(df, strict_dtypes=True, label="Gold canonical frame")
     validate_value_contracts(df)
     df = df.sort_values(TIMESTAMP_COLUMN, kind="mergesort").reset_index(drop=True)
 
+    current_feature_spec = build_feature_spec()
+    current_schema_hash = build_schema_hash(current_feature_spec)
+
+    # Optional local sidecars from an unwrapped local snapshot; not required for correctness.
+    feature_spec_sidecar = read_json_if_exists(artifact_sidecar_path(dataset_uri, ".feature_spec.json"))
+    if feature_spec_sidecar is not None and feature_spec_sidecar != current_feature_spec:
+        raise ValueError("Gold feature_spec sidecar does not match the current training contract")
+
     split = split_by_time(df, validation_fraction=validation_fraction)
-    train_df = split.train_df
-    valid_df = split.valid_df
-    if len(train_df) < 100 or len(valid_df) < 10:
+    if len(split.train_df) < 100 or len(split.valid_df) < 10:
         raise ValueError("Insufficient rows after chronological split for reliable training")
 
-    search_df = sample_frame(train_df, max_rows=sample_rows, seed=random_seed)
-    X_search = search_df[FEATURE_COLUMNS]
-    y_search = search_df[LABEL_COLUMN]
+    search_df = sample_frame(split.train_df, max_rows=sample_rows, seed=random_seed)
+    X_search = prepare_model_input_frame(search_df)
+    y_search = search_df[LABEL_COLUMN].astype("float64")
 
     automl = AutoML()
     automl.fit(
@@ -107,43 +253,64 @@ def train_model(
     best_config = dict(automl.best_config)
     safe_best_config = {k: v for k, v in best_config.items() if not str(k).startswith("FLAML_")}
     flaml_estimator = LGBMEstimator(task="regression", **safe_best_config)
-    original_params = dict(flaml_estimator.params)
-    boost_rounds = int(original_params.pop("n_estimators", num_boost_round))
+    worker_params = dict(flaml_estimator.params)
+
+    boost_rounds = int(worker_params.pop("n_estimators", num_boost_round) or num_boost_round)
     if boost_rounds <= 0:
         boost_rounds = num_boost_round
 
-    train_ray = ray.data.from_pandas(train_df[[*FEATURE_COLUMNS, LABEL_COLUMN]])
-    valid_ray = ray.data.from_pandas(valid_df[[*FEATURE_COLUMNS, LABEL_COLUMN]])
+    worker_params.setdefault("objective", "regression")
+    worker_params.setdefault("verbosity", -1)
+    worker_params.setdefault("metric", ["l1", "rmse"])
+    worker_params["num_threads"] = max(1, RAY_WORKER_CPU)
+
+    train_df = split.train_df[[*FEATURE_COLUMNS, LABEL_COLUMN]].copy()
+    valid_df = split.valid_df[[*FEATURE_COLUMNS, LABEL_COLUMN]].copy()
+
+    train_ray = ray.data.from_pandas(train_df)
+    valid_ray = ray.data.from_pandas(valid_df)
 
     trainer = LightGBMTrainer(
-        lambda config: None,
+        _worker_train_loop,
         train_loop_config={
-            "params": original_params,
+            "params": worker_params,
             "num_boost_round": boost_rounds,
             "early_stopping_rounds": early_stopping_rounds,
-            "random_seed": random_seed,
+            "feature_columns": FEATURE_COLUMNS,
+            "categorical_features": CATEGORICAL_FEATURES,
+            "label_column": LABEL_COLUMN,
+            "num_threads": RAY_WORKER_CPU,
         },
         datasets={"train": train_ray, "validation": valid_ray},
-        scaling_config=ScalingConfig(num_workers=2, use_gpu=False),
+        scaling_config=ScalingConfig(
+            num_workers=RAY_NUM_WORKERS,
+            resources_per_worker={"CPU": RAY_WORKER_CPU},
+            use_gpu=False,
+        ),
     )
     result = trainer.fit()
-
     booster = RayTrainReportCallback.get_model(result.checkpoint)
 
-    valid_features = valid_df[FEATURE_COLUMNS].copy()
-    for col in CATEGORICAL_FEATURES:
-        valid_features[col] = pd.to_numeric(valid_features[col], errors="raise").astype("int64")
-    y_valid = valid_df[LABEL_COLUMN].to_numpy(dtype="float64")
+    valid_features = prepare_model_input_frame(split.valid_df)
+    y_valid = split.valid_df[LABEL_COLUMN].to_numpy(dtype="float64")
     preds = booster.predict(valid_features, num_iteration=booster.best_iteration or None)
+
     metrics = compute_regression_metrics(y_valid, preds)
     metrics.update(
         {
             "best_iteration": int(getattr(booster, "best_iteration", 0) or 0),
-            "train_rows": len(train_df),
-            "valid_rows": len(valid_df),
+            "train_rows": len(split.train_df),
+            "valid_rows": len(split.valid_df),
             "flaml_time_budget_seconds": int(flaml_time_budget_seconds),
             "flaml_max_iter": int(flaml_max_iter),
             "cutoff_ts": split.cutoff_ts,
+            "train_profile": TRAIN_PROFILE,
+            "ray_num_workers": RAY_NUM_WORKERS,
+            "ray_worker_cpu": RAY_WORKER_CPU,
+            "ray_worker_mem": RAY_WORKER_MEM,
+            "feature_version": current_feature_spec["feature_version"],
+            "schema_version": current_feature_spec["schema_version"],
+            "schema_hash": current_schema_hash,
         }
     )
 
@@ -152,28 +319,79 @@ def train_model(
 
     booster.save_model(str(out_dir / "model.txt"))
 
-    parity_sample = valid_df.sample(n=min(2048, len(valid_df)), random_state=random_seed).copy()
+    parity_sample = split.valid_df.sample(n=min(2048, len(split.valid_df)), random_state=random_seed).copy()
+    parity_sample = parity_sample.sort_values(TIMESTAMP_COLUMN, kind="mergesort").reset_index(drop=True)
     parity_sample.to_parquet(out_dir / "validation_sample.parquet", index=False)
 
-    feature_spec = build_feature_spec()
-    write_json(out_dir / "feature_spec.json", feature_spec)
+    contract_summary = build_contract_summary(
+        dataset_uri=dataset_uri,
+        row_count=len(df),
+        dataframe=df,
+        gold_table=GOLD_TRAINING_TABLE,
+        source_silver_table=SOURCE_SILVER_TABLE,
+        cutoff_ts=split.cutoff_ts,
+        extra={
+            "train_profile": TRAIN_PROFILE,
+            "validation_fraction": validation_fraction,
+            "train_rows": len(split.train_df),
+            "valid_rows": len(split.valid_df),
+            "sample_rows": sample_rows,
+            "random_seed": random_seed,
+            "flaml_time_budget_seconds": flaml_time_budget_seconds,
+            "flaml_max_iter": flaml_max_iter,
+            "num_boost_round": num_boost_round,
+            "early_stopping_rounds": early_stopping_rounds,
+            "ray_num_workers": RAY_NUM_WORKERS,
+            "ray_worker_cpu": RAY_WORKER_CPU,
+            "ray_worker_mem": RAY_WORKER_MEM,
+            "feature_version": current_feature_spec["feature_version"],
+            "schema_version": current_feature_spec["schema_version"],
+            "schema_hash": current_schema_hash,
+        },
+    )
+
+    manifest = {
+        **contract_summary,
+        "best_config": best_config,
+        "lightgbm_params": worker_params,
+        "boost_rounds": boost_rounds,
+        "metrics": metrics,
+        "ray_train_result_metrics": getattr(result, "metrics", {}),
+        "dataset_source": dataset_uri,
+        "feature_columns": FEATURE_COLUMNS,
+        "categorical_features": CATEGORICAL_FEATURES,
+        "label_column": LABEL_COLUMN,
+        "validation_sample_rows": len(parity_sample),
+        "validation_sample_path": str(out_dir / "validation_sample.parquet"),
+        "mlflow_experiment_name": DEFAULT_MLFLOW_EXPERIMENT,
+    }
+
+    write_json(out_dir / "feature_spec.json", current_feature_spec)
+    write_json(out_dir / "contract.json", contract_summary)
     write_json(out_dir / "best_config.json", best_config)
-    write_json(out_dir / "lightgbm_params.json", original_params)
+    write_json(out_dir / "lightgbm_params.json", worker_params)
     write_json(out_dir / "metrics.json", metrics)
     write_json(
-        out_dir / "manifest.json",
+        out_dir / "runtime_config.json",
         {
-            "dataset_source": str(gold_dataset),
-            "timestamp_column": TIMESTAMP_COLUMN,
-            "cutoff_ts": split.cutoff_ts,
-            "feature_spec": feature_spec,
-            "best_config": best_config,
-            "lightgbm_params": original_params,
-            "boost_rounds": boost_rounds,
-            "random_seed": random_seed,
-            "validation_fraction": validation_fraction,
-            "ray_train_result_metrics": getattr(result, "metrics", {}),
+            "train_profile": TRAIN_PROFILE,
+            "ray_num_workers": RAY_NUM_WORKERS,
+            "ray_worker_cpu": RAY_WORKER_CPU,
+            "ray_worker_mem": RAY_WORKER_MEM,
+            "gold_feature_version": GOLD_FEATURE_VERSION,
+            "gold_schema_version": GOLD_SCHEMA_VERSION,
         },
+    )
+    write_json(out_dir / "manifest.json", manifest)
+
+    log_json(
+        msg="train_model_success",
+        run_id=manifest.get("run_id"),
+        schema_hash=current_schema_hash,
+        best_iteration=metrics["best_iteration"],
+        train_rows=metrics["train_rows"],
+        valid_rows=metrics["valid_rows"],
+        output_dir=str(out_dir),
     )
 
     return FlyteDirectory(path=str(out_dir))

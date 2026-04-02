@@ -5,60 +5,145 @@ from typing import Any
 
 from flytekit import task
 from flytekit.types.directory import FlyteDirectory
-from tasks.common import DEFAULT_MLFLOW_EXPERIMENT, read_json
+
+from workflows.train.tasks.common import (
+    DEFAULT_MLFLOW_EXPERIMENT,
+    LIGHT_TASK_LIMITS,
+    LIGHT_TASK_RETRIES,
+    TRAIN_PROFILE,
+    build_feature_spec,
+    build_schema_hash,
+    build_task_environment,
+    log_json,
+    read_json,
+    read_json_if_exists,
+)
 
 
-@task(cache=False)
+@task(
+    cache=False,
+    environment=build_task_environment(),
+    retries=LIGHT_TASK_RETRIES,
+    limits=LIGHT_TASK_LIMITS,
+)
 def register_model(
     train_artifacts_dir: FlyteDirectory,
     onnx_artifacts_dir: FlyteDirectory,
     evaluation_metrics: dict[str, Any],
     mlflow_experiment_name: str = DEFAULT_MLFLOW_EXPERIMENT,
 ) -> None:
-    """Log the model and all artifacts to MLflow as the final registry step."""
+    """
+    Log the model, contracts, and parity artifacts to MLflow as the final registry step.
 
+    This task is strict about contract drift:
+    - the saved feature spec must match the current Gold contract,
+    - the saved contract hash must match the current Gold contract hash,
+    - the manifest must carry the expected lineage fields,
+    - and all model/ONNX artifacts are logged together for reproducibility.
+    """
     import mlflow
 
     train_dir = Path(str(train_artifacts_dir))
     onnx_dir = Path(str(onnx_artifacts_dir))
 
-    manifest = read_json(train_dir / "manifest.json")
-    feature_spec = read_json(train_dir / "feature_spec.json")
-    best_config = read_json(train_dir / "best_config.json")
-    train_metrics = read_json(train_dir / "metrics.json")
-    onnx_parity = read_json(onnx_dir / "onnx_parity.json")
+    manifest_path = train_dir / "manifest.json"
+    feature_spec_path = train_dir / "feature_spec.json"
+    contract_path = train_dir / "contract.json"
+    best_config_path = train_dir / "best_config.json"
+    lightgbm_params_path = train_dir / "lightgbm_params.json"
+    metrics_path = train_dir / "metrics.json"
+    runtime_config_path = train_dir / "runtime_config.json"
+    validation_sample_path = train_dir / "validation_sample.parquet"
+
+    onnx_path = onnx_dir / "model.onnx"
+    onnx_manifest_path = onnx_dir / "onnx_manifest.json"
+    onnx_parity_path = onnx_dir / "onnx_parity.json"
+
+    manifest = read_json(manifest_path)
+    feature_spec = read_json(feature_spec_path)
+    contract = read_json_if_exists(contract_path) or manifest
+    best_config = read_json(best_config_path)
+    train_metrics = read_json(metrics_path)
+    onnx_parity = read_json(onnx_parity_path)
+
+    current_feature_spec = build_feature_spec()
+    current_schema_hash = build_schema_hash(current_feature_spec)
+
+    if feature_spec != current_feature_spec:
+        raise ValueError("Training feature_spec does not match the current Gold contract")
+    if contract.get("schema_hash") != current_schema_hash:
+        raise ValueError("Training contract hash does not match the current Gold contract")
+    if list(manifest.get("feature_columns", [])) != list(current_feature_spec.get("feature_columns", [])):
+        raise ValueError("Training feature column order does not match the current Gold contract")
+    if list(manifest.get("categorical_features", [])) != list(current_feature_spec.get("categorical_features", [])):
+        raise ValueError("Training categorical feature contract does not match the current Gold contract")
+    if manifest.get("schema_version") != current_feature_spec["schema_version"]:
+        raise ValueError("Training schema version does not match the current Gold contract")
+    if manifest.get("feature_version") != current_feature_spec["feature_version"]:
+        raise ValueError("Training feature version does not match the current Gold contract")
 
     mlflow.set_experiment(mlflow_experiment_name)
     with mlflow.start_run():
-        mlflow.set_tags(
+        tags = {
+            "problem_type": "trip_duration_regression",
+            "prediction_timing": "pre_trip",
+            "model_family": str(manifest.get("model_family", "lightgbm")),
+            "inference_runtime": str(manifest.get("inference_runtime", "onnxruntime")),
+            "feature_version": str(manifest.get("feature_version", current_feature_spec["feature_version"])),
+            "schema_version": str(manifest.get("schema_version", current_feature_spec["schema_version"])),
+            "schema_hash": str(manifest.get("schema_hash", current_schema_hash)),
+            "gold_table": str(manifest.get("gold_table", "")),
+            "source_silver_table": str(manifest.get("source_silver_table", "")),
+            "train_cutoff_ts": str(manifest.get("cutoff_ts", "")),
+            "validation_fraction": str(manifest.get("validation_fraction", "")),
+            "train_profile": str(manifest.get("train_profile", TRAIN_PROFILE)),
+            "ray_num_workers": str(manifest.get("ray_num_workers", "")),
+            "ray_worker_cpu": str(manifest.get("ray_worker_cpu", "")),
+            "ray_worker_mem": str(manifest.get("ray_worker_mem", "")),
+            "feature_contract_version": "frozen_gold_contract_v1",
+            "orchestration": "flyte",
+        }
+        mlflow.set_tags(tags)
+
+        mlflow.log_params({f"flaml__{k}": v for k, v in best_config.items()})
+        mlflow.log_params(
             {
-                "problem_type": feature_spec["prediction_problem"],
-                "prediction_timing": feature_spec["prediction_timing"],
-                "feature_contract_version": "v1",
-                "model_family": "lightgbm",
-                "orchestration": "flyte",
+                f"manifest__{k}": v
+                for k, v in manifest.items()
+                if isinstance(v, (str, int, float, bool))
             }
         )
 
-        mlflow.log_params({f"flaml__{k}": v for k, v in best_config.items()})
-        mlflow.log_params({f"manifest__{k}": v for k, v in manifest.items() if isinstance(v, (str, int, float, bool))})
         mlflow.log_metrics({f"train__{k}": float(v) for k, v in train_metrics.items() if isinstance(v, (int, float))})
         mlflow.log_metrics(
             {f"eval__{k}": float(v) for k, v in evaluation_metrics.items() if isinstance(v, (int, float))}
         )
-        mlflow.log_metrics(
-            {f"onnx_parity__{k}": float(v) for k, v in onnx_parity.items() if isinstance(v, (int, float))}
-        )
+        mlflow.log_metrics({f"onnx_parity__{k}": float(v) for k, v in onnx_parity.items() if isinstance(v, (int, float))})
 
-        mlflow.log_artifact(str(train_dir / "model.txt"), artifact_path="model")
-        mlflow.log_artifact(str(train_dir / "manifest.json"), artifact_path="model")
-        mlflow.log_artifact(str(train_dir / "feature_spec.json"), artifact_path="model")
-        mlflow.log_artifact(str(train_dir / "best_config.json"), artifact_path="model")
-        mlflow.log_artifact(str(train_dir / "metrics.json"), artifact_path="model")
-        mlflow.log_artifact(str(onnx_dir / "model.onnx"), artifact_path="onnx")
-        mlflow.log_artifact(str(onnx_dir / "onnx_manifest.json"), artifact_path="onnx")
-        mlflow.log_artifact(str(onnx_dir / "onnx_parity.json"), artifact_path="onnx")
+        mlflow.log_artifact(str(manifest_path), artifact_path="model")
+        mlflow.log_artifact(str(feature_spec_path), artifact_path="model")
+        if contract_path.exists():
+            mlflow.log_artifact(str(contract_path), artifact_path="model")
+        mlflow.log_artifact(str(best_config_path), artifact_path="model")
+        mlflow.log_artifact(str(lightgbm_params_path), artifact_path="model")
+        mlflow.log_artifact(str(metrics_path), artifact_path="model")
+        if runtime_config_path.exists():
+            mlflow.log_artifact(str(runtime_config_path), artifact_path="model")
+        if validation_sample_path.exists():
+            mlflow.log_artifact(str(validation_sample_path), artifact_path="debug")
 
-        sample_path = train_dir / "validation_sample.parquet"
-        if sample_path.exists():
-            mlflow.log_artifact(str(sample_path), artifact_path="debug")
+        mlflow.log_artifact(str(onnx_path), artifact_path="onnx")
+        mlflow.log_artifact(str(onnx_manifest_path), artifact_path="onnx")
+        mlflow.log_artifact(str(onnx_parity_path), artifact_path="onnx")
+
+    log_json(
+        msg="register_model_success",
+        mlflow_experiment_name=mlflow_experiment_name,
+        feature_version=manifest.get("feature_version"),
+        schema_version=manifest.get("schema_version"),
+        schema_hash=manifest.get("schema_hash"),
+        gold_table=manifest.get("gold_table"),
+        source_silver_table=manifest.get("source_silver_table"),
+        train_cutoff_ts=manifest.get("cutoff_ts"),
+        train_profile=manifest.get("train_profile", TRAIN_PROFILE),
+    )

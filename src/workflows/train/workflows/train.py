@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from flytekit import workflow
-from tasks.common import (
+
+from workflows.train.tasks.common import (
     DEFAULT_EARLY_STOPPING_ROUNDS,
     DEFAULT_FLAML_MAX_ITER,
     DEFAULT_FLAML_TIME_BUDGET_SECONDS,
@@ -12,12 +13,12 @@ from tasks.common import (
     DEFAULT_SAMPLE_ROWS,
     DEFAULT_VALIDATION_FRACTION,
 )
-from tasks.evaluate_model import evaluate_model
-from tasks.export_onnx import export_onnx
-from tasks.load_gold import load_gold
-from tasks.register_model import register_model
-from tasks.train_model import train_model
-from tasks.validate_dataset import validate_dataset
+from workflows.train.tasks.evaluate_model import evaluate_model
+from workflows.train.tasks.export_onnx import export_onnx
+from workflows.train.tasks.load_gold import load_gold
+from workflows.train.tasks.register_model import register_model
+from workflows.train.tasks.train_model import train_model
+from workflows.train.tasks.validate_dataset import validate_dataset
 
 
 @workflow
@@ -31,8 +32,9 @@ def train(
     num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
     early_stopping_rounds: int = DEFAULT_EARLY_STOPPING_ROUNDS,
 ) -> dict[str, Any]:
-    """Production training workflow for the ETA regression model."""
-
+    """
+    Production training workflow for the ETA regression model.
+    """
     gold_canonical = load_gold(dataset_uri=gold_dataset_uri)
     gold_validated = validate_dataset(gold_dataset=gold_canonical, validation_fraction=validation_fraction)
 

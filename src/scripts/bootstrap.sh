@@ -67,10 +67,10 @@ chmod +x ./kind && sudo mv ./kind /usr/local/bin/
 curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip -q awscliv2.zip && sudo ./aws/install && rm -rf aws awscliv2.zip
 
 
-
 echo 'export PATH=$HOME/.local/bin:$PATH' >> ~/.bashrc
 source ~/.bashrc
 
+# Install packages imported only outside of flyte task definitions
 python3 -m venv .venv_elt
 .venv_elt/bin/python -m pip install --upgrade pip wheel setuptools
 .venv_elt/bin/python -m pip install \
@@ -78,7 +78,6 @@ python3 -m venv .venv_elt
   flytekitplugins-spark==1.16.15 \
   pyspark==4.1.1 \
   cloudpickle==3.1.2
-
 python3 -m venv .venv_train
 .venv_train/bin/python -m pip install --upgrade pip wheel setuptools
 .venv_train/bin/python -m pip install \
@@ -87,10 +86,10 @@ python3 -m venv .venv_train
   numpy==1.26.4 \
   pandas==2.2.3
 
+
 python3 -m venv .venv_deploy
 .venv_deploy/bin/python -m pip install --upgrade pip wheel setuptools
 .venv_deploy/bin/python -m pip install -r src/workflows/deploy/requirements.txt
-
 
 curl -sL https://ctl.flyte.org/install | sudo bash -s -- -b /usr/local/bin v0.9.8
 
@@ -100,13 +99,15 @@ sudo mv gitleaks /usr/local/bin/gitleaks
 curl -LsSf https://astral.sh/ruff/0.14.11/install.sh | sh
 
 
-python3 -m pip install --no-cache-dir --break-system-packages pre-commit==4.5.1 datasets==4.8.4 && pre-commit install --install-hooks
+python3 -m pip install --no-cache-dir --break-system-packages pyarrow==23.0.1 boto3==1.42.81 pandas==3.0.1 pre-commit==4.5.1 datasets==4.8.4
+pre-commit install --install-hooks
 
 clear
 echo "gitleaks version $(gitleaks version)"
 echo "helm version: $(helm version)"
 aws --version
 ruff version
+pre-commit --version
 kubectl version
 tofu version
 flytectl version

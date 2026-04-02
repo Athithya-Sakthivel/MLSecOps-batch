@@ -61,6 +61,8 @@ test-iac-staging:
 sync:
 	aws s3 sync s3://$$S3_BUCKET/iceberg/warehouse/ $(pwd)/data/iceberg/
 
+sync:
+	aws s3 sync s3://$$S3_BUCKET/iceberg/warehouse/ $(pwd)/data/iceberg/
 
 
 set-staging-eks-context:
