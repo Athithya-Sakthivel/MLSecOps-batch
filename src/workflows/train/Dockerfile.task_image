@@ -42,6 +42,6 @@ RUN pip install /wheels/* && rm -rf /wheels
 RUN useradd -m -u 10001 appuser
 USER appuser
 
-# Uses tini as PID 1 to forward signals and reap zombies, ensuring clean shutdown for Ray.
+# Uses tini as PID 1 to forward signals and reap zombies, ensuring clean shutdown for ray
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
