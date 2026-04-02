@@ -7,7 +7,6 @@ from typing import Literal
 
 DeploymentProfile = Literal["kind", "eks"]
 
-
 PROFILE_DEFAULTS: dict[DeploymentProfile, dict[str, str]] = {
     "kind": {
         "SERVE_NUM_CPUS": "0.5",
@@ -18,6 +17,10 @@ PROFILE_DEFAULTS: dict[DeploymentProfile, dict[str, str]] = {
         "SERVE_MAX_ONGOING_REQUESTS": "2",
         "SERVE_BATCH_MAX_SIZE": "4",
         "SERVE_BATCH_WAIT_TIMEOUT_S": "0.01",
+        "SERVE_HEALTH_CHECK_PERIOD_S": "10.0",
+        "SERVE_HEALTH_CHECK_TIMEOUT_S": "30.0",
+        "SERVE_GRACEFUL_SHUTDOWN_WAIT_LOOP_S": "2.0",
+        "SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_S": "20.0",
         "ORT_INTRA_OP_NUM_THREADS": "1",
         "ORT_INTER_OP_NUM_THREADS": "1",
         "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
@@ -34,6 +37,10 @@ PROFILE_DEFAULTS: dict[DeploymentProfile, dict[str, str]] = {
         "SERVE_MAX_ONGOING_REQUESTS": "3",
         "SERVE_BATCH_MAX_SIZE": "16",
         "SERVE_BATCH_WAIT_TIMEOUT_S": "0.005",
+        "SERVE_HEALTH_CHECK_PERIOD_S": "10.0",
+        "SERVE_HEALTH_CHECK_TIMEOUT_S": "30.0",
+        "SERVE_GRACEFUL_SHUTDOWN_WAIT_LOOP_S": "2.0",
+        "SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_S": "20.0",
         "ORT_INTRA_OP_NUM_THREADS": "0",
         "ORT_INTER_OP_NUM_THREADS": "1",
         "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
@@ -152,8 +159,9 @@ def _env_tuple(name: str, default: tuple[str, ...], sep: str = ",") -> tuple[str
 
 def _env_otlp_timeout_seconds() -> float:
     """
-    OpenTelemetry's current OTLP timeout env var is OTEL_EXPORTER_OTLP_TIMEOUT in milliseconds.
-    Keep the legacy *_SECONDS variable as a fallback for existing deployments.
+    OpenTelemetry's current OTLP timeout env var is OTEL_EXPORTER_OTLP_TIMEOUT
+    in milliseconds. Keep the legacy *_SECONDS variable as a fallback for
+    existing deployments.
     """
     raw_ms = os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
     if raw_ms is not None and raw_ms.strip() != "":
@@ -178,7 +186,15 @@ def _validate_log_level(value: str) -> str:
     return normalized
 
 
-@dataclass(frozen=True)
+def _ensure_unique(names: tuple[str, ...], field_name: str) -> None:
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            raise RuntimeError(f"{field_name} contains duplicate name: {name}")
+        seen.add(name)
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     # Identity
     service_name: str
@@ -211,6 +227,10 @@ class Settings:
     downscale_delay_s: float
     batch_max_size: int
     batch_wait_timeout_s: float
+    serve_health_check_period_s: float
+    serve_health_check_timeout_s: float
+    serve_graceful_shutdown_wait_loop_s: float
+    serve_graceful_shutdown_timeout_s: float
 
     # ONNX Runtime
     ort_intra_op_num_threads: int
@@ -231,15 +251,30 @@ class Settings:
     slow_request_ms: float
 
     def __post_init__(self) -> None:
+        if not self.service_name.strip():
+            raise RuntimeError("service_name must not be empty")
+        if not self.service_version.strip():
+            raise RuntimeError("service_version must not be empty")
+        if not self.deployment_environment.strip():
+            raise RuntimeError("deployment_environment must not be empty")
+        if not self.cluster_name.strip():
+            raise RuntimeError("cluster_name must not be empty")
+        if not self.instance_id.strip():
+            raise RuntimeError("instance_id must not be empty")
+
+        if not self.model_uri.strip():
+            raise RuntimeError("MODEL_URI is required and cannot be empty")
         if not self.feature_order:
             raise RuntimeError("FEATURE_ORDER is required and cannot be empty")
+        _ensure_unique(self.feature_order, "FEATURE_ORDER")
+
+        if self.model_output_names:
+            _ensure_unique(self.model_output_names, "MODEL_OUTPUT_NAMES")
 
         if self.min_replicas < 0:
             raise RuntimeError("SERVE_MIN_REPLICAS must be >= 0")
-
         if self.max_replicas < self.min_replicas:
             raise RuntimeError("SERVE_MAX_REPLICAS must be >= SERVE_MIN_REPLICAS")
-
         if not (self.min_replicas <= self.initial_replicas <= self.max_replicas):
             raise RuntimeError(
                 "SERVE_INITIAL_REPLICAS must be between SERVE_MIN_REPLICAS and SERVE_MAX_REPLICAS"
@@ -247,35 +282,58 @@ class Settings:
 
         if self.target_ongoing_requests < 1:
             raise RuntimeError("SERVE_TARGET_ONGOING_REQUESTS must be >= 1")
-
         if self.max_ongoing_requests < self.target_ongoing_requests:
             raise RuntimeError(
                 "SERVE_MAX_ONGOING_REQUESTS must be >= SERVE_TARGET_ONGOING_REQUESTS"
             )
 
-        if self.batch_max_size < 1:
-            raise RuntimeError("SERVE_BATCH_MAX_SIZE must be >= 1")
-
-        if self.batch_wait_timeout_s < 0:
-            raise RuntimeError("SERVE_BATCH_WAIT_TIMEOUT_S must be >= 0")
-
-        if self.max_instances_per_request < 1:
-            raise RuntimeError("MAX_INSTANCES_PER_REQUEST must be >= 1")
-
         if self.replica_num_cpus <= 0:
             raise RuntimeError("SERVE_NUM_CPUS must be > 0")
+        if self.batch_max_size < 1:
+            raise RuntimeError("SERVE_BATCH_MAX_SIZE must be >= 1")
+        if self.batch_wait_timeout_s < 0:
+            raise RuntimeError("SERVE_BATCH_WAIT_TIMEOUT_S must be >= 0")
+        if self.upscale_delay_s < 0:
+            raise RuntimeError("SERVE_UPSCALE_DELAY_S must be >= 0")
+        if self.downscale_delay_s < 0:
+            raise RuntimeError("SERVE_DOWNSCALE_DELAY_S must be >= 0")
+        if self.serve_health_check_period_s <= 0:
+            raise RuntimeError("SERVE_HEALTH_CHECK_PERIOD_S must be > 0")
+        if self.serve_health_check_timeout_s <= 0:
+            raise RuntimeError("SERVE_HEALTH_CHECK_TIMEOUT_S must be > 0")
+        if self.serve_graceful_shutdown_wait_loop_s < 0:
+            raise RuntimeError("SERVE_GRACEFUL_SHUTDOWN_WAIT_LOOP_S must be >= 0")
+        if self.serve_graceful_shutdown_timeout_s < 0:
+            raise RuntimeError("SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_S must be >= 0")
 
         if self.ort_intra_op_num_threads < 0:
             raise RuntimeError("ORT_INTRA_OP_NUM_THREADS must be >= 0")
-
         if self.ort_inter_op_num_threads < 0:
             raise RuntimeError("ORT_INTER_OP_NUM_THREADS must be >= 0")
+        if not self.ort_providers:
+            raise RuntimeError("ORT_PROVIDERS must not be empty")
 
+        if not self.otel_endpoint.strip():
+            raise RuntimeError("OTEL_EXPORTER_OTLP_ENDPOINT must not be empty")
+        if self.otel_timeout_seconds <= 0:
+            raise RuntimeError("OTEL_EXPORTER_OTLP_TIMEOUT must be > 0")
+        if self.otel_metric_export_interval_ms <= 0:
+            raise RuntimeError("OTEL_METRIC_EXPORT_INTERVAL_MS must be > 0")
+        if self.otel_metric_export_timeout_ms <= 0:
+            raise RuntimeError("OTEL_METRIC_EXPORT_TIMEOUT_MS must be > 0")
+
+        if not self.otel_traces_sampler.strip():
+            raise RuntimeError("OTEL_TRACES_SAMPLER must not be empty")
         if not 0.0 <= self.trace_sample_ratio <= 1.0:
             raise RuntimeError("OTEL_TRACES_SAMPLER_ARG must be in [0.0, 1.0]")
 
+        if self.max_instances_per_request < 1:
+            raise RuntimeError("MAX_INSTANCES_PER_REQUEST must be >= 1")
         if self.slow_request_ms < 0:
             raise RuntimeError("SLOW_REQUEST_MS must be >= 0")
+
+        if not self.log_level.strip():
+            raise RuntimeError("LOG_LEVEL must not be empty")
 
 
 @lru_cache(maxsize=1)
@@ -284,7 +342,9 @@ def get_settings() -> Settings:
 
     feature_order = _env_list("FEATURE_ORDER", [])
     if not feature_order:
-        raise RuntimeError("FEATURE_ORDER is required, for example: FEATURE_ORDER=age,income,score")
+        raise RuntimeError(
+            "FEATURE_ORDER is required, for example: FEATURE_ORDER=age,income,score"
+        )
 
     model_uri = _env_str("MODEL_URI")
     if not model_uri:
@@ -315,10 +375,18 @@ def get_settings() -> Settings:
         "SERVE_MAX_ONGOING_REQUESTS",
         max(4, target_ongoing_requests + 1),
     )
-    upscale_delay_s = _env_float("SERVE_UPSCALE_DELAY_S", 1.0)
-    downscale_delay_s = _env_float("SERVE_DOWNSCALE_DELAY_S", 30.0)
+    upscale_delay_s = _env_float_profile("SERVE_UPSCALE_DELAY_S", 1.0)
+    downscale_delay_s = _env_float_profile("SERVE_DOWNSCALE_DELAY_S", 30.0)
     batch_max_size = _env_int_profile("SERVE_BATCH_MAX_SIZE", 16)
     batch_wait_timeout_s = _env_float_profile("SERVE_BATCH_WAIT_TIMEOUT_S", 0.005)
+    serve_health_check_period_s = _env_float_profile("SERVE_HEALTH_CHECK_PERIOD_S", 10.0)
+    serve_health_check_timeout_s = _env_float_profile("SERVE_HEALTH_CHECK_TIMEOUT_S", 30.0)
+    serve_graceful_shutdown_wait_loop_s = _env_float_profile(
+        "SERVE_GRACEFUL_SHUTDOWN_WAIT_LOOP_S", 2.0
+    )
+    serve_graceful_shutdown_timeout_s = _env_float_profile(
+        "SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_S", 20.0
+    )
 
     ort_intra_op_num_threads = _env_int_profile("ORT_INTRA_OP_NUM_THREADS", 0)
     ort_inter_op_num_threads = _env_int_profile("ORT_INTER_OP_NUM_THREADS", 1)
@@ -380,6 +448,10 @@ def get_settings() -> Settings:
         downscale_delay_s=downscale_delay_s,
         batch_max_size=batch_max_size,
         batch_wait_timeout_s=batch_wait_timeout_s,
+        serve_health_check_period_s=serve_health_check_period_s,
+        serve_health_check_timeout_s=serve_health_check_timeout_s,
+        serve_graceful_shutdown_wait_loop_s=serve_graceful_shutdown_wait_loop_s,
+        serve_graceful_shutdown_timeout_s=serve_graceful_shutdown_timeout_s,
         ort_intra_op_num_threads=ort_intra_op_num_threads,
         ort_inter_op_num_threads=ort_inter_op_num_threads,
         ort_providers=ort_providers,

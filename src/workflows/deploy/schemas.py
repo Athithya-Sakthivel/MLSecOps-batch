@@ -37,6 +37,17 @@ def coerce_instances(payload: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _to_python(value: Any) -> Any:
+    """
+    Convert numpy / array-like values into plain Python values suitable for JSON.
+    """
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def build_feature_matrix(
     instances: Sequence[dict[str, Any]],
     feature_order: Sequence[str],
@@ -66,6 +77,9 @@ def build_feature_matrix(
             value = row[name]
             if value is None:
                 raise ValueError(f"Feature '{name}' is null at row {row_idx}")
+
+            if isinstance(value, bool):
+                raise ValueError(f"Feature '{name}' must be numeric at row {row_idx}")
 
             try:
                 numeric = float(value)
@@ -108,14 +122,14 @@ def split_model_outputs(
 
     for name, arr in zip(output_names, arrays, strict=True):
         if arr.ndim == 0:
-            scalar = arr.item()
+            scalar = _to_python(arr.item())
             for row in normalized:
                 row.append((name, scalar))
             continue
 
         if arr.shape[0] != row_count:
             if arr.size == 1:
-                scalar = arr.reshape(()).item()
+                scalar = _to_python(arr.reshape(()).item())
                 for row in normalized:
                     row.append((name, scalar))
                 continue
@@ -124,9 +138,7 @@ def split_model_outputs(
             )
 
         for idx in range(row_count):
-            value = arr[idx]
-            normalized[idx].append(
-                (name, value.tolist() if hasattr(value, "tolist") else value)
-            )
+            value = _to_python(arr[idx])
+            normalized[idx].append((name, value))
 
     return [{key: value for key, value in row} for row in normalized]

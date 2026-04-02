@@ -31,22 +31,18 @@ TASK_NAMESPACE = os.environ.get("TASK_NAMESPACE", f"{REMOTE_PROJECT}-{REMOTE_DOM
 
 K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
 ELT_PROFILE = (
-    (
-        os.environ.get("ELT_PROFILE")
-        or ("dev" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod")
-    )
-    .strip()
-    .lower()
-)
+    os.environ.get("ELT_PROFILE")
+    or ("dev" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod")
+).strip().lower()
 
 SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark").strip() or "spark"
 ELT_TASK_IMAGE = os.environ.get(
     "ELT_TASK_IMAGE",
-    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-04-01-21-02--b2a1882@sha256:23c04b4cc3530e155b096bccb3c4112889c948dad38d3464477e8c950eb8dc36").strip()
+    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-04-01-21-02--b2a1882@sha256:23c04b4cc3530e155b096bccb3c4112889c948dad38d3464477e8c950eb8dc36",
+).strip()
 if not ELT_TASK_IMAGE:
     raise RuntimeError("ELT_TASK_IMAGE must not be empty")
 
-# Make the task image available to imported workflow modules and the pyflyte subprocess.
 os.environ["ELT_TASK_IMAGE"] = ELT_TASK_IMAGE
 
 WORKFLOW_SOURCE_FILE = SRC_ROOT / "workflows" / "ELT" / "launch_plans.py"
@@ -89,6 +85,22 @@ RESOURCE_QUOTA_EKS_LIMITS_MEMORY = os.environ.get("RESOURCE_QUOTA_EKS_LIMITS_MEM
 RESOURCE_QUOTA_EKS_PODS = os.environ.get("RESOURCE_QUOTA_EKS_PODS", "100")
 RESOURCE_QUOTA_EKS_PVC = os.environ.get("RESOURCE_QUOTA_EKS_PVC", "50")
 RESOURCE_QUOTA_EKS_SERVICES = os.environ.get("RESOURCE_QUOTA_EKS_SERVICES", "100")
+
+LAUNCH_PLAN_COMMANDS: dict[str, tuple[str, ...]] = {
+    "elt_workflow": ("ELT_WORKFLOW_LP_NAME", "ELT_WORKFLOW_LP"),
+    "iceberg_maintenance_daily_lp": (
+        "ICEBERG_MAINTENANCE_DAILY_LP_NAME",
+        "ICEBERG_MAINTENANCE_DAILY_LP",
+    ),
+    "iceberg_maintenance_weekly_lp": (
+        "ICEBERG_MAINTENANCE_WEEKLY_LP_NAME",
+        "ICEBERG_MAINTENANCE_WEEKLY_LP",
+    ),
+    "iceberg_maintenance_workflow": (
+        "ICEBERG_MAINTENANCE_WEEKLY_LP_NAME",
+        "ICEBERG_MAINTENANCE_WEEKLY_LP",
+    ),
+}
 
 
 def log(msg: str) -> None:
@@ -235,10 +247,36 @@ def lint_sources() -> None:
     run_cmd(["ruff", "check", str(ELT_ROOT)])
 
 
+def _module_attr_name(module: object, candidates: Sequence[str]) -> str:
+    for candidate in candidates:
+        value = getattr(module, candidate, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if value is not None and hasattr(value, "name"):
+            name = getattr(value, "name", None)
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    raise AttributeError(f"none of these launch plan attributes were found: {list(candidates)}")
+
+
 def import_check() -> None:
     mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
-    if not hasattr(mod, "ELT_WORKFLOW_LP"):
-        fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose ELT_WORKFLOW_LP")
+    required = (
+        ("elt_workflow", ("ELT_WORKFLOW_LP_NAME", "ELT_WORKFLOW_LP")),
+        (
+            "iceberg_maintenance_daily_lp",
+            ("ICEBERG_MAINTENANCE_DAILY_LP_NAME", "ICEBERG_MAINTENANCE_DAILY_LP"),
+        ),
+        (
+            "iceberg_maintenance_weekly_lp",
+            ("ICEBERG_MAINTENANCE_WEEKLY_LP_NAME", "ICEBERG_MAINTENANCE_WEEKLY_LP"),
+        ),
+    )
+    for command, candidates in required:
+        try:
+            _module_attr_name(mod, candidates)
+        except AttributeError as exc:
+            fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose launch plan for '{command}': {exc}")
     log("import_ok")
 
 
@@ -412,22 +450,8 @@ def ensure_namespace_bootstrap_ready() -> None:
     if rq.returncode != 0:
         fatal(f"resource quota {RESOURCE_QUOTA_NAME} missing in {TASK_NAMESPACE}")
 
-    required_resources = [
-        "pods",
-        "services",
-        "configmaps",
-        "persistentvolumeclaims",
-    ]
-    required_verbs = [
-        "get",
-        "list",
-        "watch",
-        "create",
-        "update",
-        "patch",
-        "delete",
-        "deletecollection",
-    ]
+    required_resources = ["pods", "services", "configmaps", "persistentvolumeclaims"]
+    required_verbs = ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
     missing: list[str] = []
     for resource in required_resources:
         for verb in required_verbs:
@@ -443,12 +467,13 @@ def ensure_namespace_bootstrap_ready() -> None:
 
 
 def registration_tree_files() -> list[Path]:
-    files: list[Path] = []
-    for path in sorted((SRC_ROOT / "workflows" / "ELT").rglob("*.py")):
-        if "__pycache__" in path.parts or "ops" in path.parts:
-            continue
-        files.append(path)
-    return files
+    files: list[Path] = [
+        SRC_ROOT / "workflows" / "ELT" / "launch_plans.py",
+        SRC_ROOT / "workflows" / "ELT" / "workflows" / "elt_workflow.py",
+    ]
+    tasks_dir = SRC_ROOT / "workflows" / "ELT" / "tasks"
+    files.extend(sorted(tasks_dir.glob("*.py")))
+    return [path for path in files if path.is_file()]
 
 
 @functools.lru_cache(maxsize=1)
@@ -467,20 +492,6 @@ def compute_registration_version() -> str:
         tree.update(path.read_bytes())
         tree.update(b"\0")
     return f"{git_sha[:12]}-{tree.hexdigest()[:16]}"
-
-
-def resolve_elt_launchplan_name() -> str:
-    mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
-    lp_name = getattr(mod, "ELT_WORKFLOW_LP_NAME", None)
-    if isinstance(lp_name, str) and lp_name.strip():
-        return lp_name.strip()
-    lp = getattr(mod, "ELT_WORKFLOW_LP", None)
-    if lp is None:
-        fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose ELT_WORKFLOW_LP")
-    name = getattr(lp, "name", None)
-    if not isinstance(name, str) or not name.strip():
-        fatal("could not resolve ELT launch plan name")
-    return name.strip()
 
 
 def pyflyte_register_supports_copy_or_fast_flag() -> tuple[bool, bool]:
@@ -532,34 +543,23 @@ def build_register_command(registration_version: str) -> list[str]:
     return cmd
 
 
-def write_helm_values_file(values_file: Path) -> None:
-    if K8S_CLUSTER == "kind":
-        metrics = "false"
-        webhook = "true"
-    else:
-        metrics = "true"
-        webhook = "true"
-
-    values = f"""hook:
-  upgradeCrd: true
-
-webhook:
-  enable: {webhook}
-
-prometheus:
-  metrics:
-    enable: {metrics}
-
-spark:
-  serviceAccount:
-    create: false
-    name: {SPARK_SERVICE_ACCOUNT}
-  rbac:
-    create: false
-  jobNamespaces:
-    - "{TASK_NAMESPACE}"
-"""
-    values_file.write_text(values, encoding="utf-8")
+def _activate_launch_plan(lp_name: str, version: str) -> None:
+    log(f"Activating launch plan: {lp_name}")
+    run_cmd(
+        [
+            "flytectl",
+            "update",
+            "launchplan",
+            "-p",
+            REMOTE_PROJECT,
+            "-d",
+            REMOTE_DOMAIN,
+            lp_name,
+            "--version",
+            version,
+            "--activate",
+        ]
+    )
 
 
 def register_entities() -> str:
@@ -578,301 +578,75 @@ def register_entities() -> str:
     log(f"Registration version: {registration_version}")
 
     register_env = build_register_env()
-
     cmd = build_register_command(registration_version)
     run_cmd(cmd, cwd=SRC_ROOT, env=register_env)
+
+    if ACTIVATE_LAUNCHPLANS:
+        _activate_launch_plan("iceberg_maintenance_daily_lp", registration_version)
+        _activate_launch_plan("iceberg_maintenance_weekly_lp", registration_version)
 
     log(f"Registration complete for version {registration_version}")
     return registration_version
 
 
-def require_preflight_for_execution() -> None:
-    ensure_namespace_bootstrap_ready()
+def _resolve_launch_plan_name(command: str) -> str:
+    mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
+    candidates = LAUNCH_PLAN_COMMANDS[command]
+    return _module_attr_name(mod, candidates)
 
 
-def fetch_launch_plan_exec_spec(
-    launch_plan_name: str,
-    exec_spec_file: Path,
-    *,
-    latest: bool,
-    version: str | None,
-) -> None:
-    exec_spec_file.unlink(missing_ok=True)
-
-    args = [
-        "flytectl",
-        "get",
-        "launchplan",
-        "-p",
-        REMOTE_PROJECT,
-        "-d",
-        REMOTE_DOMAIN,
-        launch_plan_name,
-    ]
-    if latest:
-        args.append("--latest")
-    else:
-        if not version:
-            fatal("a launch-plan version is required when latest is disabled")
-        args.extend(["--version", version])
-    args.extend(["--execFile", str(exec_spec_file)])
-    run_cmd(args)
-
-
-def create_execution_from_spec(exec_spec_file: Path) -> None:
-    run_cmd(
-        [
-            "flytectl",
-            "create",
-            "execution",
-            "-p",
-            REMOTE_PROJECT,
-            "-d",
-            REMOTE_DOMAIN,
-            "--execFile",
-            str(exec_spec_file),
-        ]
-    )
-
-
-def execute_launch_plan(*, latest: bool | None = None, version: str | None = None) -> None:
+def execute_launch_plan(command: str, *, latest: bool | None = None, version: str | None = None) -> None:
     require_bin("kubectl")
     require_bin("flytectl")
 
-    require_preflight_for_execution()
-
+    ensure_namespace_bootstrap_ready()
     start_port_forward()
     init_flytectl()
 
-    launch_plan_name = resolve_elt_launchplan_name()
+    launch_plan_name = _resolve_launch_plan_name(command)
     effective_latest = USE_LATEST if latest is None else latest
-    effective_version = (
-        version if version is not None else (None if effective_latest else compute_registration_version())
-    )
+    effective_version = version if version is not None else (None if effective_latest else compute_registration_version())
 
     if not effective_latest and not effective_version:
         fatal("launch-plan version required when latest is disabled")
 
-    fd, temp_path = tempfile.mkstemp(prefix=f"{launch_plan_name}.", suffix=".yaml")
-    os.close(fd)
-    exec_spec_file = Path(temp_path)
+    with tempfile.TemporaryDirectory(prefix=f"{launch_plan_name}.") as tmpdir:
+        exec_spec_file = Path(tmpdir) / "exec.yaml"
 
-    try:
         log(f"Launching: {launch_plan_name}")
-        fetch_launch_plan_exec_spec(
+
+        get_args = [
+            "flytectl",
+            "get",
+            "launchplan",
+            "-p",
+            REMOTE_PROJECT,
+            "-d",
+            REMOTE_DOMAIN,
             launch_plan_name,
-            exec_spec_file,
-            latest=effective_latest,
-            version=effective_version,
-        )
+        ]
+        if effective_latest:
+            get_args.append("--latest")
+        else:
+            get_args.extend(["--version", effective_version])
+        get_args.extend(["--execFile", str(exec_spec_file)])
+
+        run_cmd(get_args)
+
         log(f"Creating execution from {exec_spec_file}")
-        create_execution_from_spec(exec_spec_file)
-    finally:
-        exec_spec_file.unlink(missing_ok=True)
-
-
-def get_execution_pods(execution_id: str) -> list[str]:
-    cp = run_cmd(
-        [
-            "kubectl",
-            "get",
-            "pods",
-            "-n",
-            TASK_NAMESPACE,
-            "-l",
-            f"execution-id={execution_id}",
-            "-o",
-            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-        ],
-        check=False,
-        capture_output=True,
-    )
-    pods = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
-    if pods:
-        return pods
-
-    cp = run_cmd(
-        [
-            "kubectl",
-            "get",
-            "pods",
-            "-n",
-            TASK_NAMESPACE,
-            "-o",
-            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-        ],
-        check=False,
-        capture_output=True,
-    )
-    return [line.strip() for line in cp.stdout.splitlines() if execution_id in line]
-
-
-def get_execution_sparkapps(execution_id: str) -> list[str]:
-    cp = run_cmd(
-        [
-            "kubectl",
-            "get",
-            "sparkapplications",
-            "-n",
-            TASK_NAMESPACE,
-            "-l",
-            f"execution-id={execution_id}",
-            "-o",
-            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-        ],
-        check=False,
-        capture_output=True,
-    )
-    apps = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
-    if apps:
-        return apps
-
-    cp = run_cmd(
-        [
-            "kubectl",
-            "get",
-            "sparkapplications",
-            "-n",
-            TASK_NAMESPACE,
-            "-o",
-            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-        ],
-        check=False,
-        capture_output=True,
-    )
-    return [line.strip() for line in cp.stdout.splitlines() if execution_id in line]
-
-
-def diagnose_execution(execution_id: str) -> None:
-    start_port_forward()
-    init_flytectl()
-
-    print("=== EXECUTION ===")
-    run_cmd(
-        [
-            "flytectl",
-            "get",
-            "execution",
-            execution_id,
-            "-p",
-            REMOTE_PROJECT,
-            "-d",
-            REMOTE_DOMAIN,
-        ],
-        check=False,
-    )
-
-    print("=== EXECUTION DETAILS ===")
-    run_cmd(
-        [
-            "flytectl",
-            "get",
-            "execution",
-            execution_id,
-            "-p",
-            REMOTE_PROJECT,
-            "-d",
-            REMOTE_DOMAIN,
-            "--details",
-        ],
-        check=False,
-    )
-
-    pods = get_execution_pods(execution_id)
-    if pods:
-        print("=== MATCHING PODS ===")
-        run_cmd(["kubectl", "get", "pods", "-n", TASK_NAMESPACE, "-o", "wide"], check=False)
-        for pod in pods:
-            print(f"--- POD {pod} ---")
-            run_cmd(["kubectl", "describe", "pod", pod, "-n", TASK_NAMESPACE], check=False)
-            run_cmd(
-                ["kubectl", "logs", pod, "-n", TASK_NAMESPACE, "--all-containers=true", "--tail=120"],
-                check=False,
-            )
-    else:
-        print(f"No pod matched execution {execution_id}")
-
-    apps = get_execution_sparkapps(execution_id)
-    if apps:
-        print("=== MATCHING SPARKAPPLICATIONS ===")
-        run_cmd(["kubectl", "get", "sparkapplications", "-n", TASK_NAMESPACE, "-o", "wide"], check=False)
-        for app in apps:
-            print(f"--- SPARKAPPLICATION {app} ---")
-            run_cmd(["kubectl", "describe", "sparkapplication", app, "-n", TASK_NAMESPACE], check=False)
-    else:
-        print(f"No SparkApplication matched execution {execution_id}")
-
-
-def delete_execution(execution_id: str) -> None:
-    start_port_forward()
-    init_flytectl()
-
-    log(f"Deleting execution {execution_id}")
-    run_cmd(
-        ["flytectl", "delete", "execution", execution_id, "-p", REMOTE_PROJECT, "-d", REMOTE_DOMAIN],
-        check=False,
-    )
-
-    run_cmd(
-        [
-            "kubectl",
-            "delete",
-            "sparkapplication",
-            "-n",
-            TASK_NAMESPACE,
-            "-l",
-            f"execution-id={execution_id}",
-            "--ignore-not-found=true",
-        ],
-        check=False,
-    )
-    run_cmd(
-        [
-            "kubectl",
-            "delete",
-            "pod",
-            "-n",
-            TASK_NAMESPACE,
-            "-l",
-            f"execution-id={execution_id}",
-            "--ignore-not-found=true",
-        ],
-        check=False,
-    )
-
-
-def cleanup_stale_resources() -> None:
-    run_cmd(
-        [
-            "kubectl",
-            "delete",
-            "sparkapplication",
-            "-n",
-            TASK_NAMESPACE,
-            "-l",
-            "execution-id",
-            "--ignore-not-found=true",
-        ],
-        check=False,
-    )
-    run_cmd(
-        [
-            "kubectl",
-            "delete",
-            "pod",
-            "-n",
-            TASK_NAMESPACE,
-            "-l",
-            "execution-id",
-            "--ignore-not-found=true",
-        ],
-        check=False,
-    )
-
-
-def register_and_run() -> None:
-    registration_version = register_entities()
-    execute_launch_plan(version=registration_version)
+        run_cmd(
+            [
+                "flytectl",
+                "create",
+                "execution",
+                "-p",
+                REMOTE_PROJECT,
+                "-d",
+                REMOTE_DOMAIN,
+                "--execFile",
+                str(exec_spec_file),
+            ]
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -880,16 +654,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("register", help="Register ELT workflows and launch plans")
-    sub.add_parser("elt", help="Execute the ELT workflow")
-    sub.add_parser("up", help="Register and then execute ELT")
+    sub.add_parser("elt_workflow", help="Execute the ELT workflow launch plan")
+    sub.add_parser("iceberg_maintenance_daily_lp", help="Execute the daily Iceberg maintenance launch plan")
+    sub.add_parser("iceberg_maintenance_weekly_lp", help="Execute the weekly Iceberg maintenance launch plan")
+    sub.add_parser("iceberg_maintenance_workflow", help="Alias for the weekly Iceberg maintenance launch plan")
 
-    diag = sub.add_parser("diagnose", help="Inspect a Flyte execution and related Spark resources")
-    diag.add_argument("execution_id")
-
-    delete = sub.add_parser("delete", help="Delete a Flyte execution and matching Spark resources")
-    delete.add_argument("execution_id")
-
-    sub.add_parser("reset", help="Delete leftover ELT Spark resources in the target namespace")
     return parser
 
 
@@ -909,29 +678,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         register_entities()
         return 0
 
-    if args.command == "elt":
-        execute_launch_plan()
-        return 0
-
-    if args.command == "up":
-        lint_sources()
-        import_check()
-        ensure_namespace_bootstrap_ready()
-        start_port_forward()
-        init_flytectl()
-        register_and_run()
-        return 0
-
-    if args.command == "diagnose":
-        diagnose_execution(args.execution_id)
-        return 0
-
-    if args.command == "delete":
-        delete_execution(args.execution_id)
-        return 0
-
-    if args.command == "reset":
-        cleanup_stale_resources()
+    if args.command in LAUNCH_PLAN_COMMANDS:
+        execute_launch_plan(command=args.command)
         return 0
 
     return 1

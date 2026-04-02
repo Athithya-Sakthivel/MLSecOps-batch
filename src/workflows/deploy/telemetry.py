@@ -3,8 +3,8 @@ from __future__ import annotations
 import atexit
 import json
 import logging
-import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -20,7 +20,6 @@ try:
 except ImportError:  # pragma: no cover
     from opentelemetry.exporter.otlp.proto.grpc.log_exporter import OTLPLogExporter  # type: ignore
 
-from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.sdk.metrics import MeterProvider
@@ -31,12 +30,10 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
 logger = logging.getLogger(__name__)
-logger.propagate = True
 
 _STATE_LOCK = threading.Lock()
-_INITIALIZED = False
-_STATE_KEY: tuple[Any, ...] | None = None
 _HANDLE: TelemetryHandle | None = None
+_STATE_KEY: tuple[Any, ...] | None = None
 _ATEEXIT_REGISTERED = False
 
 
@@ -95,15 +92,11 @@ def _log_info(event: str, message: str, **fields: Any) -> None:
 
 
 def _log_warn(event: str, message: str, **fields: Any) -> None:
-    logger.warning(_json_log("WARN", event, message, **fields))
-
-
-def _log_error(event: str, message: str, **fields: Any) -> None:
-    logger.error(_json_log("ERROR", event, message, **fields))
+    logger.warning(_json_log("WARNING", event, message, **fields))
 
 
 def _log_exception(event: str, message: str, **fields: Any) -> None:
-    logger.exception(_json_log("EXCEPTION", event, message, **fields))
+    logger.exception(_json_log("ERROR", event, message, **fields))
 
 
 def _grpc_endpoint(endpoint: str) -> tuple[str, bool]:
@@ -154,18 +147,25 @@ def _resource(settings: Settings) -> Resource:
     return Resource.create(clean_attrs)
 
 
-def _require_positive_number(name: str, value: object) -> float:
+def _require_nonnegative_number(name: str, value: object) -> float:
     try:
         num = float(value)
     except Exception as exc:  # pragma: no cover
         raise ValueError(f"{name} must be numeric") from exc
+    if num < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return num
+
+
+def _require_positive_number(name: str, value: object) -> float:
+    num = _require_nonnegative_number(name, value)
     if num <= 0:
         raise ValueError(f"{name} must be > 0")
     return num
 
 
 def _require_ratio(name: str, value: object) -> float:
-    num = _require_positive_number(name, value)
+    num = _require_nonnegative_number(name, value)
     if num > 1.0:
         raise ValueError(f"{name} must be between 0.0 and 1.0")
     return num
@@ -182,8 +182,22 @@ def _require_positive_int(name: str, value: object) -> int:
 
 
 def _effective_log_level(settings: Settings) -> str:
-    return _normalize_level_name(
-        os.getenv("LOG_LEVEL") or getattr(settings, "log_level", None) or "INFO"
+    return _normalize_level_name(settings.log_level)
+
+
+def _build_sampler(settings: Settings) -> ParentBased | TraceIdRatioBased:
+    sampler = (settings.otel_traces_sampler or "").strip().lower()
+    ratio = _require_ratio("trace_sample_ratio", settings.trace_sample_ratio)
+
+    if sampler == "parentbased_traceidratio":
+        return ParentBased(root=TraceIdRatioBased(ratio))
+    if sampler == "traceidratio":
+        return TraceIdRatioBased(ratio)
+
+    raise ValueError(
+        "unsupported OTEL_TRACES_SAMPLER value: "
+        f"{settings.otel_traces_sampler!r}. Supported values: "
+        "'parentbased_traceidratio', 'traceidratio'"
     )
 
 
@@ -198,10 +212,15 @@ def _config_key(
         endpoint,
         insecure,
         tuple(sorted(resource_attrs.items())),
+        settings.otel_traces_sampler,
         _require_ratio("trace_sample_ratio", settings.trace_sample_ratio),
         _require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
-        _require_positive_int("otel_metric_export_interval_ms", settings.otel_metric_export_interval_ms),
-        _require_positive_int("otel_metric_export_timeout_ms", settings.otel_metric_export_timeout_ms),
+        _require_positive_int(
+            "otel_metric_export_interval_ms", settings.otel_metric_export_interval_ms
+        ),
+        _require_positive_int(
+            "otel_metric_export_timeout_ms", settings.otel_metric_export_timeout_ms
+        ),
         log_level_name,
     )
 
@@ -209,6 +228,24 @@ def _config_key(
 class _DropOpenTelemetryRecords(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return not record.name.startswith("opentelemetry")
+
+
+def _log_record_factory(
+    previous_factory: Callable[..., logging.LogRecord],
+) -> Callable[..., logging.LogRecord]:
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = previous_factory(*args, **kwargs)
+        try:
+            span = trace.get_current_span()
+            ctx = span.get_span_context()
+            if ctx is not None and ctx.is_valid:
+                record.trace_id = f"{ctx.trace_id:032x}"
+                record.span_id = f"{ctx.span_id:016x}"
+        except Exception:
+            pass
+        return record
+
+    return factory
 
 
 @dataclass
@@ -220,6 +257,7 @@ class TelemetryHandle:
     log_level_name: str
     endpoint: str
     insecure: bool
+    previous_log_record_factory: Callable[..., logging.LogRecord]
     _closed: bool = False
 
     def shutdown(self) -> None:
@@ -261,6 +299,16 @@ class TelemetryHandle:
                     insecure=self.insecure,
                 )
 
+            try:
+                logging.setLogRecordFactory(self.previous_log_record_factory)
+            except Exception:
+                _log_warn(
+                    event="telemetry.shutdown.factory_restore_failed",
+                    message="log record factory restore failed",
+                    endpoint=self.endpoint,
+                    insecure=self.insecure,
+                )
+
             for provider_name, provider in (
                 ("logger_provider", self.logger_provider),
                 ("meter_provider", self.meter_provider),
@@ -297,14 +345,16 @@ class TelemetryHandle:
 
 
 def initialize_telemetry(settings: Settings) -> TelemetryHandle:
-    global _INITIALIZED, _HANDLE, _STATE_KEY, _ATEEXIT_REGISTERED
+    global _HANDLE, _STATE_KEY, _ATEEXIT_REGISTERED
 
     with _STATE_LOCK:
         log_level_name = _effective_log_level(settings)
         endpoint, insecure = _grpc_endpoint(settings.otel_endpoint)
         resource = _resource(settings)
         resource_attrs = {
-            k: v for k, v in resource.attributes.items() if isinstance(k, str) and isinstance(v, str)
+            k: v
+            for k, v in resource.attributes.items()
+            if isinstance(k, str) and isinstance(v, str)
         }
         config_key = _config_key(settings, endpoint, insecure, resource_attrs, log_level_name)
 
@@ -320,7 +370,9 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                 return _HANDLE
             raise RuntimeError("telemetry was already initialized with a different configuration")
 
-        partial: dict[str, Any] = {}
+        previous_factory = logging.getLogRecordFactory()
+        logging.setLogRecordFactory(_log_record_factory(previous_factory))
+
         _log_info(
             event="telemetry.initialize.start",
             message="starting telemetry initialization",
@@ -341,19 +393,20 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
         try:
             tracer_provider = TracerProvider(
                 resource=resource,
-                sampler=ParentBased(root=TraceIdRatioBased(_require_ratio("trace_sample_ratio", settings.trace_sample_ratio))),
+                sampler=_build_sampler(settings),
             )
             tracer_provider.add_span_processor(
                 BatchSpanProcessor(
                     OTLPSpanExporter(
                         endpoint=endpoint,
                         insecure=insecure,
-                        timeout=_require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
+                        timeout=_require_positive_number(
+                            "otel_timeout_seconds", settings.otel_timeout_seconds
+                        ),
                     )
                 )
             )
             trace.set_tracer_provider(tracer_provider)
-            partial["tracer_provider"] = tracer_provider
             _log_info(
                 event="telemetry.traces.configured",
                 message="tracing configured",
@@ -364,7 +417,9 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
             metric_exporter = OTLPMetricExporter(
                 endpoint=endpoint,
                 insecure=insecure,
-                timeout=_require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
+                timeout=_require_positive_number(
+                    "otel_timeout_seconds", settings.otel_timeout_seconds
+                ),
             )
             meter_provider = MeterProvider(
                 resource=resource,
@@ -372,16 +427,17 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                     PeriodicExportingMetricReader(
                         metric_exporter,
                         export_interval_millis=_require_positive_int(
-                            "otel_metric_export_interval_ms", settings.otel_metric_export_interval_ms
+                            "otel_metric_export_interval_ms",
+                            settings.otel_metric_export_interval_ms,
                         ),
                         export_timeout_millis=_require_positive_int(
-                            "otel_metric_export_timeout_ms", settings.otel_metric_export_timeout_ms
+                            "otel_metric_export_timeout_ms",
+                            settings.otel_metric_export_timeout_ms,
                         ),
                     )
                 ],
             )
             metrics.set_meter_provider(meter_provider)
-            partial["meter_provider"] = meter_provider
             _log_info(
                 event="telemetry.metrics.configured",
                 message="metrics configured",
@@ -395,23 +451,16 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                     OTLPLogExporter(
                         endpoint=endpoint,
                         insecure=insecure,
-                        timeout=_require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
+                        timeout=_require_positive_number(
+                            "otel_timeout_seconds", settings.otel_timeout_seconds
+                        ),
                     )
                 )
             )
             set_logger_provider(logger_provider)
-            partial["logger_provider"] = logger_provider
             _log_info(
                 event="telemetry.logs.configured",
                 message="logs provider configured",
-                endpoint=endpoint,
-                insecure=insecure,
-            )
-
-            LoggingInstrumentor().instrument(set_logging_format=False)
-            _log_info(
-                event="telemetry.python_logging.instrumented",
-                message="python logging instrumentor enabled",
                 endpoint=endpoint,
                 insecure=insecure,
             )
@@ -421,7 +470,11 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
             root_logger.propagate = True
 
             existing_handler = next(
-                (handler for handler in root_logger.handlers if getattr(handler, "_otel_handler", False)),
+                (
+                    handler
+                    for handler in root_logger.handlers
+                    if getattr(handler, "_otel_handler", False)
+                ),
                 None,
             )
             if existing_handler is None:
@@ -453,11 +506,11 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                 log_level_name=log_level_name,
                 endpoint=endpoint,
                 insecure=insecure,
+                previous_log_record_factory=previous_factory,
             )
 
             _HANDLE = handle
             _STATE_KEY = config_key
-            _INITIALIZED = True
 
             if not _ATEEXIT_REGISTERED:
                 atexit.register(handle.shutdown)
@@ -481,10 +534,14 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                 error_type=type(exc).__name__,
                 error_message=str(exc),
             )
+            try:
+                logging.setLogRecordFactory(previous_factory)
+            except Exception:
+                pass
             for provider in (
-                partial.get("logger_provider"),
-                partial.get("meter_provider"),
-                partial.get("tracer_provider"),
+                locals().get("logger_provider"),
+                locals().get("meter_provider"),
+                locals().get("tracer_provider"),
             ):
                 try:
                     if provider is not None:

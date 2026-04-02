@@ -1,10 +1,9 @@
-# src/workflows/ELT/launch_plans.py
 from __future__ import annotations
 
-from flytekit import CronSchedule, LaunchPlan
+from flytekit import CronSchedule, LaunchPlan, workflow
 
+from workflows.ELT.tasks.maintenance_optimize import MaintenanceResult, maintenance_optimize
 from workflows.ELT.workflows.elt_workflow import elt_workflow
-from workflows.ELT.workflows.iceberg_maintenance_workflow import iceberg_maintenance_workflow
 
 __all__ = [
     "ELT_WORKFLOW_LP",
@@ -13,13 +12,23 @@ __all__ = [
     "ICEBERG_MAINTENANCE_DAILY_LP_NAME",
     "ICEBERG_MAINTENANCE_WEEKLY_LP",
     "ICEBERG_MAINTENANCE_WEEKLY_LP_NAME",
+    "iceberg_maintenance_workflow",
 ]
 
+
+@workflow
+def iceberg_maintenance_workflow() -> MaintenanceResult:
+    return maintenance_optimize()
+
 # Default manual entrypoint for ELT.
-ELT_WORKFLOW_LP = LaunchPlan.get_or_create(workflow=elt_workflow)
+
+ELT_WORKFLOW_LP = LaunchPlan.get_or_create(
+    workflow=elt_workflow,
+    name="elt_workflow_lp",
+)
 ELT_WORKFLOW_LP_NAME = ELT_WORKFLOW_LP.name
 
-# Daily maintenance runs at 02:30 UTC.
+# Daily maintenance: cleanup only.
 ICEBERG_MAINTENANCE_DAILY_LP = LaunchPlan.get_or_create(
     workflow=iceberg_maintenance_workflow,
     name="iceberg_maintenance_daily_lp",
@@ -27,7 +36,7 @@ ICEBERG_MAINTENANCE_DAILY_LP = LaunchPlan.get_or_create(
 )
 ICEBERG_MAINTENANCE_DAILY_LP_NAME = ICEBERG_MAINTENANCE_DAILY_LP.name
 
-# Weekly maintenance runs at 03:30 UTC on Sunday.
+# Weekly maintenance: cleanup only for now; keep the schedule separate.
 ICEBERG_MAINTENANCE_WEEKLY_LP = LaunchPlan.get_or_create(
     workflow=iceberg_maintenance_workflow,
     name="iceberg_maintenance_weekly_lp",

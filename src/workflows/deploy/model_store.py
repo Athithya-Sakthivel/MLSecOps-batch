@@ -30,74 +30,6 @@ _MAX_SCHEMA_BYTES = 1_048_576
 _MAX_METADATA_BYTES = 1_048_576
 _LOCK_TIMEOUT_SECONDS = 300
 
-_LOG_LEVEL_ALIASES = {
-    "WARN": "WARNING",
-    "EXCEPTION": "ERROR",
-}
-
-
-class JsonLogFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload: dict[str, Any] = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-
-        for key, value in record.__dict__.items():
-            if key.startswith("_"):
-                continue
-            if key in {
-                "args",
-                "asctime",
-                "created",
-                "exc_info",
-                "exc_text",
-                "filename",
-                "funcName",
-                "levelname",
-                "levelno",
-                "lineno",
-                "module",
-                "msecs",
-                "message",
-                "msg",
-                "name",
-                "pathname",
-                "process",
-                "processName",
-                "relativeCreated",
-                "stack_info",
-                "thread",
-                "threadName",
-            }:
-                continue
-            payload[key] = value
-
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
-
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _configure_logging() -> None:
-    raw = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
-    level_name = _LOG_LEVEL_ALIASES.get(raw, raw)
-    if level_name not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
-        level_name = "INFO"
-
-    handler = logging.StreamHandler()
-    handler.setFormatter(JsonLogFormatter())
-
-    logging.basicConfig(
-        level=getattr(logging, level_name),
-        handlers=[handler],
-        force=True,
-    )
-
-
-_configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -174,8 +106,15 @@ def _cache_key(model_sha256: str, schema_sha256: str, model_version: str | None)
     return h.hexdigest()[:16]
 
 
-def _cache_dir(settings: Settings, model_sha256: str, schema_sha256: str, model_version: str | None) -> Path:
-    cache_dir = Path(settings.model_cache_dir) / _cache_key(model_sha256, schema_sha256, model_version)
+def _cache_dir(
+    settings: Settings,
+    model_sha256: str,
+    schema_sha256: str,
+    model_version: str | None,
+) -> Path:
+    cache_dir = Path(settings.model_cache_dir) / _cache_key(
+        model_sha256, schema_sha256, model_version
+    )
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -369,7 +308,9 @@ def _manifest_dict(
     return {
         "format_version": _BUNDLE_FORMAT_VERSION,
         "source_uri": str(settings.model_uri),
-        "model_version": str(settings.model_version) if settings.model_version is not None else None,
+        "model_version": str(settings.model_version)
+        if settings.model_version is not None
+        else None,
         "model_sha256": model_sha256,
         "schema_sha256": schema_sha256,
         "metadata_sha256": metadata_sha256,
@@ -384,7 +325,9 @@ def _load_manifest(path: Path) -> ModelBundleManifest:
     return ModelBundleManifest(
         format_version=int(raw["format_version"]),
         source_uri=str(raw["source_uri"]),
-        model_version=raw.get("model_version") if raw.get("model_version") is not None else None,
+        model_version=raw.get("model_version")
+        if raw.get("model_version") is not None
+        else None,
         model_sha256=_normalize_sha256(raw["model_sha256"], "manifest.model_sha256"),
         schema_sha256=_normalize_sha256(raw["schema_sha256"], "manifest.schema_sha256"),
         metadata_sha256=(
@@ -414,7 +357,9 @@ def _validate_manifest(
     schema_sha256: str,
 ) -> None:
     expected_source_uri = str(settings.model_uri)
-    expected_model_version = str(settings.model_version) if settings.model_version is not None else None
+    expected_model_version = (
+        str(settings.model_version) if settings.model_version is not None else None
+    )
 
     if manifest.source_uri != expected_source_uri:
         raise RuntimeError(
@@ -457,7 +402,9 @@ def load_model_bundle(settings: Settings) -> tuple[Path, ModelSchema, ModelMetad
         extra={
             "event": "bundle.load.start",
             "model_uri": str(settings.model_uri),
-            "model_version": str(settings.model_version) if settings.model_version is not None else None,
+            "model_version": str(settings.model_version)
+            if settings.model_version is not None
+            else None,
             "source_model_path": model_src,
             "source_schema_path": schema_src,
         },
@@ -466,14 +413,22 @@ def load_model_bundle(settings: Settings) -> tuple[Path, ModelSchema, ModelMetad
     if not src_fs.exists(model_src):
         logger.error(
             "bundle.source_missing_model",
-            extra={"event": "bundle.source_missing_model", "model_uri": str(settings.model_uri), "source_model_path": model_src},
+            extra={
+                "event": "bundle.source_missing_model",
+                "model_uri": str(settings.model_uri),
+                "source_model_path": model_src,
+            },
         )
         raise FileNotFoundError(f"Model artifact not found: {settings.model_uri}")
 
     if not src_fs.exists(schema_src):
         logger.error(
             "bundle.source_missing_schema",
-            extra={"event": "bundle.source_missing_schema", "model_uri": str(settings.model_uri), "source_schema_path": schema_src},
+            extra={
+                "event": "bundle.source_missing_schema",
+                "model_uri": str(settings.model_uri),
+                "source_schema_path": schema_src,
+            },
         )
         raise FileNotFoundError(f"schema.json is required next to the model artifact: {schema_src}")
 
@@ -507,10 +462,36 @@ def load_model_bundle(settings: Settings) -> tuple[Path, ModelSchema, ModelMetad
                     schema_sha256=schema_sha256,
                 )
 
-                cached_schema = _parse_schema(_read_json_object_from_path(schema_path))
-                cached_metadata = _parse_metadata(
-                    _read_json_object_from_path(metadata_path) if metadata_path.is_file() else None
-                )
+                cached_schema_raw = _read_json_object_from_path(schema_path)
+                cached_schema_canonical = _canonical_json_text(cached_schema_raw)
+                cached_schema_sha256 = _sha256_text(cached_schema_canonical)
+                if cached_schema_sha256 != schema_sha256:
+                    raise RuntimeError(
+                        f"Cached schema checksum mismatch for {settings.model_uri}: "
+                        f"expected {schema_sha256}, got {cached_schema_sha256}"
+                    )
+                cached_schema = _parse_schema(cached_schema_raw)
+
+                cached_metadata = _parse_metadata(None)
+                if metadata_path.is_file():
+                    cached_metadata_raw = _read_json_object_from_path(metadata_path)
+                    cached_metadata_canonical = _canonical_json_text(cached_metadata_raw)
+                    cached_metadata_sha256 = _sha256_text(cached_metadata_canonical)
+
+                    if manifest.metadata_sha256 is None:
+                        raise RuntimeError(
+                            f"Cached bundle unexpectedly contains metadata.json: {metadata_path}"
+                        )
+                    if cached_metadata_sha256 != manifest.metadata_sha256:
+                        raise RuntimeError(
+                            f"Cached metadata checksum mismatch for {settings.model_uri}: "
+                            f"expected {manifest.metadata_sha256}, got {cached_metadata_sha256}"
+                        )
+                    cached_metadata = _parse_metadata(cached_metadata_raw)
+                elif manifest.metadata_sha256 is not None:
+                    raise RuntimeError(
+                        f"Cached manifest expects metadata.json but file is missing: {metadata_path}"
+                    )
 
                 cached_model_sha256 = _hash_file(model_path)
                 if cached_model_sha256 != model_sha256:
@@ -704,7 +685,9 @@ def build_onnx_session(model_path: Path, settings: Settings) -> ort.InferenceSes
     return session
 
 
-def _resolve_session_io(session: ort.InferenceSession, schema: ModelSchema) -> tuple[str, tuple[str, ...]]:
+def _resolve_session_io(
+    session: ort.InferenceSession, schema: ModelSchema
+) -> tuple[str, tuple[str, ...]]:
     session_inputs = tuple(inp.name for inp in session.get_inputs())
     session_outputs = tuple(out.name for out in session.get_outputs())
 

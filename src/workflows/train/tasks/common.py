@@ -304,7 +304,7 @@ def _read_parquet_frame(
     columns: list[str] | None,
 ) -> pd.DataFrame:
     """
-    Read a single physical parquet file, not a dataset path.
+    Read one physical parquet file.
     """
     parquet_file = pq.ParquetFile(path, filesystem=filesystem)
     table = parquet_file.read(columns=columns, use_threads=True)
@@ -319,15 +319,45 @@ def _normalize_as_of_date_column(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _normalize_utc_timestamp_series(series: pd.Series) -> pd.Series:
+    """
+    Force pandas to represent timestamps as UTC-aware nanosecond precision.
+    """
+    ts = pd.to_datetime(series, utc=True, errors="raise")
+    return ts.astype("datetime64[ns, UTC]")
+
+
 def load_gold_frame(dataset_uri: str, columns: list[str] | None = None) -> pd.DataFrame:
     """
     Robust parquet loader for the gold training matrix.
+
+    Handles both:
+    - a single staged parquet file from Flyte
+    - a parquet dataset root containing many files
     """
     log_json(msg="load_gold_start", dataset_uri=str(dataset_uri), output_path="/tmp/gold_canonical.parquet")
 
     filesystem, base_path = _filesystem_and_path(dataset_uri)
-    files = _discover_parquet_files(filesystem, base_path)
 
+    info = filesystem.get_file_info(base_path)
+    if info.type == pa_fs.FileType.NotFound:
+        raise FileNotFoundError(base_path)
+
+    if info.type == pa_fs.FileType.File:
+        if not _is_parquet_file(base_path):
+            raise ValueError(f"{dataset_uri} is a file, but not a parquet file")
+        log_json(msg="load_gold_single_file_detected", dataset_uri=str(dataset_uri), file=base_path)
+        frame = _read_parquet_frame(filesystem, base_path, columns=columns)
+        frame = _normalize_as_of_date_column(frame)
+        log_json(
+            msg="load_gold_complete",
+            rows=len(frame),
+            cols=len(frame.columns),
+            dataset_uri=str(dataset_uri),
+        )
+        return frame
+
+    files = _discover_parquet_files(filesystem, base_path)
     if not files:
         raise RuntimeError(f"No parquet files found at {dataset_uri}")
 
@@ -396,14 +426,6 @@ def validate_gold_contract(
         }
         if mismatched:
             raise ValueError(f"{label} has dtype drift: {json.dumps(mismatched, sort_keys=True, default=str)}")
-
-
-def _normalize_utc_timestamp_series(series: pd.Series) -> pd.Series:
-    """
-    Force pandas to represent timestamps as UTC-aware nanosecond precision.
-    """
-    ts = pd.to_datetime(series, utc=True, errors="raise")
-    return ts.astype("datetime64[ns, UTC]")
 
 
 def coerce_contract_dtypes(df: pd.DataFrame) -> pd.DataFrame:

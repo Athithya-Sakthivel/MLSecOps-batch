@@ -1,3 +1,4 @@
+# src/workflows/ELT/workflows/iceberg_maintenance_workflow.py
 from __future__ import annotations
 
 from flytekit import workflow
@@ -8,5 +9,5 @@ __all__ = ["iceberg_maintenance_workflow"]
 
 
 @workflow
-def iceberg_maintenance_workflow() -> MaintenanceResult:
-    return maintenance_optimize()
+def iceberg_maintenance_workflow(run_compaction: bool = False) -> MaintenanceResult:
+    return maintenance_optimize(run_compaction=run_compaction)
