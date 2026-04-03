@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.7
+# Build custom MLflow image to ensure required runtime deps (psycopg2, boto3) are present and avoid unstable official images
+
+FROM docker.io/library/python:3.11.8-slim-bookworm@sha256:90f8795536170fd08236d2ceb74fe7065dbf74f738d8b84bfbf263656654dc9b
+
+ARG MLFLOW_VERSION=3.10.1
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/tmp \
+    TMPDIR=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache \
+    MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE=true \
+    MLFLOW_WORKERS=1 \
+    MLFLOW_PORT=5000
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install \
+        "mlflow==${MLFLOW_VERSION}" \
+        psycopg2-binary==2.9.11 \
+        boto3==1.42.70
+
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin mlflow \
+    && mkdir -p /tmp/.cache \
+    && chown -R 10001:10001 /tmp/.cache /home/mlflow
+
+WORKDIR /workspace
+USER 10001:10001
+
+EXPOSE 5000
+
+ENTRYPOINT ["mlflow"]
