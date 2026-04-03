@@ -1,7 +1,9 @@
+# src/workflows/ELT/run.py
 from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import functools
 import hashlib
 import importlib
@@ -38,7 +40,8 @@ ELT_PROFILE = (
 SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark").strip() or "spark"
 ELT_TASK_IMAGE = os.environ.get(
     "ELT_TASK_IMAGE",
-    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-04-02-16-28--852c5b8@sha256:ae3c9d2b2c03c0bdffb7149c2beaec5932ee9f39feae85ddaa4431e09f4a6e43").strip()
+    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-04-02-16-28--852c5b8@sha256:ae3c9d2b2c03c0bdffb7149c2beaec5932ee9f39feae85ddaa4431e09f4a6e43",
+).strip()
 if not ELT_TASK_IMAGE:
     raise RuntimeError("ELT_TASK_IMAGE must not be empty")
 
@@ -55,6 +58,8 @@ FLYTE_ADMIN_PORT = int(os.environ.get("FLYTE_ADMIN_PORT", "30081"))
 PORT_FORWARD_TARGET_PORT = int(os.environ.get("PORT_FORWARD_TARGET_PORT", "81"))
 PORT_FORWARD_PID_FILE = Path(os.environ.get("PORT_FORWARD_PID_FILE", "/tmp/flyteadmin-portforward.pid"))
 PORT_FORWARD_LOG = Path(os.environ.get("PORT_FORWARD_LOG", "/tmp/flyteadmin-portforward.log"))
+
+PORT_FORWARD_PROC: subprocess.Popen[str] | None = None
 
 ACTIVATE_LAUNCHPLANS = os.environ.get("ACTIVATE_LAUNCHPLANS", "0").lower() in {
     "1",
@@ -132,6 +137,7 @@ def run_cmd(
         capture_output=capture_output,
         check=False,
         env=env,
+        close_fds=True,
     )
     if check and cp.returncode != 0:
         detail: list[str] = []
@@ -145,17 +151,35 @@ def run_cmd(
 
 
 def stop_port_forward_if_any() -> None:
-    if not PORT_FORWARD_PID_FILE.is_file():
-        return
-    try:
-        pid = int(PORT_FORWARD_PID_FILE.read_text().strip())
-    except Exception:
-        PORT_FORWARD_PID_FILE.unlink(missing_ok=True)
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    global PORT_FORWARD_PROC
+
+    proc = PORT_FORWARD_PROC
+    PORT_FORWARD_PROC = None
+
+    pid: int | None = None
+    if PORT_FORWARD_PID_FILE.is_file():
+        try:
+            pid = int(PORT_FORWARD_PID_FILE.read_text().strip())
+        except Exception:
+            pid = None
+
+    if proc is not None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=10)
+
+    if pid is not None and (proc is None or proc.pid != pid):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+        with contextlib.suppress(Exception):
+            os.waitpid(pid, 0)
+
     PORT_FORWARD_PID_FILE.unlink(missing_ok=True)
 
 
@@ -176,7 +200,14 @@ def port_is_open(host: str, port: int) -> bool:
 
 
 def start_port_forward() -> None:
+    global PORT_FORWARD_PROC
+
     if not USE_PORT_FORWARD:
+        return
+
+    if PORT_FORWARD_PROC is not None and PORT_FORWARD_PROC.poll() is None and port_is_open(
+        FLYTE_ADMIN_HOST, FLYTE_ADMIN_PORT
+    ):
         return
 
     stop_port_forward_if_any()
@@ -188,7 +219,8 @@ def start_port_forward() -> None:
         f"{FLYTE_ADMIN_NAMESPACE}/svc/flyteadmin:{PORT_FORWARD_TARGET_PORT}"
     )
 
-    with PORT_FORWARD_LOG.open("w", encoding="utf-8") as log_file:
+    log_file = PORT_FORWARD_LOG.open("w", encoding="utf-8")
+    try:
         proc = subprocess.Popen(
             [
                 "kubectl",
@@ -198,18 +230,25 @@ def start_port_forward() -> None:
                 "svc/flyteadmin",
                 f"{FLYTE_ADMIN_PORT}:{PORT_FORWARD_TARGET_PORT}",
             ],
+            stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
+            close_fds=True,
+            start_new_session=True,
         )
-        PORT_FORWARD_PID_FILE.write_text(str(proc.pid))
+    finally:
+        log_file.close()
 
-        for _ in range(60):
-            if port_is_open(FLYTE_ADMIN_HOST, FLYTE_ADMIN_PORT):
-                return
-            if proc.poll() is not None:
-                break
-            time.sleep(1)
+    PORT_FORWARD_PROC = proc
+    PORT_FORWARD_PID_FILE.write_text(str(proc.pid))
+
+    for _ in range(60):
+        if port_is_open(FLYTE_ADMIN_HOST, FLYTE_ADMIN_PORT):
+            return
+        if proc.poll() is not None:
+            break
+        time.sleep(1)
 
     tail = ""
     if PORT_FORWARD_LOG.is_file():
