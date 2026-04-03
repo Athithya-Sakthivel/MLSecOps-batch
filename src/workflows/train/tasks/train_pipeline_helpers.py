@@ -1,15 +1,14 @@
-# src/workflows/train/tasks/train_pipeline_helpers.py
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import tempfile
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -17,43 +16,35 @@ from pyarrow import fs as pa_fs
 from pyarrow import parquet as pq
 
 DEFAULT_MLFLOW_EXPERIMENT = "trip_duration_eta_lgbm"
+DEFAULT_MODEL_FAMILY = "lightgbm"
+DEFAULT_INFERENCE_RUNTIME = "onnxruntime"
+DEFAULT_TRAIN_PROFILE = "staging"
+DEFAULT_ARTIFACT_ROOT_PREFIX = "artifacts/train"
+DEFAULT_REGISTERED_MODEL_NAME = "trip_eta"
+
+DEFAULT_VALIDATION_FRACTION = 0.15
+DEFAULT_RANDOM_SEED = 42
+DEFAULT_NUM_BOOST_ROUND = 1500
+DEFAULT_EARLY_STOPPING_ROUNDS = 100
+DEFAULT_ONNX_OPSET = 17
+
+VALIDATION_MODE = "sample"
+VALIDATION_SAMPLE_FRACTION = 0.10
+VALIDATION_SAMPLE_MAX_ROWS = 100000
 
 LABEL_COLUMN = "label_trip_duration_seconds"
 TIMESTAMP_COLUMN = "as_of_ts"
 IDENTIFIER_COLUMNS = ["trip_id"]
 
-K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
-TRAIN_PROFILE = (
-    os.environ.get(
-        "TRAIN_PROFILE",
-        os.environ.get(
-            "ELT_PROFILE",
-            "staging" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod",
-        ),
-    )
-    .strip()
-    .lower()
-)
-if TRAIN_PROFILE not in {"staging", "prod"}:
-    raise ValueError(f"Invalid TRAIN_PROFILE={TRAIN_PROFILE!r}; expected staging or prod")
+GOLD_FEATURE_VERSION = "trip_eta_lgbm_v1"
+GOLD_SCHEMA_VERSION = "trip_eta_frozen_matrix_v1"
+GOLD_TRAINING_TABLE = "iceberg.gold.trip_training_matrix"
+GOLD_CONTRACT_TABLE = "iceberg.gold.trip_training_contracts"
+SOURCE_SILVER_TABLE = "iceberg.silver.trip_canonical"
 
-GOLD_FEATURE_VERSION = os.environ.get("GOLD_FEATURE_VERSION", "trip_eta_lgbm_v1").strip()
-GOLD_SCHEMA_VERSION = os.environ.get("GOLD_SCHEMA_VERSION", "trip_eta_frozen_matrix_v1").strip()
-
-GOLD_TRAINING_TABLE = os.environ.get("GOLD_TRAINING_TABLE", "iceberg.gold.trip_training_matrix").strip()
-GOLD_CONTRACT_TABLE = os.environ.get("GOLD_CONTRACT_TABLE", "iceberg.gold.trip_training_contracts").strip()
-SOURCE_SILVER_TABLE = os.environ.get("SOURCE_SILVER_TABLE", "iceberg.silver.trip_canonical").strip()
-MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "lightgbm").strip()
-INFERENCE_RUNTIME = os.environ.get("INFERENCE_RUNTIME", "onnxruntime").strip()
-
-ROUTE_PAIR_BUCKETS = int(os.environ.get("ROUTE_PAIR_BUCKETS", "4096"))
-ROUTE_PAIR_HASH_SALT = os.environ.get("ROUTE_PAIR_HASH_SALT", "trip_eta_route_pair_v1").strip()
-
-SERVICE_ZONE_VALUES = tuple(
-    item.strip()
-    for item in os.environ.get("GOLD_SERVICE_ZONE_VALUES", "airports,boro zone,yellow zone").split(",")
-    if item.strip()
-)
+ROUTE_PAIR_BUCKETS = 4096
+ROUTE_PAIR_HASH_SALT = "trip_eta_route_pair_v1"
+SERVICE_ZONE_VALUES = ("airports", "boro zone", "yellow zone")
 
 FEATURE_COLUMNS: list[str] = [
     "pickup_hour",
@@ -130,33 +121,101 @@ CANONICAL_GOLD_DTYPE_MAP: dict[str, str] = {
     LABEL_COLUMN: "float64",
 }
 
-VALIDATION_MODE = os.environ.get("VALIDATION_MODE", "sample").strip().lower()
-if VALIDATION_MODE not in {"full", "sample"}:
-    raise ValueError("VALIDATION_MODE must be 'full' or 'sample'")
+# Compatibility aliases expected by downstream modules.
+MLFLOW_EXPERIMENT = DEFAULT_MLFLOW_EXPERIMENT
+MODEL_FAMILY = DEFAULT_MODEL_FAMILY
+INFERENCE_RUNTIME = DEFAULT_INFERENCE_RUNTIME
+TRAIN_PROFILE = DEFAULT_TRAIN_PROFILE
+ARTIFACT_ROOT_PREFIX = DEFAULT_ARTIFACT_ROOT_PREFIX
+REGISTERED_MODEL_NAME = DEFAULT_REGISTERED_MODEL_NAME
+VALIDATION_FRACTION = DEFAULT_VALIDATION_FRACTION
+RANDOM_SEED = DEFAULT_RANDOM_SEED
+NUM_BOOST_ROUND = DEFAULT_NUM_BOOST_ROUND
+EARLY_STOPPING_ROUNDS = DEFAULT_EARLY_STOPPING_ROUNDS
+ONNX_OPSET = DEFAULT_ONNX_OPSET
 
-VALIDATION_SAMPLE_FRACTION = float(os.environ.get("VALIDATION_SAMPLE_FRACTION", "0.10"))
-VALIDATION_SAMPLE_MAX_ROWS = int(os.environ.get("VALIDATION_SAMPLE_MAX_ROWS", "100000"))
-DEFAULT_VALIDATION_FRACTION = float(os.environ.get("VALIDATION_FRACTION", "0.15"))
-DEFAULT_RANDOM_SEED = int(os.environ.get("RANDOM_SEED", "42"))
-DEFAULT_SAMPLE_ROWS = int(os.environ.get("SAMPLE_ROWS", "50000"))
-DEFAULT_NUM_BOOST_ROUND = int(os.environ.get("NUM_BOOST_ROUND", "1500"))
-DEFAULT_EARLY_STOPPING_ROUNDS = int(os.environ.get("EARLY_STOPPING_ROUNDS", "100"))
-DEFAULT_ONNX_OPSET = int(os.environ.get("ONNX_OPSET", "17"))
-
-LIGHTGBM_LEARNING_RATE = float(os.environ.get("LIGHTGBM_LEARNING_RATE", "0.05"))
-LIGHTGBM_NUM_LEAVES = int(os.environ.get("LIGHTGBM_NUM_LEAVES", "63"))
-LIGHTGBM_MIN_CHILD_SAMPLES = int(os.environ.get("LIGHTGBM_MIN_CHILD_SAMPLES", "20"))
-LIGHTGBM_FEATURE_FRACTION = float(os.environ.get("LIGHTGBM_FEATURE_FRACTION", "0.90"))
-LIGHTGBM_BAGGING_FRACTION = float(os.environ.get("LIGHTGBM_BAGGING_FRACTION", "0.90"))
-LIGHTGBM_BAGGING_FREQ = int(os.environ.get("LIGHTGBM_BAGGING_FREQ", "1"))
-LIGHTGBM_L1 = float(os.environ.get("LIGHTGBM_L1", "0.0"))
-LIGHTGBM_L2 = float(os.environ.get("LIGHTGBM_L2", "0.0"))
-LIGHTGBM_SEED = int(os.environ.get("LIGHTGBM_SEED", "42"))
-
-ARTIFACT_ROOT_S3 = os.environ.get(
-    "TRAIN_ARTIFACT_ROOT",
-    f"s3://{os.environ.get('S3_BUCKET', 'e2e-mlops-data-681802563986').strip()}/artifacts/train",
-).rstrip("/")
+__all__ = [
+    "ARTIFACT_ROOT_PREFIX",
+    "CANONICAL_GOLD_DTYPE_MAP",
+    "CATEGORICAL_FEATURES",
+    "DEFAULT_ARTIFACT_ROOT_PREFIX",
+    "DEFAULT_EARLY_STOPPING_ROUNDS",
+    "DEFAULT_INFERENCE_RUNTIME",
+    "DEFAULT_MLFLOW_EXPERIMENT",
+    "DEFAULT_MODEL_FAMILY",
+    "DEFAULT_NUM_BOOST_ROUND",
+    "DEFAULT_ONNX_OPSET",
+    "DEFAULT_RANDOM_SEED",
+    "DEFAULT_REGISTERED_MODEL_NAME",
+    "DEFAULT_TRAIN_PROFILE",
+    "DEFAULT_VALIDATION_FRACTION",
+    "EARLY_STOPPING_ROUNDS",
+    "FEATURE_COLUMNS",
+    "FLOAT_FEATURES",
+    "GOLD_CONTRACT_TABLE",
+    "GOLD_FEATURE_VERSION",
+    "GOLD_SCHEMA_VERSION",
+    "GOLD_TRAINING_TABLE",
+    "IDENTIFIER_COLUMNS",
+    "INFERENCE_RUNTIME",
+    "LABEL_COLUMN",
+    "MLFLOW_EXPERIMENT",
+    "MODEL_FAMILY",
+    "NUMERIC_FEATURES",
+    "NUM_BOOST_ROUND",
+    "ONNX_OPSET",
+    "RANDOM_SEED",
+    "REGISTERED_MODEL_NAME",
+    "REQUIRED_COLUMNS",
+    "ROUTE_PAIR_BUCKETS",
+    "ROUTE_PAIR_HASH_SALT",
+    "SERVICE_ZONE_VALUES",
+    "SOURCE_SILVER_TABLE",
+    "TIMESTAMP_COLUMN",
+    "TIME_INTEGER_FEATURES",
+    "TRAIN_PROFILE",
+    "VALIDATION_FRACTION",
+    "VALIDATION_MODE",
+    "VALIDATION_SAMPLE_FRACTION",
+    "VALIDATION_SAMPLE_MAX_ROWS",
+    "SplitResult",
+    "align_feature_frame",
+    "artifact_uri_join",
+    "assert_no_leakage_columns",
+    "best_lightgbm_params",
+    "build_aggregate_spec",
+    "build_contract_summary",
+    "build_encoding_spec",
+    "build_feature_spec",
+    "build_label_spec",
+    "build_quality_report",
+    "build_schema_hash",
+    "coerce_contract_dtypes",
+    "compute_regression_metrics",
+    "dataframe_dtype_map",
+    "discover_parquet_files",
+    "ensure_directory",
+    "filesystem_and_path",
+    "load_gold_frame",
+    "log_json",
+    "make_run_id",
+    "persist_training_artifacts",
+    "prepare_model_input_frame",
+    "prepare_training_frame",
+    "read_json_uri",
+    "read_parquet_frame",
+    "sample_validation_frame",
+    "split_by_time",
+    "train_lightgbm_model",
+    "upload_file_to_uri",
+    "validate_and_canonicalize_gold_frame",
+    "validate_gold_contract",
+    "validate_required_columns",
+    "validate_value_contracts",
+    "write_bytes_uri",
+    "write_json_uri",
+    "write_parquet_frame_to_uri",
+]
 
 
 @dataclass(frozen=True)
@@ -190,60 +249,6 @@ def log_json(**payload: object) -> None:
     print(json.dumps(payload, default=_json_default, sort_keys=True))
 
 
-def build_task_environment() -> dict[str, str]:
-    env = {
-        "PYTHONUNBUFFERED": "1",
-        "AWS_EC2_METADATA_DISABLED": "true",
-        "AWS_DEFAULT_REGION": os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"),
-        "AWS_REGION": os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")),
-        "K8S_CLUSTER": K8S_CLUSTER,
-        "TRAIN_PROFILE": TRAIN_PROFILE,
-        "GOLD_FEATURE_VERSION": GOLD_FEATURE_VERSION,
-        "GOLD_SCHEMA_VERSION": GOLD_SCHEMA_VERSION,
-        "GOLD_TRAINING_TABLE": GOLD_TRAINING_TABLE,
-        "GOLD_CONTRACT_TABLE": GOLD_CONTRACT_TABLE,
-        "SOURCE_SILVER_TABLE": SOURCE_SILVER_TABLE,
-        "MODEL_FAMILY": MODEL_FAMILY,
-        "INFERENCE_RUNTIME": INFERENCE_RUNTIME,
-        "VALIDATION_MODE": VALIDATION_MODE,
-        "VALIDATION_SAMPLE_FRACTION": str(VALIDATION_SAMPLE_FRACTION),
-        "VALIDATION_SAMPLE_MAX_ROWS": str(VALIDATION_SAMPLE_MAX_ROWS),
-        "VALIDATION_FRACTION": str(DEFAULT_VALIDATION_FRACTION),
-        "RANDOM_SEED": str(DEFAULT_RANDOM_SEED),
-        "SAMPLE_ROWS": str(DEFAULT_SAMPLE_ROWS),
-        "NUM_BOOST_ROUND": str(DEFAULT_NUM_BOOST_ROUND),
-        "EARLY_STOPPING_ROUNDS": str(DEFAULT_EARLY_STOPPING_ROUNDS),
-        "LIGHTGBM_LEARNING_RATE": str(LIGHTGBM_LEARNING_RATE),
-        "LIGHTGBM_NUM_LEAVES": str(LIGHTGBM_NUM_LEAVES),
-        "LIGHTGBM_MIN_CHILD_SAMPLES": str(LIGHTGBM_MIN_CHILD_SAMPLES),
-        "LIGHTGBM_FEATURE_FRACTION": str(LIGHTGBM_FEATURE_FRACTION),
-        "LIGHTGBM_BAGGING_FRACTION": str(LIGHTGBM_BAGGING_FRACTION),
-        "LIGHTGBM_BAGGING_FREQ": str(LIGHTGBM_BAGGING_FREQ),
-        "LIGHTGBM_L1": str(LIGHTGBM_L1),
-        "LIGHTGBM_L2": str(LIGHTGBM_L2),
-        "LIGHTGBM_SEED": str(LIGHTGBM_SEED),
-        "ARTIFACT_ROOT_S3": ARTIFACT_ROOT_S3,
-    }
-
-    for key in (
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_ROLE_ARN",
-        "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-        "S3_ENDPOINT",
-        "S3_PATH_STYLE_ACCESS",
-        "MLFLOW_TRACKING_URI",
-        "MLFLOW_EXPERIMENT_NAME",
-    ):
-        value = os.environ.get(key, "").strip()
-        if value:
-            env[key] = value
-    return env
-
-
 def ensure_directory(path: str | Path) -> Path:
     out = Path(path)
     out.mkdir(parents=True, exist_ok=True)
@@ -264,17 +269,7 @@ def artifact_uri_join(root_uri: str, *parts: str) -> str:
     return f"{root}/{suffix}" if suffix else root
 
 
-def run_artifact_root(run_id: str) -> str:
-    return artifact_uri_join(ARTIFACT_ROOT_S3, run_id)
-
-
 def make_run_id() -> str:
-    env_run_id = os.environ.get("RUN_ID", "").strip()
-    if env_run_id:
-        return env_run_id
-    flyte_execution_id = os.environ.get("FLYTE_INTERNAL_EXECUTION_ID", "").strip()
-    if flyte_execution_id:
-        return flyte_execution_id
     return uuid.uuid4().hex
 
 
@@ -300,6 +295,28 @@ def discover_parquet_files(dataset_uri: str) -> list[str]:
     return sorted(files)
 
 
+def _read_single_parquet_file(
+    filesystem: pa_fs.FileSystem,
+    file_path: str,
+    columns: list[str] | None,
+) -> pd.DataFrame:
+    parquet_file = pq.ParquetFile(file_path, filesystem=filesystem)
+    table = parquet_file.read(columns=columns, use_threads=True)
+    return table.to_pandas()
+
+
+def _normalize_as_of_date_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "as_of_date" not in df.columns:
+        return df
+    out = df.copy()
+    out["as_of_date"] = pd.to_datetime(out["as_of_date"], errors="raise").dt.date
+    return out
+
+
+def _normalize_utc_timestamp_series(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, utc=True, errors="raise").astype("datetime64[ns, UTC]")
+
+
 def read_parquet_frame(dataset_uri: str, columns: list[str] | None = None) -> pd.DataFrame:
     filesystem, base_path = filesystem_and_path(dataset_uri)
     info = filesystem.get_file_info(base_path)
@@ -309,7 +326,8 @@ def read_parquet_frame(dataset_uri: str, columns: list[str] | None = None) -> pd
     if info.type == pa_fs.FileType.File:
         if not _is_parquet_file(base_path):
             raise ValueError(f"{dataset_uri} is a file, but not a parquet file")
-        return pq.read_table(base_path, filesystem=filesystem, columns=columns).to_pandas()
+        frame = _read_single_parquet_file(filesystem, base_path, columns)
+        return _normalize_as_of_date_column(frame)
 
     parquet_files = discover_parquet_files(dataset_uri)
     if not parquet_files:
@@ -317,57 +335,30 @@ def read_parquet_frame(dataset_uri: str, columns: list[str] | None = None) -> pd
 
     frames: list[pd.DataFrame] = []
     for file_path in parquet_files:
-        frames.append(pq.read_table(file_path, filesystem=filesystem, columns=columns).to_pandas())
-    return pd.concat(frames, ignore_index=True, sort=False)
+        frame = _read_single_parquet_file(filesystem, file_path, columns)
+        frames.append(_normalize_as_of_date_column(frame))
+
+    final_df = pd.concat(frames, ignore_index=True, sort=False)
+    return _normalize_as_of_date_column(final_df)
+
+
+def load_gold_frame(dataset_uri: str) -> pd.DataFrame:
+    frame = read_parquet_frame(dataset_uri)
+    return validate_and_canonicalize_gold_frame(frame)
 
 
 def read_json_uri(uri: str) -> object:
-    value = (uri or "").strip()
-    if not value:
-        raise ValueError("uri must not be empty")
-
-    filesystem, path = filesystem_and_path(value)
-    if value.startswith("s3://"):
+    filesystem, path = filesystem_and_path(uri)
+    if uri.startswith("s3://"):
         with filesystem.open_input_file(path) as stream:
             return json.loads(stream.read().decode("utf-8"))
-
     return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
-def read_json_if_exists(uri: str | Path) -> object | None:
-    text = str(uri).strip()
-    if not text:
-        return None
-
-    local_path = Path(text)
-    if local_path.exists():
-        return json.loads(local_path.read_text(encoding="utf-8"))
-
-    if text.startswith("s3://"):
-        filesystem, path = filesystem_and_path(text)
-        if filesystem.get_file_info(path).type == pa_fs.FileType.File:
-            with filesystem.open_input_file(path) as stream:
-                return json.loads(stream.read().decode("utf-8"))
-    return None
 
 
 def write_json_uri(payload: object, uri: str) -> str:
     filesystem, path = filesystem_and_path(uri)
     text = json.dumps(payload, indent=2, sort_keys=True, default=_json_default) + "\n"
 
-    if uri.startswith("s3://"):
-        with filesystem.open_output_stream(path) as stream:
-            stream.write(text.encode("utf-8"))
-        return uri
-
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text, encoding="utf-8")
-    return uri
-
-
-def write_text_uri(text: str, uri: str) -> str:
-    filesystem, path = filesystem_and_path(uri)
     if uri.startswith("s3://"):
         with filesystem.open_output_stream(path) as stream:
             stream.write(text.encode("utf-8"))
@@ -399,35 +390,18 @@ def upload_file_to_uri(local_path: str | Path, uri: str) -> str:
     return write_bytes_uri(source.read_bytes(), uri)
 
 
-def artifact_sidecar_path(base_path: str | Path, suffix: str) -> Path:
-    return Path(base_path).with_suffix(suffix)
+def write_parquet_frame_to_uri(df: pd.DataFrame, uri: str) -> str:
+    _filesystem, path = filesystem_and_path(uri)
+    if uri.startswith("s3://"):
+        with tempfile.TemporaryDirectory(prefix="parquet_upload_") as tmpdir:
+            tmp_path = Path(tmpdir) / "frame.parquet"
+            df.to_parquet(tmp_path, index=False)
+            return upload_file_to_uri(tmp_path, uri)
 
-
-def _normalize_as_of_date_column(df: pd.DataFrame) -> pd.DataFrame:
-    if "as_of_date" not in df.columns:
-        return df
-    out = df.copy()
-    out["as_of_date"] = pd.to_datetime(out["as_of_date"], errors="raise").dt.date
-    return out
-
-
-def _normalize_utc_timestamp_series(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, utc=True, errors="raise").astype("datetime64[ns, UTC]")
-
-
-def load_gold_frame(dataset_uri: str, columns: list[str] | None = None) -> pd.DataFrame:
-    """
-    Read the Gold dataset from a parquet file or parquet dataset root.
-
-    This intentionally avoids task-local temp files as contracts.
-    """
-    log_json(msg="load_gold_start", dataset_uri=dataset_uri)
-    df = read_parquet_frame(dataset_uri, columns=columns)
-    if df.empty:
-        raise ValueError(f"Gold dataset is empty: {dataset_uri}")
-    df = _normalize_as_of_date_column(df)
-    log_json(msg="load_gold_complete", dataset_uri=dataset_uri, rows=len(df), cols=len(df.columns))
-    return df
+    local_path = Path(path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(local_path, index=False)
+    return uri
 
 
 def validate_required_columns(df: pd.DataFrame, required_columns: Iterable[str] = REQUIRED_COLUMNS) -> None:
@@ -511,7 +485,6 @@ def validate_value_contracts(df: pd.DataFrame) -> None:
         raise ValueError(f"{TIMESTAMP_COLUMN} contains nulls after parsing")
     if df["as_of_date"].isna().any():
         raise ValueError("as_of_date contains nulls after parsing")
-
     if not isinstance(df[TIMESTAMP_COLUMN].dtype, pd.DatetimeTZDtype):
         raise ValueError(f"{TIMESTAMP_COLUMN} must be timezone-aware UTC")
 
@@ -561,6 +534,8 @@ def validate_and_canonicalize_gold_frame(df: pd.DataFrame) -> pd.DataFrame:
 def split_by_time(df: pd.DataFrame, validation_fraction: float) -> SplitResult:
     if not 0.0 < validation_fraction < 0.5:
         raise ValueError("validation_fraction must be > 0 and < 0.5")
+    if len(df) < 2:
+        raise ValueError("at least 2 rows are required to split train/validation sets")
 
     ordered = df.sort_values(TIMESTAMP_COLUMN, kind="mergesort").reset_index(drop=True)
     split_idx = int(len(ordered) * (1.0 - validation_fraction))
@@ -570,24 +545,6 @@ def split_by_time(df: pd.DataFrame, validation_fraction: float) -> SplitResult:
     valid_df = ordered.iloc[split_idx:].copy()
     cutoff_ts = valid_df[TIMESTAMP_COLUMN].iloc[0]
     return SplitResult(train_df=train_df, valid_df=valid_df, cutoff_ts=cutoff_ts)
-
-
-def split_by_cutoff(df: pd.DataFrame, cutoff_ts: pd.Timestamp) -> SplitResult:
-    if TIMESTAMP_COLUMN not in df.columns:
-        raise ValueError(f"{TIMESTAMP_COLUMN} is required for split_by_cutoff")
-    ordered = df.sort_values(TIMESTAMP_COLUMN, kind="mergesort").reset_index(drop=True)
-    cutoff = pd.Timestamp(cutoff_ts)
-    if cutoff.tzinfo is None:
-        cutoff = cutoff.tz_localize("UTC")
-    else:
-        cutoff = cutoff.tz_convert("UTC")
-    train_df = ordered[ordered[TIMESTAMP_COLUMN] < cutoff].copy()
-    valid_df = ordered[ordered[TIMESTAMP_COLUMN] >= cutoff].copy()
-    if train_df.empty or valid_df.empty:
-        raise ValueError(
-            f"split_by_cutoff produced empty partitions: train_rows={len(train_df)}, valid_rows={len(valid_df)}, cutoff_ts={cutoff}"
-        )
-    return SplitResult(train_df=train_df.reset_index(drop=True), valid_df=valid_df.reset_index(drop=True), cutoff_ts=cutoff)
 
 
 def sample_validation_frame(
@@ -898,8 +855,8 @@ def build_contract_summary(
     run_id: str | None = None,
     cutoff_ts: object | None = None,
     created_ts: datetime | None = None,
-    model_family: str = MODEL_FAMILY,
-    inference_runtime: str = INFERENCE_RUNTIME,
+    model_family: str = DEFAULT_MODEL_FAMILY,
+    inference_runtime: str = DEFAULT_INFERENCE_RUNTIME,
     extra: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     feature_spec = build_feature_spec()
@@ -919,7 +876,8 @@ def build_contract_summary(
         "model_family": model_family,
         "inference_runtime": inference_runtime,
         "output_columns_json": json.dumps(
-            [row["name"] for row in feature_spec["output_columns"]], separators=(",", ":")
+            [row["name"] for row in cast(list[dict[str, object]], feature_spec["output_columns"])],
+            separators=(",", ":"),
         ),
         "feature_spec_json": json.dumps(feature_spec, sort_keys=True, separators=(",", ":"), default=_json_default),
         "encoding_spec_json": json.dumps(encoding_spec, sort_keys=True, separators=(",", ":"), default=_json_default),
@@ -973,19 +931,19 @@ def build_quality_report(
     return report
 
 
-def best_lightgbm_params(seed: int = LIGHTGBM_SEED) -> dict[str, object]:
+def best_lightgbm_params(seed: int = DEFAULT_RANDOM_SEED) -> dict[str, object]:
     return {
         "objective": "regression",
         "metric": ["l1", "rmse"],
         "boosting_type": "gbdt",
-        "learning_rate": LIGHTGBM_LEARNING_RATE,
-        "num_leaves": LIGHTGBM_NUM_LEAVES,
-        "min_child_samples": LIGHTGBM_MIN_CHILD_SAMPLES,
-        "feature_fraction": LIGHTGBM_FEATURE_FRACTION,
-        "bagging_fraction": LIGHTGBM_BAGGING_FRACTION,
-        "bagging_freq": LIGHTGBM_BAGGING_FREQ,
-        "lambda_l1": LIGHTGBM_L1,
-        "lambda_l2": LIGHTGBM_L2,
+        "learning_rate": 0.05,
+        "num_leaves": 63,
+        "min_child_samples": 20,
+        "feature_fraction": 0.90,
+        "bagging_fraction": 0.90,
+        "bagging_freq": 1,
+        "lambda_l1": 0.0,
+        "lambda_l2": 0.0,
         "verbosity": -1,
         "seed": int(seed),
         "feature_fraction_seed": int(seed),
@@ -1008,7 +966,7 @@ def train_lightgbm_model(
     *,
     num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
     early_stopping_rounds: int = DEFAULT_EARLY_STOPPING_ROUNDS,
-    seed: int = LIGHTGBM_SEED,
+    seed: int = DEFAULT_RANDOM_SEED,
 ) -> tuple[object, dict[str, float], dict[str, object]]:
     import lightgbm as lgb
 
@@ -1059,20 +1017,6 @@ def train_lightgbm_model(
     return booster, metrics, extras
 
 
-def write_parquet_frame_to_uri(df: pd.DataFrame, uri: str) -> str:
-    _filesystem, path = filesystem_and_path(uri)
-    if uri.startswith("s3://"):
-        with tempfile.TemporaryDirectory(prefix="parquet_upload_") as tmpdir:
-            tmp_path = Path(tmpdir) / "frame.parquet"
-            df.to_parquet(tmp_path, index=False)
-            return upload_file_to_uri(tmp_path, uri)
-
-    local_path = Path(path)
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(local_path, index=False)
-    return uri
-
-
 def persist_training_artifacts(
     *,
     run_id: str,
@@ -1084,7 +1028,7 @@ def persist_training_artifacts(
     num_boost_round: int,
     early_stopping_rounds: int,
     validation_fraction: float,
-    artifact_root_s3: str | None = None,
+    artifact_root_s3: str,
     validation_sample_rows: int = 2048,
     quality_report: Mapping[str, object] | None = None,
     best_config: Mapping[str, object] | None = None,
@@ -1097,10 +1041,9 @@ def persist_training_artifacts(
     label_spec = build_label_spec()
     schema_hash = build_schema_hash(feature_spec)
 
-    artifact_root_base = (artifact_root_s3 or ARTIFACT_ROOT_S3).rstrip("/")
-    artifact_root = artifact_uri_join(artifact_root_base, run_id)
-
-    best_iteration = int((runtime_config or {}).get("best_iteration", 0) or 0)
+    artifact_root = artifact_root_s3.rstrip("/")
+    runtime_payload: dict[str, object] = dict(runtime_config or {})
+    best_iteration = int(runtime_payload.get("best_iteration", 0) or 0)
 
     outputs: dict[str, object] = {
         "run_id": run_id,
@@ -1132,12 +1075,13 @@ def persist_training_artifacts(
 
         validation_sample = split.valid_df.sample(
             n=min(validation_sample_rows, len(split.valid_df)),
-            random_state=LIGHTGBM_SEED,
+            random_state=DEFAULT_RANDOM_SEED,
         ).copy()
         validation_sample = validation_sample.sort_values(TIMESTAMP_COLUMN, kind="mergesort").reset_index(drop=True)
 
-        if quality_report is None:
-            quality_payload = build_quality_report(
+        quality_payload = dict(
+            quality_report
+            or build_quality_report(
                 canonical_df,
                 split=split,
                 validation_mode=VALIDATION_MODE,
@@ -1145,26 +1089,34 @@ def persist_training_artifacts(
                 validation_sample_max_rows=VALIDATION_SAMPLE_MAX_ROWS,
                 random_seed=DEFAULT_RANDOM_SEED,
             )
-        else:
-            quality_payload = dict(quality_report)
+        )
+        quality_payload.update(
+            {
+                "run_id": run_id,
+                "dataset_uri": dataset_uri,
+                "schema_hash": schema_hash,
+                "feature_version": feature_spec["feature_version"],
+                "schema_version": feature_spec["schema_version"],
+            }
+        )
 
-        quality_payload.setdefault("run_id", run_id)
-        quality_payload.setdefault("dataset_uri", dataset_uri)
-        quality_payload.setdefault("schema_hash", schema_hash)
-        quality_payload.setdefault("feature_version", feature_spec["feature_version"])
-        quality_payload.setdefault("schema_version", feature_spec["schema_version"])
+        runtime_payload.update(
+            {
+                "run_id": run_id,
+                "dataset_uri": dataset_uri,
+                "validation_fraction": validation_fraction,
+                "train_rows": len(split.train_df),
+                "valid_rows": len(split.valid_df),
+                "cutoff_ts": split.cutoff_ts,
+                "best_iteration": best_iteration,
+                "schema_hash": schema_hash,
+                "model_family": DEFAULT_MODEL_FAMILY,
+                "inference_runtime": DEFAULT_INFERENCE_RUNTIME,
+                "train_profile": runtime_payload.get("train_profile", DEFAULT_TRAIN_PROFILE),
+            }
+        )
 
-        runtime_payload: dict[str, object] = dict(runtime_config or {})
-        runtime_payload.setdefault("run_id", run_id)
-        runtime_payload.setdefault("dataset_uri", dataset_uri)
-        runtime_payload.setdefault("validation_fraction", validation_fraction)
-        runtime_payload.setdefault("train_rows", len(split.train_df))
-        runtime_payload.setdefault("valid_rows", len(split.valid_df))
-        runtime_payload.setdefault("cutoff_ts", split.cutoff_ts)
-        runtime_payload.setdefault("best_iteration", best_iteration)
-        runtime_payload.setdefault("schema_hash", schema_hash)
-
-        contract = build_contract_summary(
+        manifest = build_contract_summary(
             dataset_uri=dataset_uri,
             row_count=len(canonical_df),
             dataframe=canonical_df,
@@ -1182,53 +1134,48 @@ def persist_training_artifacts(
                 "schema_version": feature_spec["schema_version"],
                 "schema_hash": schema_hash,
                 "best_iteration": best_iteration,
+                "num_boost_round": num_boost_round,
+                "early_stopping_rounds": early_stopping_rounds,
+                "train_profile": runtime_payload["train_profile"],
             },
         )
-
-        manifest = {
-            "run_id": run_id,
-            "dataset_uri": dataset_uri,
-            "artifact_root_s3": artifact_root,
-            "feature_version": feature_spec["feature_version"],
-            "schema_version": feature_spec["schema_version"],
-            "schema_hash": schema_hash,
-            "gold_table": GOLD_TRAINING_TABLE,
-            "source_silver_table": SOURCE_SILVER_TABLE,
-            "model_family": MODEL_FAMILY,
-            "inference_runtime": INFERENCE_RUNTIME,
-            "cutoff_ts": split.cutoff_ts,
-            "train_rows": len(split.train_df),
-            "valid_rows": len(split.valid_df),
-            "metrics": dict(metrics),
-            "best_iteration": best_iteration,
-            "feature_columns": list(FEATURE_COLUMNS),
-            "categorical_features": list(CATEGORICAL_FEATURES),
-            "label_column": LABEL_COLUMN,
-            "timestamp_column": TIMESTAMP_COLUMN,
-        }
+        manifest["metrics"] = dict(metrics)
 
         best_config_payload = dict(best_config or {})
-        best_config_payload.setdefault("source", "direct_lightgbm")
-        best_config_payload.setdefault("seed", LIGHTGBM_SEED)
-        best_config_payload.setdefault("model_family", MODEL_FAMILY)
-        best_config_payload.setdefault("inference_runtime", INFERENCE_RUNTIME)
-        best_config_payload.setdefault("feature_columns", list(FEATURE_COLUMNS))
-        best_config_payload.setdefault("categorical_features", list(CATEGORICAL_FEATURES))
-        best_config_payload.setdefault("label_column", LABEL_COLUMN)
-        best_config_payload.setdefault("timestamp_column", TIMESTAMP_COLUMN)
+        best_config_payload.update(
+            {
+                "source": "direct_lightgbm",
+                "seed": DEFAULT_RANDOM_SEED,
+                "model_family": DEFAULT_MODEL_FAMILY,
+                "inference_runtime": DEFAULT_INFERENCE_RUNTIME,
+                "feature_columns": list(FEATURE_COLUMNS),
+                "categorical_features": list(CATEGORICAL_FEATURES),
+                "label_column": LABEL_COLUMN,
+                "timestamp_column": TIMESTAMP_COLUMN,
+            }
+        )
 
         lightgbm_params_payload = dict(lightgbm_params or best_lightgbm_params())
-        lightgbm_params_payload.setdefault("seed", LIGHTGBM_SEED)
+        lightgbm_params_payload.setdefault("seed", DEFAULT_RANDOM_SEED)
 
         write_bytes_uri(model_path.read_bytes(), str(outputs["model_uri"]))
         write_parquet_frame_to_uri(validation_sample, str(outputs["validation_sample_uri"]))
         write_json_uri(dict(metrics), str(outputs["metrics_uri"]))
-        write_json_uri(contract, str(outputs["contract_uri"]))
+        write_json_uri(manifest, str(outputs["manifest_uri"]))
+        write_json_uri(
+            build_contract_summary(
+                dataset_uri=dataset_uri,
+                row_count=len(canonical_df),
+                dataframe=canonical_df,
+                run_id=run_id,
+                cutoff_ts=split.cutoff_ts,
+            ),
+            str(outputs["contract_uri"]),
+        )
         write_json_uri(feature_spec, str(outputs["feature_spec_uri"]))
         write_json_uri(encoding_spec, str(outputs["encoding_spec_uri"]))
         write_json_uri(aggregate_spec, str(outputs["aggregate_spec_uri"]))
         write_json_uri(label_spec, str(outputs["label_spec_uri"]))
-        write_json_uri(manifest, str(outputs["manifest_uri"]))
         write_json_uri(quality_payload, str(outputs["quality_report_uri"]))
         write_json_uri(best_config_payload, str(outputs["best_config_uri"]))
         write_json_uri(lightgbm_params_payload, str(outputs["lightgbm_params_uri"]))
@@ -1237,6 +1184,7 @@ def persist_training_artifacts(
             {
                 "run_id": run_id,
                 "dataset_uri": dataset_uri,
+                "artifact_root_s3": artifact_root,
                 "cutoff_ts": split.cutoff_ts,
                 "train_rows": len(split.train_df),
                 "valid_rows": len(split.valid_df),
@@ -1244,24 +1192,41 @@ def persist_training_artifacts(
                 "validation_mode": VALIDATION_MODE,
                 "validation_sample_fraction": VALIDATION_SAMPLE_FRACTION,
                 "validation_sample_max_rows": VALIDATION_SAMPLE_MAX_ROWS,
-                "metrics": dict(metrics),
-                "artifact_root_s3": artifact_root,
+                "best_iteration": best_iteration,
+                "current_iteration": int(runtime_payload.get("current_iteration", 0) or 0),
+                "num_boost_round": num_boost_round,
+                "early_stopping_rounds": early_stopping_rounds,
                 "schema_hash": schema_hash,
                 "feature_version": feature_spec["feature_version"],
                 "schema_version": feature_spec["schema_version"],
+                "model_family": DEFAULT_MODEL_FAMILY,
+                "inference_runtime": DEFAULT_INFERENCE_RUNTIME,
+                "train_profile": runtime_payload["train_profile"],
             },
             str(outputs["training_summary_uri"]),
         )
 
-    outputs["contract"] = contract
-    outputs["manifest"] = manifest
-    outputs["quality_report"] = quality_payload
-    outputs["runtime_config"] = runtime_payload
-    outputs["schema_hash"] = schema_hash
-    outputs["feature_version"] = feature_spec["feature_version"]
-    outputs["schema_version"] = feature_spec["schema_version"]
+    outputs.update(
+        {
+            "schema_hash": schema_hash,
+            "feature_version": feature_spec["feature_version"],
+            "schema_version": feature_spec["schema_version"],
+            "gold_table": GOLD_TRAINING_TABLE,
+            "source_silver_table": SOURCE_SILVER_TABLE,
+            "model_family": DEFAULT_MODEL_FAMILY,
+            "inference_runtime": DEFAULT_INFERENCE_RUNTIME,
+            "train_profile": runtime_payload["train_profile"],
+            "validation_fraction": validation_fraction,
+            "validation_mode": VALIDATION_MODE,
+            "validation_sample_fraction": VALIDATION_SAMPLE_FRACTION,
+            "validation_sample_max_rows": VALIDATION_SAMPLE_MAX_ROWS,
+            "train_rows": len(split.train_df),
+            "valid_rows": len(split.valid_df),
+            "cutoff_ts": split.cutoff_ts,
+            "best_iteration": best_iteration,
+            "current_iteration": int(runtime_payload.get("current_iteration", 0) or 0),
+            "num_boost_round": num_boost_round,
+            "early_stopping_rounds": early_stopping_rounds,
+        }
+    )
     return outputs
-
-
-def build_run_id() -> str:
-    return make_run_id()

@@ -72,9 +72,9 @@ log "pushing image to GHCR"
 docker push "${FULL_IMAGE}"
 
 echo
-echo "========================================"
-echo "MLFLOW IMAGE PUSHED SUCCESSFULLY"
-echo "========================================"
+echo "=================================================================="
+echo "MLFLOW IMAGE PUSHED SUCCESSFULLY. ENSURE PUBLIC VISIBILITY"
+echo "=================================================================="
 echo "Image:"
 echo "  ${FULL_IMAGE}"
 echo

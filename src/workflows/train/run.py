@@ -27,78 +27,78 @@ TRAIN_ROOT = SRC_ROOT / "workflows" / "train"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-REMOTE_PROJECT = os.environ.get("REMOTE_PROJECT", "flytesnacks")
-REMOTE_DOMAIN = os.environ.get("REMOTE_DOMAIN", "development")
-TASK_NAMESPACE = os.environ.get("TRAIN_NAMESPACE", f"{REMOTE_PROJECT}-{REMOTE_DOMAIN}")
 
-K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "kind").strip().lower()
-TRAIN_PROFILE = (
-    os.environ.get(
-        "TRAIN_PROFILE",
-        os.environ.get(
-            "ELT_PROFILE",
-            "staging" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod",
-        ),
-    )
-    .strip()
-    .lower()
-)
+def _env_str(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    return _env_str(name, default).lower() in {"1", "true", "yes", "y", "on"}
+
+
+REMOTE_PROJECT = _env_str("REMOTE_PROJECT", "flytesnacks")
+REMOTE_DOMAIN = _env_str("REMOTE_DOMAIN", "development")
+TASK_NAMESPACE = _env_str("TRAIN_NAMESPACE", f"{REMOTE_PROJECT}-{REMOTE_DOMAIN}")
+
+K8S_CLUSTER = _env_str("K8S_CLUSTER", "kind").lower()
+
+TRAIN_PROFILE = _env_str(
+    "TRAIN_PROFILE",
+    _env_str(
+        "ELT_PROFILE",
+        "staging" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod",
+    ),
+).lower()
+
 if TRAIN_PROFILE not in {"staging", "prod"}:
     raise RuntimeError(f"TRAIN_PROFILE must be 'staging' or 'prod', got {TRAIN_PROFILE!r}")
 
-TRAIN_SERVICE_ACCOUNT = os.environ.get("TRAIN_SERVICE_ACCOUNT", "ray").strip() or "ray"
+TRAIN_SERVICE_ACCOUNT = _env_str("TRAIN_SERVICE_ACCOUNT", "ray") or "ray"
 
-TRAIN_TASK_IMAGE = os.environ.get(
-    "TRAIN_TASK_IMAGE",
-    "ghcr.io/athithya-sakthivel/flyte-train-task:2026-04-02-18-25--8c422fa@sha256:776a608b821af5af295e593dd8736681d11552cc542510b0a5aa300712ca9fc1",
-).strip()
+TRAIN_TASK_IMAGE = os.environ.get("TRAIN_TASK_IMAGE")
 if not TRAIN_TASK_IMAGE:
-    raise RuntimeError(
-        "TRAIN_TASK_IMAGE must not be empty. Set it to the container image that includes the train task runtime."
-    )
-
-os.environ["TRAIN_TASK_IMAGE"] = TRAIN_TASK_IMAGE
-
+    raise RuntimeError("TRAIN_TASK_IMAGE environment variable must be set and non-empty")
+    
 WORKFLOW_SOURCE_FILE = SRC_ROOT / "workflows" / "train" / "launch_plans.py"
 WORKFLOW_SOURCE_REL = WORKFLOW_SOURCE_FILE.relative_to(SRC_ROOT)
-WORKFLOW_IMPORT_MODULE = os.environ.get("WORKFLOW_IMPORT_MODULE", "workflows.train.launch_plans")
+WORKFLOW_IMPORT_MODULE = _env_str("WORKFLOW_IMPORT_MODULE", "workflows.train.launch_plans")
 
-USE_PORT_FORWARD = os.environ.get("USE_PORT_FORWARD", "1").lower() in {"1", "true", "yes", "y", "on"}
-FLYTE_ADMIN_NAMESPACE = os.environ.get("FLYTE_ADMIN_NAMESPACE", "flyte")
-FLYTE_ADMIN_HOST = os.environ.get("FLYTE_ADMIN_HOST", "127.0.0.1")
-FLYTE_ADMIN_PORT = int(os.environ.get("FLYTE_ADMIN_PORT", "30081"))
-PORT_FORWARD_TARGET_PORT = int(os.environ.get("PORT_FORWARD_TARGET_PORT", "81"))
-PORT_FORWARD_PID_FILE = Path(os.environ.get("PORT_FORWARD_PID_FILE", "/tmp/flyteadmin-portforward-train.pid"))
-PORT_FORWARD_LOG = Path(os.environ.get("PORT_FORWARD_LOG", "/tmp/flyteadmin-portforward-train.log"))
+USE_PORT_FORWARD = _env_bool("USE_PORT_FORWARD", "1")
+FLYTE_ADMIN_NAMESPACE = _env_str("FLYTE_ADMIN_NAMESPACE", "flyte")
+FLYTE_ADMIN_HOST = _env_str("FLYTE_ADMIN_HOST", "127.0.0.1")
+FLYTE_ADMIN_PORT = int(_env_str("FLYTE_ADMIN_PORT", "30081"))
+PORT_FORWARD_TARGET_PORT = int(_env_str("PORT_FORWARD_TARGET_PORT", "81"))
+PORT_FORWARD_PID_FILE = Path(_env_str("PORT_FORWARD_PID_FILE", "/tmp/flyteadmin-portforward-train.pid"))
+PORT_FORWARD_LOG = Path(_env_str("PORT_FORWARD_LOG", "/tmp/flyteadmin-portforward-train.log"))
 
 PORT_FORWARD_PROC: subprocess.Popen[str] | None = None
 
-ACTIVATE_LAUNCHPLANS = os.environ.get("ACTIVATE_LAUNCHPLANS", "0").lower() in {"1", "true", "yes", "y", "on"}
-USE_LATEST = os.environ.get("USE_LATEST", "0").lower() in {"1", "true", "yes", "y", "on"}
+ACTIVATE_LAUNCHPLANS = _env_bool("ACTIVATE_LAUNCHPLANS", "0")
+USE_LATEST = _env_bool("USE_LATEST", "0")
 
-PYFLYTE_REGISTER_EXTRA_ARGS = os.environ.get("PYFLYTE_REGISTER_EXTRA_ARGS", "").strip()
+PYFLYTE_REGISTER_EXTRA_ARGS = _env_str("PYFLYTE_REGISTER_EXTRA_ARGS", "")
 
-RESOURCE_QUOTA_NAME = os.environ.get("TRAIN_RESOURCE_QUOTA_NAME", "ray-workload-quota")
+RESOURCE_QUOTA_NAME = _env_str("TRAIN_RESOURCE_QUOTA_NAME", "ray-workload-quota")
 
-RESOURCE_QUOTA_KIND_REQUESTS_CPU = os.environ.get("TRAIN_RESOURCE_QUOTA_KIND_REQUESTS_CPU", "8")
-RESOURCE_QUOTA_KIND_REQUESTS_MEMORY = os.environ.get("TRAIN_RESOURCE_QUOTA_KIND_REQUESTS_MEMORY", "16Gi")
-RESOURCE_QUOTA_KIND_LIMITS_CPU = os.environ.get("TRAIN_RESOURCE_QUOTA_KIND_LIMITS_CPU", "16")
-RESOURCE_QUOTA_KIND_LIMITS_MEMORY = os.environ.get("TRAIN_RESOURCE_QUOTA_KIND_LIMITS_MEMORY", "24Gi")
-RESOURCE_QUOTA_KIND_PODS = os.environ.get("TRAIN_RESOURCE_QUOTA_KIND_PODS", "60")
-RESOURCE_QUOTA_KIND_PVC = os.environ.get("TRAIN_RESOURCE_QUOTA_KIND_PVC", "40")
-RESOURCE_QUOTA_KIND_SERVICES = os.environ.get("TRAIN_RESOURCE_QUOTA_KIND_SERVICES", "50")
+RESOURCE_QUOTA_KIND_REQUESTS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_KIND_REQUESTS_CPU", "8")
+RESOURCE_QUOTA_KIND_REQUESTS_MEMORY = _env_str("TRAIN_RESOURCE_QUOTA_KIND_REQUESTS_MEMORY", "16Gi")
+RESOURCE_QUOTA_KIND_LIMITS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_KIND_LIMITS_CPU", "16")
+RESOURCE_QUOTA_KIND_LIMITS_MEMORY = _env_str("TRAIN_RESOURCE_QUOTA_KIND_LIMITS_MEMORY", "24Gi")
+RESOURCE_QUOTA_KIND_PODS = _env_str("TRAIN_RESOURCE_QUOTA_KIND_PODS", "60")
+RESOURCE_QUOTA_KIND_PVC = _env_str("TRAIN_RESOURCE_QUOTA_KIND_PVC", "40")
+RESOURCE_QUOTA_KIND_SERVICES = _env_str("TRAIN_RESOURCE_QUOTA_KIND_SERVICES", "50")
 
-RESOURCE_QUOTA_EKS_REQUESTS_CPU = os.environ.get("TRAIN_RESOURCE_QUOTA_EKS_REQUESTS_CPU", "24")
-RESOURCE_QUOTA_EKS_REQUESTS_MEMORY = os.environ.get("TRAIN_RESOURCE_QUOTA_EKS_REQUESTS_MEMORY", "48Gi")
-RESOURCE_QUOTA_EKS_LIMITS_CPU = os.environ.get("TRAIN_RESOURCE_QUOTA_EKS_LIMITS_CPU", "48")
-RESOURCE_QUOTA_EKS_LIMITS_MEMORY = os.environ.get("TRAIN_RESOURCE_QUOTA_EKS_LIMITS_MEMORY", "96Gi")
-RESOURCE_QUOTA_EKS_PODS = os.environ.get("TRAIN_RESOURCE_QUOTA_EKS_PODS", "150")
-RESOURCE_QUOTA_EKS_PVC = os.environ.get("TRAIN_RESOURCE_QUOTA_EKS_PVC", "80")
-RESOURCE_QUOTA_EKS_SERVICES = os.environ.get("TRAIN_RESOURCE_QUOTA_EKS_SERVICES", "150")
+RESOURCE_QUOTA_EKS_REQUESTS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_EKS_REQUESTS_CPU", "24")
+RESOURCE_QUOTA_EKS_REQUESTS_MEMORY = _env_str("TRAIN_RESOURCE_QUOTA_EKS_REQUESTS_MEMORY", "48Gi")
+RESOURCE_QUOTA_EKS_LIMITS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_EKS_LIMITS_CPU", "48")
+RESOURCE_QUOTA_EKS_LIMITS_MEMORY = _env_str("TRAIN_RESOURCE_QUOTA_EKS_LIMITS_MEMORY", "96Gi")
+RESOURCE_QUOTA_EKS_PODS = _env_str("TRAIN_RESOURCE_QUOTA_EKS_PODS", "150")
+RESOURCE_QUOTA_EKS_PVC = _env_str("TRAIN_RESOURCE_QUOTA_EKS_PVC", "80")
+RESOURCE_QUOTA_EKS_SERVICES = _env_str("TRAIN_RESOURCE_QUOTA_EKS_SERVICES", "150")
 
 
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}", file=sys.stderr)
+    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}", file=sys.stderr, flush=True)
 
 
 def fatal(msg: str) -> NoReturn:
@@ -247,6 +247,7 @@ def start_port_forward() -> None:
             tail = "\n".join(tail_lines)
         except Exception:
             tail = ""
+
     stop_port_forward_if_any()
     if tail:
         fatal(f"flyteadmin port-forward did not become ready\n{tail}")

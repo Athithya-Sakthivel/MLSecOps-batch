@@ -1,20 +1,15 @@
-# src/workflows/train/tasks/evaluate_register.py
 from __future__ import annotations
 
-import os
-from collections.abc import Mapping
-
-from flytekit import Resources, task, workflow
+from flytekit import Resources, task
 
 from workflows.train.tasks.evaluate_register_helpers import (
     DEFAULT_MLFLOW_EXPERIMENT,
     DEFAULT_ONNX_OPSET,
     DEFAULT_RANDOM_SEED,
-    DEFAULT_VALIDATION_FRACTION,
-    REGISTERED_MODEL_NAME,
+    DEFAULT_REGISTERED_MODEL_NAME,
+    DEFAULT_TRAIN_PROFILE,
     build_evaluation_context,
     build_registry_payload,
-    build_task_environment,
     evaluate_model_from_context,
     evaluation_output_uris,
     export_onnx_and_parity_from_context,
@@ -23,64 +18,66 @@ from workflows.train.tasks.evaluate_register_helpers import (
     log_json,
     write_json_uri,
 )
+from workflows.train.tasks.train_pipeline_helpers import DEFAULT_MODEL_FAMILY
 
-EVALUATE_REGISTER_TASK_CPU = os.environ.get("EVALUATE_REGISTER_TASK_CPU", "500m")
-EVALUATE_REGISTER_TASK_MEM = os.environ.get("EVALUATE_REGISTER_TASK_MEM", "768Mi")
-EVALUATE_REGISTER_TASK_RETRIES = int(os.environ.get("EVALUATE_REGISTER_TASK_RETRIES", "1"))
+EVALUATE_REGISTER_LIMITS = Resources(cpu="500m", mem="768Mi")
 
 
-def _stringify_bundle(payload: Mapping[str, object]) -> dict[str, str]:
+def _stringify_bundle(payload: dict[str, object]) -> dict[str, str]:
     return {str(key): "" if value is None else str(value) for key, value in payload.items()}
 
 
 @task(
     cache=False,
-    environment=build_task_environment(),
-    retries=EVALUATE_REGISTER_TASK_RETRIES,
-    limits=Resources(cpu=EVALUATE_REGISTER_TASK_CPU, mem=EVALUATE_REGISTER_TASK_MEM),
+    retries=1,
+    limits=EVALUATE_REGISTER_LIMITS,
 )
 def evaluate_register(
-    training_bundle: dict[str, str],
-    gold_dataset_uri: str,
-    validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
+    train_bundle: dict[str, str],
+    registered_model_name: str = DEFAULT_REGISTERED_MODEL_NAME,
+    model_family: str = DEFAULT_MODEL_FAMILY,
+    train_profile: str = DEFAULT_TRAIN_PROFILE,
+    mlflow_experiment_name: str = DEFAULT_MLFLOW_EXPERIMENT,
+    mlflow_tracking_uri: str = "",
     onnx_opset: int = DEFAULT_ONNX_OPSET,
     validation_sample_rows: int = 2048,
     random_seed: int = DEFAULT_RANDOM_SEED,
-    registered_model_name: str = REGISTERED_MODEL_NAME,
-    mlflow_experiment_name: str = DEFAULT_MLFLOW_EXPERIMENT,
-    mlflow_tracking_uri: str = os.environ.get("MLFLOW_TRACKING_URI", "").strip(),
 ) -> dict[str, str]:
-    """
-    Evaluate the trained model, export ONNX, and register the final model in MLflow.
+    if not registered_model_name.strip():
+        raise ValueError("registered_model_name must not be empty")
+    if model_family != DEFAULT_MODEL_FAMILY:
+        raise ValueError(f"Unsupported model_family={model_family!r}; expected {DEFAULT_MODEL_FAMILY!r}")
+    if train_profile not in {"staging", "prod"}:
+        raise ValueError("train_profile must be 'staging' or 'prod'")
+    if onnx_opset <= 0:
+        raise ValueError("onnx_opset must be > 0")
+    if validation_sample_rows <= 0:
+        raise ValueError("validation_sample_rows must be > 0")
 
-    Expects the string-only bundle returned by train_pipeline.
-    """
-    normalized_bundle = load_training_bundle(training_bundle)
+    normalized_bundle = load_training_bundle(train_bundle)
+    if str(normalized_bundle["model_family"]) != model_family:
+        raise ValueError("train_bundle model_family does not match the requested model_family")
+    if str(normalized_bundle["train_profile"]) != train_profile:
+        raise ValueError("train_bundle train_profile does not match the requested train_profile")
 
     log_json(
         msg="evaluate_register_start",
         run_id=normalized_bundle["run_id"],
-        gold_dataset_uri=gold_dataset_uri,
-        validation_fraction=validation_fraction,
-        onnx_opset=onnx_opset,
-        validation_sample_rows=validation_sample_rows,
-        random_seed=random_seed,
-        registered_model_name=registered_model_name,
-        mlflow_experiment_name=mlflow_experiment_name,
-        mlflow_tracking_uri=mlflow_tracking_uri,
         schema_hash=normalized_bundle["schema_hash"],
         feature_version=normalized_bundle["feature_version"],
         schema_version=normalized_bundle["schema_version"],
+        registered_model_name=registered_model_name,
+        model_family=model_family,
+        train_profile=train_profile,
+        mlflow_experiment_name=mlflow_experiment_name,
+        mlflow_tracking_uri=mlflow_tracking_uri,
     )
 
     context = build_evaluation_context(
         normalized_bundle,
-        gold_dataset_uri,
-        validation_fraction=validation_fraction,
-        random_seed=random_seed,
         validation_sample_rows=validation_sample_rows,
+        random_seed=random_seed,
     )
-
     evaluation_metrics = evaluate_model_from_context(context)
     onnx_bundle = export_onnx_and_parity_from_context(
         context,
@@ -91,7 +88,12 @@ def evaluate_register(
     )
 
     output_uris = evaluation_output_uris(normalized_bundle)
-    registry_payload = build_registry_payload(normalized_bundle, onnx_bundle)
+    registry_payload = build_registry_payload(
+        normalized_bundle,
+        onnx_bundle,
+        registered_model_name=registered_model_name,
+        mlflow_experiment_name=mlflow_experiment_name,
+    )
     write_json_uri(registry_payload, output_uris["registry_payload_uri"])
 
     mlflow_bundle = log_and_register_mlflow(
@@ -104,52 +106,37 @@ def evaluate_register(
 
     result: dict[str, object] = {
         **normalized_bundle,
-        **onnx_bundle,
-        **mlflow_bundle,
+        "evaluation_artifact_root_s3": output_uris["evaluation_artifact_root_s3"],
+        "evaluation_metrics_uri": output_uris["evaluation_metrics_uri"],
+        "evaluation_summary_uri": output_uris["evaluation_summary_uri"],
+        "onnx_uri": output_uris["onnx_uri"],
+        "onnx_manifest_uri": output_uris["onnx_manifest_uri"],
+        "onnx_parity_uri": output_uris["onnx_parity_uri"],
         "registry_payload_uri": output_uris["registry_payload_uri"],
-        "evaluation_metrics": evaluation_metrics,
-        "registry_payload": registry_payload,
+        "mlflow_tracking_uri": mlflow_bundle["mlflow_tracking_uri"],
+        "mlflow_experiment_name": mlflow_bundle["mlflow_experiment_name"],
+        "mlflow_run_id": mlflow_bundle["mlflow_run_id"],
+        "registered_model_name": mlflow_bundle["registered_model_name"],
+        "registered_model_version": mlflow_bundle["registered_model_version"],
+        "registered_model_source_uri": mlflow_bundle["registered_model_source_uri"],
+        "schema_hash": mlflow_bundle["schema_hash"],
+        "feature_version": mlflow_bundle["feature_version"],
+        "schema_version": mlflow_bundle["schema_version"],
+        "gold_table": mlflow_bundle["gold_table"],
+        "source_silver_table": mlflow_bundle["source_silver_table"],
+        "train_cutoff_ts": mlflow_bundle["train_cutoff_ts"],
     }
 
     log_json(
         msg="evaluate_register_success",
         run_id=normalized_bundle["run_id"],
-        registered_model_name=mlflow_bundle.get("registered_model_name", registered_model_name),
-        registered_model_version=mlflow_bundle.get("registered_model_version", ""),
-        mlflow_run_id=mlflow_bundle.get("mlflow_run_id", ""),
-        onnx_uri=onnx_bundle["onnx_uri"],
-        onnx_manifest_uri=onnx_bundle["onnx_manifest_uri"],
-        onnx_parity_uri=onnx_bundle["onnx_parity_uri"],
-        evaluation_metrics_uri=onnx_bundle["evaluation_metrics_uri"],
-        evaluation_summary_uri=onnx_bundle["evaluation_summary_uri"],
+        registered_model_name=mlflow_bundle["registered_model_name"],
+        registered_model_version=mlflow_bundle["registered_model_version"],
+        mlflow_run_id=mlflow_bundle["mlflow_run_id"],
+        evaluation_artifact_root_s3=output_uris["evaluation_artifact_root_s3"],
         registry_payload_uri=output_uris["registry_payload_uri"],
-        schema_hash=normalized_bundle["schema_hash"],
-        feature_version=normalized_bundle["feature_version"],
-        schema_version=normalized_bundle["schema_version"],
+        schema_hash=mlflow_bundle["schema_hash"],
+        feature_version=mlflow_bundle["feature_version"],
+        schema_version=mlflow_bundle["schema_version"],
     )
     return _stringify_bundle(result)
-
-
-@workflow
-def evaluate_register_workflow(
-    training_bundle: dict[str, str],
-    gold_dataset_uri: str,
-    validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
-    onnx_opset: int = DEFAULT_ONNX_OPSET,
-    validation_sample_rows: int = 2048,
-    random_seed: int = DEFAULT_RANDOM_SEED,
-    registered_model_name: str = REGISTERED_MODEL_NAME,
-    mlflow_experiment_name: str = DEFAULT_MLFLOW_EXPERIMENT,
-    mlflow_tracking_uri: str = os.environ.get("MLFLOW_TRACKING_URI", "").strip(),
-) -> dict[str, str]:
-    return evaluate_register(
-        training_bundle=training_bundle,
-        gold_dataset_uri=gold_dataset_uri,
-        validation_fraction=validation_fraction,
-        onnx_opset=onnx_opset,
-        validation_sample_rows=validation_sample_rows,
-        random_seed=random_seed,
-        registered_model_name=registered_model_name,
-        mlflow_experiment_name=mlflow_experiment_name,
-        mlflow_tracking_uri=mlflow_tracking_uri,
-    )

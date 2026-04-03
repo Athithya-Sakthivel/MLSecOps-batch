@@ -1,206 +1,163 @@
-# src/workflows/train/tasks/train_pipeline.py
 from __future__ import annotations
 
-import os
-
-from flytekit import Resources, task, workflow
+from flytekit import Resources, task
 
 from workflows.train.tasks.train_pipeline_helpers import (
-    ARTIFACT_ROOT_S3,
+    DEFAULT_ARTIFACT_ROOT_PREFIX,
     DEFAULT_EARLY_STOPPING_ROUNDS,
+    DEFAULT_MODEL_FAMILY,
     DEFAULT_NUM_BOOST_ROUND,
     DEFAULT_RANDOM_SEED,
+    DEFAULT_REGISTERED_MODEL_NAME,
+    DEFAULT_TRAIN_PROFILE,
     DEFAULT_VALIDATION_FRACTION,
-    FEATURE_COLUMNS,
-    GOLD_FEATURE_VERSION,
-    GOLD_SCHEMA_VERSION,
-    GOLD_TRAINING_TABLE,
     INFERENCE_RUNTIME,
-    LABEL_COLUMN,
-    MODEL_FAMILY,
-    SOURCE_SILVER_TABLE,
-    TIMESTAMP_COLUMN,
-    TRAIN_PROFILE,
-    VALIDATION_MODE,
-    VALIDATION_SAMPLE_FRACTION,
-    VALIDATION_SAMPLE_MAX_ROWS,
+    artifact_uri_join,
     build_quality_report,
-    build_run_id,
-    build_task_environment,
     load_gold_frame,
     log_json,
+    make_run_id,
     persist_training_artifacts,
     split_by_time,
     train_lightgbm_model,
     validate_and_canonicalize_gold_frame,
 )
 
-TRAIN_TASK_CPU = os.environ.get("TRAIN_TASK_CPU", "500m" if TRAIN_PROFILE == "staging" else "1000m")
-TRAIN_TASK_MEM = os.environ.get("TRAIN_TASK_MEM", "768Mi" if TRAIN_PROFILE == "staging" else "1024Mi")
-TRAIN_TASK_RETRIES = int(os.environ.get("TRAIN_TASK_RETRIES", "1"))
+TRAIN_TASK_LIMITS = Resources(cpu="500m", mem="768Mi")
 
 
-def _to_string_bundle(payload: dict[str, object]) -> dict[str, str]:
+def _stringify_bundle(payload: dict[str, object]) -> dict[str, str]:
     return {str(key): "" if value is None else str(value) for key, value in payload.items()}
+
+
+def _validate_non_empty(name: str, value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{name} must not be empty")
+    return cleaned
 
 
 @task(
     cache=False,
-    environment=build_task_environment(),
-    retries=TRAIN_TASK_RETRIES,
-    limits=Resources(cpu=TRAIN_TASK_CPU, mem=TRAIN_TASK_MEM),
+    retries=1,
+    limits=TRAIN_TASK_LIMITS,
 )
 def train_pipeline(
     dataset_uri: str,
+    s3_bucket: str,
+    artifact_root_prefix: str = DEFAULT_ARTIFACT_ROOT_PREFIX,
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
+    random_seed: int = DEFAULT_RANDOM_SEED,
     num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
     early_stopping_rounds: int = DEFAULT_EARLY_STOPPING_ROUNDS,
-    artifact_root_s3: str = ARTIFACT_ROOT_S3,
-    validation_mode: str = VALIDATION_MODE,
-    validation_sample_fraction: float = VALIDATION_SAMPLE_FRACTION,
-    validation_sample_max_rows: int = VALIDATION_SAMPLE_MAX_ROWS,
-    random_seed: int = DEFAULT_RANDOM_SEED,
+    model_family: str = DEFAULT_MODEL_FAMILY,
+    train_profile: str = DEFAULT_TRAIN_PROFILE,
 ) -> dict[str, str]:
-    """
-    Read Gold from Iceberg/S3, validate once, train once, and persist durable
-    artifacts to S3. The return value is a compact string-only manifest for the
-    downstream evaluation/register stage.
-    """
-    run_id = build_run_id()
+    dataset_uri = _validate_non_empty("dataset_uri", dataset_uri)
+    s3_bucket = _validate_non_empty("s3_bucket", s3_bucket)
+    artifact_root_prefix = _validate_non_empty("artifact_root_prefix", artifact_root_prefix)
+
+    if not 0.0 < validation_fraction < 0.5:
+        raise ValueError("validation_fraction must be > 0 and < 0.5")
+    if random_seed < 0:
+        raise ValueError("random_seed must be >= 0")
+    if num_boost_round <= 0:
+        raise ValueError("num_boost_round must be > 0")
+    if early_stopping_rounds <= 0:
+        raise ValueError("early_stopping_rounds must be > 0")
+    if model_family != DEFAULT_MODEL_FAMILY:
+        raise ValueError(f"Unsupported model_family={model_family!r}; expected {DEFAULT_MODEL_FAMILY!r}")
+    if train_profile not in {"staging", "prod"}:
+        raise ValueError("train_profile must be 'staging' or 'prod'")
+
+    run_id = make_run_id()
+    artifact_root_s3 = artifact_uri_join(f"s3://{s3_bucket}", artifact_root_prefix, run_id)
 
     log_json(
         msg="train_pipeline_start",
         run_id=run_id,
         dataset_uri=dataset_uri,
+        artifact_root_s3=artifact_root_s3,
         validation_fraction=validation_fraction,
+        random_seed=random_seed,
         num_boost_round=num_boost_round,
         early_stopping_rounds=early_stopping_rounds,
-        artifact_root_s3=artifact_root_s3,
-        validation_mode=validation_mode,
-        validation_sample_fraction=validation_sample_fraction,
-        validation_sample_max_rows=validation_sample_max_rows,
-        random_seed=random_seed,
-        train_profile=TRAIN_PROFILE,
-        gold_feature_version=GOLD_FEATURE_VERSION,
-        gold_schema_version=GOLD_SCHEMA_VERSION,
-        gold_training_table=GOLD_TRAINING_TABLE,
-        source_silver_table=SOURCE_SILVER_TABLE,
-        model_family=MODEL_FAMILY,
+        model_family=model_family,
+        train_profile=train_profile,
         inference_runtime=INFERENCE_RUNTIME,
     )
 
     raw_df = load_gold_frame(dataset_uri)
     canonical_df = validate_and_canonicalize_gold_frame(raw_df)
+    split_result = split_by_time(canonical_df, validation_fraction=validation_fraction)
 
-    if canonical_df.empty:
-        raise ValueError(f"Canonical Gold frame is empty for dataset_uri={dataset_uri}")
-
-    split = split_by_time(canonical_df, validation_fraction=validation_fraction)
-    if split.train_df.empty or split.valid_df.empty:
+    if split_result.train_df.empty or split_result.valid_df.empty:
         raise ValueError(
-            f"Chronological split produced empty partitions: "
-            f"train_rows={len(split.train_df)}, valid_rows={len(split.valid_df)}"
+            "Chronological split produced empty partitions: "
+            f"train_rows={len(split_result.train_df)}, valid_rows={len(split_result.valid_df)}"
         )
 
     quality_report = build_quality_report(
         canonical_df,
-        split=split,
-        validation_mode=validation_mode,
-        validation_sample_fraction=validation_sample_fraction,
-        validation_sample_max_rows=validation_sample_max_rows,
+        split=split_result,
+        validation_mode="sample",
+        validation_sample_fraction=0.10,
+        validation_sample_max_rows=100000,
         random_seed=random_seed,
     )
-
-    log_json(
-        msg="train_pipeline_split_ready",
-        run_id=run_id,
-        train_rows=len(split.train_df),
-        valid_rows=len(split.valid_df),
-        cutoff_ts=split.cutoff_ts,
-        validation_mode=validation_mode,
-    )
+    quality_report["train_profile"] = train_profile
 
     booster, metrics, trainer_meta = train_lightgbm_model(
-        split.train_df,
-        split.valid_df,
+        split_result.train_df,
+        split_result.valid_df,
         num_boost_round=num_boost_round,
         early_stopping_rounds=early_stopping_rounds,
         seed=random_seed,
     )
 
-    runtime_config: dict[str, object] = {
+    runtime_config = {
         "run_id": run_id,
         "dataset_uri": dataset_uri,
+        "artifact_root_s3": artifact_root_s3,
+        "validation_fraction": validation_fraction,
+        "random_seed": random_seed,
+        "num_boost_round": num_boost_round,
+        "early_stopping_rounds": early_stopping_rounds,
+        "train_profile": train_profile,
+        "model_family": model_family,
+        "inference_runtime": INFERENCE_RUNTIME,
+        "best_iteration": trainer_meta["best_iteration"],
+        "current_iteration": trainer_meta["current_iteration"],
+        "lightgbm_params": trainer_meta["lightgbm_params"],
+    }
+
+    best_config = {
+        "model_family": model_family,
+        "train_profile": train_profile,
+        "seed": random_seed,
         "validation_fraction": validation_fraction,
         "num_boost_round": num_boost_round,
         "early_stopping_rounds": early_stopping_rounds,
-        "random_seed": random_seed,
-        "train_rows": len(split.train_df),
-        "valid_rows": len(split.valid_df),
-        "cutoff_ts": split.cutoff_ts,
-        "best_iteration": trainer_meta.get("best_iteration", 0),
-        "current_iteration": trainer_meta.get("current_iteration", 0),
-        "lightgbm_params": trainer_meta.get("lightgbm_params", {}),
-        "validation_mode": validation_mode,
-        "validation_sample_fraction": validation_sample_fraction,
-        "validation_sample_max_rows": validation_sample_max_rows,
-    }
-
-    best_config: dict[str, object] = {
-        "source": "direct_lightgbm",
-        "seed": random_seed,
-        "model_family": MODEL_FAMILY,
-        "inference_runtime": INFERENCE_RUNTIME,
-        "feature_columns": list(FEATURE_COLUMNS),
-        "categorical_features": [
-            "pickup_borough_id",
-            "pickup_zone_id",
-            "pickup_service_zone_id",
-            "dropoff_borough_id",
-            "dropoff_zone_id",
-            "dropoff_service_zone_id",
-            "route_pair_id",
-        ],
-        "label_column": LABEL_COLUMN,
-        "timestamp_column": TIMESTAMP_COLUMN,
+        "feature_columns": trainer_meta.get("feature_columns", []),
+        "categorical_features": trainer_meta.get("categorical_features", []),
     }
 
     artifacts = persist_training_artifacts(
         run_id=run_id,
         dataset_uri=dataset_uri,
         canonical_df=canonical_df,
-        split=split,
+        split=split_result,
         booster=booster,
         metrics=metrics,
         num_boost_round=num_boost_round,
         early_stopping_rounds=early_stopping_rounds,
         validation_fraction=validation_fraction,
         artifact_root_s3=artifact_root_s3,
-        validation_sample_rows=min(2048, len(split.valid_df)),
+        validation_sample_rows=min(2048, len(split_result.valid_df)),
         quality_report=quality_report,
         best_config=best_config,
-        lightgbm_params=trainer_meta.get("lightgbm_params", {}),
+        lightgbm_params=trainer_meta["lightgbm_params"],
         runtime_config=runtime_config,
-    )
-
-    log_json(
-        msg="train_pipeline_artifacts_persisted",
-        run_id=run_id,
-        artifact_root_s3=artifacts["artifact_root_s3"],
-        model_uri=artifacts["model_uri"],
-        manifest_uri=artifacts["manifest_uri"],
-        feature_spec_uri=artifacts["feature_spec_uri"],
-        contract_uri=artifacts["contract_uri"],
-        quality_report_uri=artifacts["quality_report_uri"],
-        validation_sample_uri=artifacts["validation_sample_uri"],
-        metrics_uri=artifacts["metrics_uri"],
-        train_rows=len(split.train_df),
-        valid_rows=len(split.valid_df),
-        cutoff_ts=split.cutoff_ts,
-        best_iteration=trainer_meta.get("best_iteration", 0),
-        mae=metrics["mae"],
-        rmse=metrics["rmse"],
-        r2=metrics["r2"],
     )
 
     result: dict[str, object] = {
@@ -224,57 +181,35 @@ def train_pipeline(
         "schema_hash": artifacts["schema_hash"],
         "feature_version": artifacts["feature_version"],
         "schema_version": artifacts["schema_version"],
-        "gold_table": GOLD_TRAINING_TABLE,
-        "source_silver_table": SOURCE_SILVER_TABLE,
-        "model_family": MODEL_FAMILY,
-        "inference_runtime": INFERENCE_RUNTIME,
-        "cutoff_ts": split.cutoff_ts,
-        "train_rows": len(split.train_df),
-        "valid_rows": len(split.valid_df),
-        "best_iteration": trainer_meta.get("best_iteration", 0),
-        "validation_mode": validation_mode,
-        "validation_sample_fraction": validation_sample_fraction,
-        "validation_sample_max_rows": validation_sample_max_rows,
-        "validation_fraction": validation_fraction,
+        "gold_table": artifacts["gold_table"],
+        "source_silver_table": artifacts["source_silver_table"],
+        "model_family": artifacts["model_family"],
+        "inference_runtime": artifacts["inference_runtime"],
+        "train_profile": artifacts["train_profile"],
+        "validation_fraction": str(artifacts["validation_fraction"]),
+        "validation_mode": artifacts["validation_mode"],
+        "validation_sample_fraction": str(artifacts["validation_sample_fraction"]),
+        "validation_sample_max_rows": str(artifacts["validation_sample_max_rows"]),
+        "train_rows": str(artifacts["train_rows"]),
+        "valid_rows": str(artifacts["valid_rows"]),
+        "cutoff_ts": str(artifacts["cutoff_ts"]),
+        "best_iteration": str(artifacts["best_iteration"]),
+        "current_iteration": str(artifacts["current_iteration"]),
+        "num_boost_round": str(artifacts["num_boost_round"]),
+        "early_stopping_rounds": str(artifacts["early_stopping_rounds"]),
+        "random_seed": str(random_seed),
+        "registered_model_name": DEFAULT_REGISTERED_MODEL_NAME,
     }
 
     log_json(
         msg="train_pipeline_success",
         run_id=run_id,
-        dataset_uri=dataset_uri,
-        artifact_root_s3=artifacts["artifact_root_s3"],
-        model_uri=artifacts["model_uri"],
         schema_hash=artifacts["schema_hash"],
         feature_version=artifacts["feature_version"],
         schema_version=artifacts["schema_version"],
-        train_rows=len(split.train_df),
-        valid_rows=len(split.valid_df),
-        cutoff_ts=split.cutoff_ts,
-        best_iteration=trainer_meta.get("best_iteration", 0),
+        train_rows=artifacts["train_rows"],
+        valid_rows=artifacts["valid_rows"],
+        cutoff_ts=str(artifacts["cutoff_ts"]),
+        artifact_root_s3=artifacts["artifact_root_s3"],
     )
-    return _to_string_bundle(result)
-
-
-@workflow
-def train_pipeline_workflow(
-    dataset_uri: str,
-    validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
-    num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
-    early_stopping_rounds: int = DEFAULT_EARLY_STOPPING_ROUNDS,
-    artifact_root_s3: str = ARTIFACT_ROOT_S3,
-    validation_mode: str = VALIDATION_MODE,
-    validation_sample_fraction: float = VALIDATION_SAMPLE_FRACTION,
-    validation_sample_max_rows: int = VALIDATION_SAMPLE_MAX_ROWS,
-    random_seed: int = DEFAULT_RANDOM_SEED,
-) -> dict[str, str]:
-    return train_pipeline(
-        dataset_uri=dataset_uri,
-        validation_fraction=validation_fraction,
-        num_boost_round=num_boost_round,
-        early_stopping_rounds=early_stopping_rounds,
-        artifact_root_s3=artifact_root_s3,
-        validation_mode=validation_mode,
-        validation_sample_fraction=validation_sample_fraction,
-        validation_sample_max_rows=validation_sample_max_rows,
-        random_seed=random_seed,
-    )
+    return _stringify_bundle(result)

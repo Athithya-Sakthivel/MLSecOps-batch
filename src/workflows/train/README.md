@@ -1,315 +1,265 @@
-# Flyte Training Workflow (Gold → Validate → Train → Evaluate → Export ONNX → Register Model) + frozen Gold contract + Ray orchestration
+# Flyte training workflow for trip duration ETA
 
-## End-to-end runtime model
+This package trains a frozen Gold-contract regression model from Iceberg/S3, evaluates it, exports ONNX, and registers the run in MLflow.
+
+The design is intentionally narrow:
+- one training task
+- one evaluate/register task
+- one workflow
+- one manual launch plan
+- explicit scalar inputs only
+- S3 URIs for durable artifacts
+- no hidden dataset rewriting across task boundaries
+
+## 1) Runtime model
 
 ```text
-Control plane (Flyte) ───────► orchestration only
-Data plane (Ray + Python) ────► Gold loading, validation, train/validation split, FLAML search, LightGBM training, metrics, ONNX export, MLflow registration
-Storage (Iceberg Gold) ───────► frozen training dataset and contract tables
-Object store (S3) ────────────► immutable parquet/model artifacts and sidecars
-Catalog DB ───────────────────► Iceberg metadata/state
-```
+Flyte control plane
+  ├── train_pipeline task
+  │     ├── read Gold parquet from Iceberg/S3
+  │     ├── validate/canonicalize contract
+  │     ├── split chronologically
+  │     ├── train LightGBM
+  │     └── persist artifacts to S3
+  │
+  └── evaluate_register task
+        ├── load training bundle
+        ├── validate contract again
+        ├── evaluate on validation split
+        ├── export ONNX and parity check
+        └── log/register in MLflow
+````
 
-Flyte tasks run in Kubernetes pods, and the Ray task plugin provides the Ray runtime needed by the training task. The code is organized around registered workflows and launch plans: Flyte generates a default launch plan for each workflow when it is registered, and launch plans are the invocation mechanism for executions. Launch plans can also define fixed inputs, schedules, and other execution-time settings. ([Flyte][1])
+Flyte orchestrates. Python performs the data work. Iceberg owns the Gold tables. S3 stores immutable artifacts. MLflow stores run metadata and registered model lineage.
 
-## 1) Core contracts
+## 2) File responsibilities
 
-### Single runtime image
+### `src/workflows/train/tasks/train_pipeline_helpers.py`
 
-One shared runtime image is used by all task files.
+Single source of truth for:
 
-It contains:
+* Gold feature contract
+* dtype coercion
+* schema/value validation
+* parquet read/write helpers
+* chronological splitting
+* feature-frame preparation
+* regression metrics
+* contract/spec/manifest generation
+* artifact path construction
 
-* Python runtime
-* Flytekit
-* Ray
-* FLAML
-* LightGBM
-* ONNX / ONNX Runtime / onnxmltools
-* pandas / numpy
-* MLflow
-* libraries needed by the training, evaluation, ONNX export, and registry tasks
+This module is pure utility code. It should not contain Flyte decorators or MLflow calls.
 
-### Versioning
+### `src/workflows/train/tasks/train_pipeline.py`
 
-* Image version is separate from code version.
-* Code lineage is tracked by git SHA.
-* Execution lineage is tracked through Flyte execution IDs and registered workflow/launch-plan versions.
-* Model lineage is tracked through Gold contract version, schema hash, split cutoff, and MLflow run metadata.
+Training task only:
 
-## 2) Final file-by-file plan
+* read Gold dataset
+* validate and canonicalize
+* split chronologically
+* train the model
+* write the model and JSON/Parquet artifacts to S3
+* return a string-only bundle of URIs and scalar metadata
 
-| File                                            | Final responsibility                                                                       | Must contain                                                                                                                    | Must not contain                                                               |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `src/workflows/train/launch_plans.py`           | Single source of truth for Flyte execution entrypoints.                                    | `LaunchPlan` definition for the training workflow; fixed defaults; exports.                                                     | Task code, workflow orchestration logic, operational shell logic.              |
-| `src/workflows/train/tasks/common.py`           | Single source of truth for the training contract and shared helpers.                       | Frozen Gold contract constants; schema/dtype validation; sidecar helpers; split helpers; model feature helpers; JSON helpers.   | Workflow orchestration, Ray task code, MLflow logging, ONNX export logic.      |
-| `src/workflows/train/tasks/load_gold.py`        | Gold ingestion and canonicalization task.                                                  | Contract validation; exact column/order checks; dtype coercion; deterministic parquet snapshot; contract sidecars.              | Feature engineering, training, evaluation, ONNX export, MLflow registry logic. |
-| `src/workflows/train/tasks/validate_dataset.py` | Validation gate for the Gold dataset.                                                      | Contract validation; chronological split verification; canonical ordered snapshot; validation report sidecar.                   | Feature creation, training, evaluation, ONNX export, MLflow registry logic.    |
-| `src/workflows/train/tasks/train_model.py`      | Ray + FLAML + LightGBM training task.                                                      | Chronological split; FLAML search; Ray LightGBM training; metrics; model artifact; manifest; parity sample; contract artifacts. | Gold loading logic, ONNX export, registry, manual debugging logic.             |
-| `src/workflows/train/tasks/evaluate_model.py`   | Evaluation task.                                                                           | Same contract as training; exact feature order and categorical coercion; regression metrics on validation split.                | Training, ONNX export, MLflow registry logic.                                  |
-| `src/workflows/train/tasks/export_onnx.py`      | ONNX conversion and parity task.                                                           | Contract hash checks; ONNX conversion; parity sample validation; ONNX parity metrics and manifest.                              | Training, data loading beyond parity sample, MLflow registry logic.            |
-| `src/workflows/train/tasks/register_model.py`   | Final registry task.                                                                       | MLflow experiment/runs; tags; metrics; model/ONNX artifacts; contract artifacts.                                                | Training, evaluation, ONNX conversion, dataset validation.                     |
-| `src/workflows/train/workflows/train.py`        | Thin training orchestration DAG.                                                           | The sequence `load_gold -> validate_dataset -> train_model -> evaluate_model -> export_onnx -> register_model`.                 | Business logic, schema validation internals, Ray internals, MLflow internals.  |
-| `src/workflows/train/run.py`                    | Operator command for bootstrap, registration, execution, diagnosis, deletion, and cleanup. | Namespace bootstrap, Ray ServiceAccount/RBAC, registration of workflow/launch plan, execution submission, diagnosis, cleanup.   | Task code, workflow logic, model logic.                                        |
-| `src/workflows/train/commands.sh`               | Operator convenience entrypoint.                                                           | Activation of environment; training profile selection; registration and execution commands.                                     | Task internals, workflow definitions, container build logic.                   |
+This task must not contain workflow orchestration.
 
-### Canonical ownership
+### `src/workflows/train/tasks/evaluate_register_helpers.py`
 
-* Shared contract helpers own schema truth.
-* Tasks own data work and model work.
-* Workflows own orchestration only.
-* Launch plans own execution contracts.
-* Ops scripts own bootstrap, registration, execution triggering, diagnosis, and cleanup.
+Second-stage utility code for:
 
-### Final rule
+* parsing the training bundle
+* loading training artifacts
+* validating contract continuity
+* computing evaluation metrics
+* exporting ONNX
+* computing ONNX parity
+* building MLflow tags, params, and metrics
+* logging and registering the model
 
-If a file changes **data or model behavior**, it belongs in `tasks/`.
+This module should remain task-agnostic.
 
-If a file changes **step ordering**, it belongs in `workflows/`.
+### `src/workflows/train/tasks/evaluate_register.py`
 
-If a file changes **how/when Flyte runs things**, it belongs in `launch_plans.py`.
+Second task only:
 
-If a file changes **how operators interact with the system**, it belongs in `run.py` or `commands.sh`.
+* consume the training bundle from `train_pipeline`
+* evaluate
+* export ONNX
+* register the model in MLflow
+* return a string-only bundle
 
-## 3) Data contract for the Gold training dataset
+No workflow decorator belongs here.
 
-The source dataset is treated as a frozen model contract, not as an ad hoc training input.
+### `src/workflows/train/workflows/train.py`
 
-The Gold table contains:
+Thin orchestration layer:
 
-* a single trip-level label column
-* a fixed metadata envelope
-* a fixed feature order
-* frozen categorical encodings
-* point-in-time-safe aggregate features
+* calls `train_pipeline`
+* then calls `evaluate_register`
 
-Required canonical columns include:
+This file should contain no data logic, no schema logic, and no MLflow implementation details.
+
+### `src/workflows/train/launch_plans.py`
+
+Manual execution entrypoint:
+
+* resolves default inputs
+* creates the manual launch plan
+* keeps execution defaults in one place
+
+## 3) Gold data contract
+
+The Gold dataset is treated as a frozen model contract, not a free-form input.
+
+Required canonical columns:
 
 * `trip_id`
 * `as_of_ts`
 * `as_of_date`
 * `schema_version`
 * `feature_version`
-* feature columns in fixed order
+* the fixed feature columns
 * `label_trip_duration_seconds`
 
-The Gold table must be the exact feature matrix that training and ONNX inference consume identically.
+Contract rules:
 
-## 4) Exact behavior of each task
+* exact column order is enforced
+* exact dtype expectations are enforced after coercion
+* timestamp/date consistency is enforced
+* duplicate IDs are rejected
+* label values must be positive
+* categorical IDs are non-negative with `0` reserved for unknown
 
-### `common.py`
+The Gold table is the exact matrix used for both training and evaluation.
 
-Purpose: define the training contract and shared validation helpers.
+## 4) Artifact model
 
-Rules:
+The training task writes a compact bundle of immutable artifacts to S3.
 
-* hold the frozen Gold feature contract as the single source of truth
-* define required columns, categorical features, numeric features, and label/timestamp columns
-* validate exact column order and dtype expectations
-* validate value contracts such as timestamp sanity, non-null rules, non-negative label, and categorical ID constraints
-* provide deterministic split, feature-frame, and JSON/sidecar helpers
-* provide schema hash and contract summary helpers used by all downstream tasks
+Typical outputs:
 
-This file should be the first place updated whenever the Gold contract changes.
+* `model.txt`
+* `manifest.json`
+* `contract.json`
+* `feature_spec.json`
+* `encoding_spec.json`
+* `aggregate_spec.json`
+* `label_spec.json`
+* `quality_report.json`
+* `validation_sample.parquet`
+* `runtime_config.json`
+* `training_summary.json`
+* `best_config.json`
+* `lightgbm_params.json`
 
-### `load_gold.py`
+The second-stage task reads those artifacts by URI and does not reconstruct state from local temp paths.
 
-Purpose: read the Gold dataset and canonicalize it into a validated parquet snapshot.
-
-Rules:
-
-* read the Gold dataset from Iceberg/S3
-* validate exact column set and exact order against the frozen contract
-* coerce dtypes only after contract validation passes
-* keep `as_of_ts` and `as_of_date` intact
-* sort deterministically by `as_of_ts`
-* write the canonical parquet snapshot
-* write contract sidecars alongside the snapshot
-
-This task must fail fast if the Gold schema has drifted.
-
-### `validate_dataset.py`
-
-Purpose: validate the Gold snapshot before training.
-
-Rules:
-
-* read only from the canonical Gold snapshot produced by `load_gold`
-* validate exact contract and value rules again
-* verify that a chronological split is possible
-* materialize a deterministic, timestamp-ordered snapshot
-* write validation metadata sidecars including schema hash, feature version, schema version, split cutoff, and row counts
-
-This task is a validation gate, not a feature engineering step.
-
-### `train_model.py`
-
-Purpose: train the regression model against the frozen Gold contract.
-
-Rules:
-
-* read only from the validated Gold snapshot
-* use the Gold contract as the source of truth
-* split chronologically on `as_of_ts`
-* keep the model input feature order locked
-* use the same categorical feature handling in every training and inference path
-* run FLAML on a sampled subset of the training split
-* train LightGBM via Ray using the documented `LightGBMTrainer` pattern
-* consume per-worker data through `ray.train.get_dataset_shard(name)`
-* use `RayTrainReportCallback` for checkpoint/reporting
-* save model, manifest, metrics, best config, runtime config, contract summary, and validation sample
-* persist `feature_version`, `schema_version`, `schema_hash`, `gold_table`, `source_silver_table`, and split cutoff for exact reproducibility
-
-This task is the primary training runtime and must be deterministic on contract and split behavior.
-
-### `evaluate_model.py`
-
-Purpose: evaluate the trained model on the validation split.
-
-Rules:
-
-* evaluate against the same Gold contract used by training
-* use the same chronological split basis
-* use the same feature list and categorical coercions as training
-* compare predictions against the validation label
-* emit regression metrics only; do not retrain or alter artifacts
-* fail if manifest or feature spec does not match the loaded Gold frame
-
-This task is strictly an evaluation gate.
-
-### `export_onnx.py`
-
-Purpose: convert the trained LightGBM model into ONNX and verify parity.
-
-Rules:
-
-* verify the saved feature spec and contract hash before export
-* refuse export if the current Gold contract has drifted
-* use the exact feature order used in training
-* preserve the same categorical coercions and parity sample handling as training
-* convert to ONNX
-* compare ONNX predictions against LightGBM predictions on the validation sample
-* write ONNX model, parity metrics, and ONNX manifest sidecars
-
-This task is a contract enforcement step, not a model training step.
-
-### `register_model.py`
-
-Purpose: register the trained model and artifacts in MLflow.
-
-Rules:
-
-* log the real contract identifiers as MLflow tags
-* include `feature_version`, `schema_version`, `schema_hash`, `gold_table`, `source_silver_table`, split cutoff, and profile tags
-* log training metrics, evaluation metrics, and ONNX parity metrics
-* log the model, contract, and parity artifacts together
-* keep registry logging separate from training, validation, and export logic
-
-This task is the final lineage and registry step.
-
-### `train.py`
-
-Purpose: be the thin orchestration layer for the training hot path.
+## 5) Workflow execution model
 
 Recommended flow:
 
-1. `load_gold`
-2. `validate_dataset`
-3. `train_model`
-4. `evaluate_model`
-5. `export_onnx`
-6. `register_model`
+1. `train_pipeline`
+2. `evaluate_register`
 
-If any contract drift is detected, the workflow should fail before registry.
+The second stage should depend on the bundle created by the first stage, not on re-reading or re-deriving training state from scratch.
 
-### `launch_plans.py`
+That avoids:
 
-Purpose: centralize launch-plan definitions.
+* split drift
+* schema drift
+* local-path fragility
+* duplicate contract logic
+* hidden task coupling
 
-Recommended launch plan:
+## 6) Launch plan model
 
-* one manual launch plan for `train`
+Use a single manual launch plan for the workflow.
 
-If scheduled training is needed later, add it here without changing task logic.
+The launch plan should provide defaults for:
 
-## 5) Runtime and execution model
+* dataset URI
+* bucket
+* artifact prefix
+* registered model name
+* validation fraction
+* random seed
+* number of boosting rounds
+* early stopping rounds
+* model family
+* training profile
+* MLflow experiment name
+* MLflow tracking URI
+* ONNX opset
+* validation sample size
 
-Use the Ray task pattern Flyte documents:
+The workflow can still accept overrides, but the launch plan should make the common path zero-config.
 
-* task config carries Ray settings
-* the Ray plugin provides the Ray infrastructure the task needs by the time the task function runs
-* the training task uses Ray only for distributed model fitting, not for orchestration
+## 7) Environment variables
 
-That gives this runtime shape:
+Keep env vars small and deployment-oriented.
 
-```text
-Flyte workflow
-  -> Gold load task pod
-  -> Validation task pod
-  -> Ray training task pod
-  -> Evaluation task pod
-  -> ONNX export task pod
-  -> MLflow registry task pod
-```
+Strong defaults are:
 
-The training task itself may launch Ray workers inside the Flyte-managed Ray job, but Flyte remains the control plane.
+* `S3_BUCKET`
+* `TRAIN_DATASET_URI`
+* `TRAIN_PROFILE`
+* `REGISTERED_MODEL_NAME`
+* `ARTIFACT_ROOT_PREFIX`
+* `TRAIN_VALIDATION_FRACTION`
+* `TRAIN_RANDOM_SEED`
+* `TRAIN_NUM_BOOST_ROUND`
+* `TRAIN_EARLY_STOPPING_ROUNDS`
+* `TRAIN_MODEL_FAMILY`
+* `MLFLOW_EXPERIMENT_NAME`
+* `MLFLOW_TRACKING_URI`
 
-## 6) Bottleneck rules
+Prefer workflow inputs and launch-plan defaults over task-local environment reads.
 
-* Only `load_gold.py` talks to the Gold input dataset.
-* Only `validate_dataset.py` verifies the canonical Gold snapshot for train readiness.
-* Only `train_model.py` performs FLAML search and LightGBM training.
-* Only `evaluate_model.py` computes evaluation metrics.
-* Only `export_onnx.py` performs ONNX export and parity checks.
-* Only `register_model.py` performs MLflow logging.
-* The workflow file must stay thin.
-* Rebuild the shared image only when task dependencies change, not for workflow wiring changes.
-* Keep the Ray job bounded and task-scoped.
-* Do not move model training or ONNX export into the workflow file.
-* Do not let evaluation mutate training artifacts.
-* Do not let registry logic infer schema; it must consume the saved contract.
+## 8) What should not live in tasks
 
-## 7) Final invariants
+Do not put these in task code:
+
+* workflow orchestration
+* launch-plan wiring
+* container build logic
+* manual shell/bootstrap logic
+* schema/version ownership
+* duplicate Gold parsing logic
+* MLflow server deployment details
+
+Do not use task-local `/tmp` as a durable contract boundary.
+
+## 9) Local operator model
+
+The operator path stays separate from training logic:
+
+* `run.py` for bootstrap, registration, execution, diagnosis, deletion, and cleanup
+* `commands.sh` for shell convenience
+
+Those files are not part of the training contract itself.
+
+## 10) Invariants
 
 These should always hold:
 
-* Flyte orchestrates.
-* Ray executes the training workload.
-* Iceberg owns the Gold table and contract tables.
-* S3 stores immutable artifacts.
-* Gold is the frozen model contract.
-* Validation is a gate, not a feature creator.
-* Training is chronological and reproducible.
-* Evaluation matches the training contract.
-* ONNX export is parity-checked.
-* Registry logs the final lineage.
-* The runtime image is shared.
-* Application code is external and versioned by git SHA.
+* Flyte orchestrates
+* tasks do the work
+* workflows only compose tasks
+* launch plans supply defaults
+* Iceberg owns Gold tables
+* S3 stores immutable artifacts
+* MLflow stores metadata and registry lineage
+* the Gold contract is frozen
+* evaluation uses the training bundle
+* ONNX export is parity-checked
+* runtime behavior is explicit and reproducible
 
-## 8) Local operator model
+## 11) Practical rule
 
-The local operator model is split across two files:
+If a file changes data or model behavior, it belongs in `tasks/`.
 
-* `run.py` for bootstrap, registration, execution, diagnosis, deletion, and cleanup
-* `commands.sh` for the minimal shell wrapper used by operators
+If a file changes step ordering, it belongs in `workflows/`.
 
-This is the training-side replacement for the old single-script pattern.
+If a file changes execution defaults, it belongs in `launch_plans.py`.
 
-## 9) Two separate execution modes
-
-* Training workflow
-
-  * manual or on a business schedule
-  * Gold load → validation → training → evaluation → ONNX export → registry
-
-* Debug and lifecycle mode
-
-  * register
-  * run
-  * diagnose
-  * delete
-  * reset
-
-This keeps the training path deterministic while preserving a clean operator workflow for local and cluster use.
-
-[1]: https://docs-legacy.flyte.org/en/latest/user_guide/basics/launch_plans.html "Launch plans"
+If a file changes operator behavior, it belongs in `run.py` or `commands.sh`.
