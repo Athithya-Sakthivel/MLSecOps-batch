@@ -17,20 +17,21 @@ rules:
         - "src/workflows/ELT/**/*.py"
       exclude:
         - "src/workflows/ELT/tasks/maintenance_optimize.py"
-    pattern-either:
-      - pattern: $DB.sql(f"...{...}...")
-      - pattern: $DB.sql("...".format(...))
-      - pattern: $DB.sql("..." + ...)
-      - pattern: $DB.sql("..." % ...)
-    pattern-not-inside: |
-      def ensure_namespace(...):
-          ...
-    pattern-not-inside: |
-      def table_exists(...):
-          ...
-    pattern-not-inside: |
-      def validate_iceberg_catalog(...):
-          ...
+    patterns:
+      - pattern-either:
+          - pattern: $DB.sql(f"...{...}...")
+          - pattern: $DB.sql("...".format(...))
+          - pattern: $DB.sql("..." + ...)
+          - pattern: $DB.sql("..." % ...)
+      - pattern-not-inside: |
+          def ensure_namespace(...):
+              ...
+      - pattern-not-inside: |
+          def table_exists(...):
+              ...
+      - pattern-not-inside: |
+          def validate_iceberg_catalog(...):
+              ...
 
   - id: elt.security.secret-value-in-logs
     message: >
@@ -72,6 +73,7 @@ rules:
       - pattern: LOG.error(...)
       - pattern: log_json(...)
       - pattern: print(...)
+
   - id: elt.iceberg.expire-snapshots-outside-maintenance
     message: >
       Iceberg snapshot expiration is a destructive maintenance operation.

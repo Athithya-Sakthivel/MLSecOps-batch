@@ -86,7 +86,6 @@ jobs:
 
               echo "[INFO] === OpenGrep ELT Scan (custom rules) ==="
               opengrep scan \
-                --verbose \
                 --config /workspace/src/infra/security/static_analysis/elt_rules.yaml \
                 --error \
                 --max-target-bytes 2000000 \
