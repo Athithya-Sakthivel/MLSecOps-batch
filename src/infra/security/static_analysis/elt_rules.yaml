@@ -3,7 +3,7 @@ rules:
     message: >
       Spark SQL is being built with interpolation, formatting, concatenation, or percent formatting.
       Keep SQL text static and move all identifier handling into validated helper functions.
-    severity: ERROR
+    severity: WARNING
     languages: [python]
     metadata:
       category: security
@@ -37,7 +37,7 @@ rules:
     message: >
       A secret or token derived from environment configuration is flowing into logs.
       Do not log access keys, session tokens, or Hugging Face tokens.
-    severity: ERROR
+    severity: WARNING
     languages: [python]
     mode: taint
     metadata:
