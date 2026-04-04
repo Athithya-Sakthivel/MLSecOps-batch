@@ -913,10 +913,8 @@ def bronze_ingest(max_rows_to_extract_from_datasets: int | None = None) -> Bronz
     trips_preview, trips_iter = iter_preview_rows(trips_stream, 2)
     taxi_preview, taxi_iter = iter_preview_rows(taxi_zone_stream, 2)
 
-    for i, row in enumerate(trips_preview, start=1):
-        log_json(msg="trip_preview_row", row=i, data=normalize_record(dict(row)))
-    for i, row in enumerate(taxi_preview, start=1):
-        log_json(msg="taxi_zone_preview_row", row=i, data=normalize_record(dict(row)))
+    log_json(msg="trip_preview_rows_loaded", rows=len(trips_preview))
+    log_json(msg="taxi_zone_preview_rows_loaded", rows=len(taxi_preview))
 
     if row_cap is not None:
         trips_iter = islice(trips_iter, row_cap)
@@ -969,5 +967,16 @@ def bronze_ingest(max_rows_to_extract_from_datasets: int | None = None) -> Bronz
         trips_write_mode=trips_write_mode,
         taxi_zone_write_mode=taxi_zone_write_mode,
     )
-    log_json(msg="bronze_ingest_success", **result.__dict__)
+    log_json(
+        msg="bronze_ingest_success",
+        run_id=result.run_id,
+        trips_table=result.trips_table,
+        taxi_zone_table=result.taxi_zone_table,
+        trips_rows=result.trips_rows,
+        taxi_zone_rows=result.taxi_zone_rows,
+        trips_source_ref=result.trips_source_ref,
+        taxi_zone_source_ref=result.taxi_zone_source_ref,
+        trips_write_mode=result.trips_write_mode,
+        taxi_zone_write_mode=result.taxi_zone_write_mode,
+    )
     return result
