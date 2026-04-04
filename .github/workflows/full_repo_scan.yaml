@@ -112,6 +112,5 @@ jobs:
                 --skip-dirs src/opengrep \
                 --exit-code 1 \
                 /workspace
-
               echo "[SUCCESS] All scans completed"
             '

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 import sys
 from collections.abc import Callable, Sequence
@@ -17,7 +16,6 @@ from src.workflows.ELT.tasks.bronze_ingest import (
     BRONZE_NAMESPACE,
     CATALOG_NAME,
     GOLD_NAMESPACE,
-    ICEBERG_TARGET_FILE_SIZE_BYTES,
     SILVER_NAMESPACE,
     SILVER_TRIPS_TABLE,
     BronzeIngestResult,
@@ -72,7 +70,6 @@ if ELT_PROFILE == "prod":
     SPARK_MAX_PARTITION_BYTES = _env_str("SPARK_MAX_PARTITION_BYTES", "134217728")
     SPARK_MAX_RESULT_SIZE = _env_str("SPARK_MAX_RESULT_SIZE", "256m")
     TASK_RETRIES = _env_int("SILVER_TASK_RETRIES", 1, minimum=0)
-    SILVER_ROWS_PER_PARTITION = _env_int("SILVER_ROWS_PER_PARTITION", 100000, minimum=1)
 else:
     TASK_LIMITS = Resources(cpu="500m", mem="768Mi")
     SPARK_DRIVER_MEMORY = _env_str("SPARK_DRIVER_MEMORY", "1g")
@@ -86,7 +83,6 @@ else:
     SPARK_MAX_PARTITION_BYTES = _env_str("SPARK_MAX_PARTITION_BYTES", "67108864")
     SPARK_MAX_RESULT_SIZE = _env_str("SPARK_MAX_RESULT_SIZE", "128m")
     TASK_RETRIES = _env_int("SILVER_TASK_RETRIES", 1, minimum=0)
-    SILVER_ROWS_PER_PARTITION = _env_int("SILVER_ROWS_PER_PARTITION", 50000, minimum=1)
 
 
 @dataclass(frozen=True)
@@ -172,38 +168,19 @@ def ensure_trips_schema(df: DataFrame) -> DataFrame:
     require_columns(df, required, "bronze trips table")
 
     return df.select(
-        _coalesced_typed_expr(
-            df,
-            ("pickup_ts",),
-            _safe_to_timestamp_expr,
-            null_type="timestamp",
-        ).alias("pickup_ts"),
-        _coalesced_typed_expr(
-            df,
-            ("dropoff_ts",),
-            _safe_to_timestamp_expr,
-            null_type="timestamp",
-        ).alias("dropoff_ts"),
-        _coalesced_typed_expr(
-            df,
-            ("pickup_location_id",),
-            _safe_cast_long_expr,
-            null_type="long",
-        ).alias("pickup_location_id"),
-        _coalesced_typed_expr(
-            df,
-            ("dropoff_location_id",),
-            _safe_cast_long_expr,
-            null_type="long",
-        ).alias("dropoff_location_id"),
+        _coalesced_typed_expr(df, ("pickup_ts",), _safe_to_timestamp_expr, null_type="timestamp").alias("pickup_ts"),
+        _coalesced_typed_expr(df, ("dropoff_ts",), _safe_to_timestamp_expr, null_type="timestamp").alias("dropoff_ts"),
+        _coalesced_typed_expr(df, ("pickup_location_id",), _safe_cast_long_expr, null_type="long").alias(
+            "pickup_location_id"
+        ),
+        _coalesced_typed_expr(df, ("dropoff_location_id",), _safe_cast_long_expr, null_type="long").alias(
+            "dropoff_location_id"
+        ),
         _coalesced_typed_expr(df, ("vendor_id",), _safe_cast_long_expr, null_type="long").alias("vendor_id"),
         _coalesced_typed_expr(df, ("ratecode_id",), _safe_cast_long_expr, null_type="long").alias("ratecode_id"),
-        _coalesced_typed_expr(
-            df,
-            ("passenger_count",),
-            _safe_cast_long_expr,
-            null_type="long",
-        ).alias("passenger_count"),
+        _coalesced_typed_expr(df, ("passenger_count",), _safe_cast_long_expr, null_type="long").alias(
+            "passenger_count"
+        ),
         _coalesced_typed_expr(df, ("payment_type",), _safe_cast_long_expr, null_type="long").alias("payment_type"),
         _coalesced_typed_expr(df, ("trip_type",), _safe_cast_long_expr, null_type="long").alias("trip_type"),
         _coalesced_typed_expr(df, ("trip_distance",), _safe_cast_double_expr, null_type="double").alias("trip_distance"),
@@ -233,9 +210,12 @@ def ensure_trips_schema(df: DataFrame) -> DataFrame:
             _safe_cast_double_expr,
             null_type="double",
         ).alias("cbd_congestion_fee"),
-        _coalesced_typed_expr(df, ("store_and_fwd_flag",), lambda c: c.cast("string"), null_type="string").alias(
-            "store_and_fwd_flag"
-        ),
+        _coalesced_typed_expr(
+            df,
+            ("store_and_fwd_flag",),
+            lambda c: c.cast("string"),
+            null_type="string",
+        ).alias("store_and_fwd_flag"),
         _coalesced_typed_expr(df, ("source_uri",), lambda c: c.cast("string"), null_type="string").alias("source_uri"),
         _coalesced_typed_expr(
             df,
@@ -246,23 +226,23 @@ def ensure_trips_schema(df: DataFrame) -> DataFrame:
         _coalesced_typed_expr(df, ("source_file",), lambda c: c.cast("string"), null_type="string").alias("source_file"),
         _coalesced_typed_expr(df, ("source_kind",), lambda c: c.cast("string"), null_type="string").alias("source_kind"),
         _coalesced_typed_expr(df, ("run_id",), lambda c: c.cast("string"), null_type="string").alias("run_id"),
-        _coalesced_typed_expr(
-            df,
-            ("ingestion_ts",),
-            _safe_to_timestamp_expr,
-            null_type="timestamp",
-        ).alias("ingestion_ts"),
+        _coalesced_typed_expr(df, ("ingestion_ts",), _safe_to_timestamp_expr, null_type="timestamp").alias(
+            "ingestion_ts"
+        ),
     )
 
 
 def ensure_zone_schema(df: DataFrame) -> DataFrame:
     require_columns(df, ("location_id", "borough", "zone", "service_zone"), "bronze taxi zone table")
-    return df.select(
-        F.col("location_id").cast("long").alias("location_id"),
-        F.col("borough").cast("string").alias("borough"),
-        F.col("zone").cast("string").alias("zone"),
-        F.col("service_zone").cast("string").alias("service_zone"),
-    ).dropDuplicates(["location_id"])
+    return (
+        df.select(
+            F.col("location_id").cast("long").alias("location_id"),
+            F.col("borough").cast("string").alias("borough"),
+            F.col("zone").cast("string").alias("zone"),
+            F.col("service_zone").cast("string").alias("service_zone"),
+        )
+        .dropDuplicates(["location_id"])
+    )
 
 
 def stable_trip_id_expr() -> F.Column:
@@ -293,7 +273,6 @@ def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_colu
         df.writeTo(table_id)
         .tableProperty("format-version", "2")
         .tableProperty("write.format.default", "parquet")
-        .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
     )
 
     if table_exists(df.sparkSession, table_id):
@@ -523,13 +502,13 @@ def silver_transform(bronze: BronzeIngestResult) -> SilverTransformResult:
         source_taxi_zone_table=bronze_taxi_zone_table,
     )
 
-    trips_df = spark.table(bronze_trips_table)
+    trips_df = (
+        spark.table(bronze_trips_table)
+        .where(F.col("run_id") == F.lit(bronze.run_id))
+    )
     zones_df = spark.table(bronze_taxi_zone_table)
 
     canonical_df = build_canonical_frame(trips_df, zones_df, bronze.run_id)
-
-    target_partitions = max(1, math.ceil(max(bronze.trips_rows, 1) / SILVER_ROWS_PER_PARTITION))
-    canonical_df = canonical_df.repartition(target_partitions, F.col("pickup_date"))
 
     write_mode = write_partitioned_iceberg_table(
         canonical_df,

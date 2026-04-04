@@ -39,10 +39,8 @@ POSTGRES_SECRET_NAME="${POSTGRES_SECRET_NAME:-postgres-cluster-app}"
 POSTGRES_USERNAME_KEY="${POSTGRES_USERNAME_KEY:-username}"
 POSTGRES_PASSWORD_KEY="${POSTGRES_PASSWORD_KEY:-password}"
 
-READY_TIMEOUT="${READY_TIMEOUT:-300}"
+READY_TIMEOUT="${READY_TIMEOUT:-600}"
 VALIDATE_SCRIPT="${VALIDATE_SCRIPT:-src/tests/elt/iceberg_server_validate.sh}"
-
-# --- Logging ------------------------------------------------------------------
 
 log() {
   printf '[%s] [iceberg] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2

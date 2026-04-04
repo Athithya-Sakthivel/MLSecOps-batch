@@ -1,11 +1,11 @@
 apiVersion: postgresql.cnpg.io/v1
 kind: Pooler
 metadata:
-  name: postgres-cluster-latest-restore-validate-110697-pooler
+  name: postgres-pooler
   namespace: default
 spec:
   cluster:
-    name: postgres-cluster-latest-restore-validate-110697
+    name: postgres-cluster
   instances: 1
   type: rw
   pgbouncer:

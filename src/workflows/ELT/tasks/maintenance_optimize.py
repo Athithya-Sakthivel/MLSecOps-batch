@@ -53,7 +53,6 @@ DEFAULT_EXPIRE_TABLES = (
     GOLD_TRAINING_TABLE,
     GOLD_CONTRACT_TABLE,
 )
-DEFAULT_REWRITE_TABLES = (GOLD_TRAINING_TABLE,)
 DEFAULT_REWRITE_WHERE = "as_of_date >= date_sub(current_date(), 30)"
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -76,9 +75,24 @@ def _env_str(name: str, default: str) -> str:
     return raw or default
 
 
+def parse_bool(value: str | None, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
 ICEBERG_EXPIRE_DAYS = _env_int("ICEBERG_EXPIRE_DAYS", 7, minimum=0)
 ICEBERG_ORPHAN_DAYS = _env_int("ICEBERG_ORPHAN_DAYS", 3, minimum=0)
 ICEBERG_RETAIN_LAST = _env_int("ICEBERG_RETAIN_LAST", 2, minimum=1)
+
+# Keep compaction opt-in. Snapshot expiration and orphan cleanup remain enabled by default.
+MAINTENANCE_ENABLE_REWRITE = parse_bool(os.environ.get("MAINTENANCE_ENABLE_REWRITE"), default=False)
+MAINTENANCE_CONTINUE_ON_ERROR = parse_bool(os.environ.get("MAINTENANCE_CONTINUE_ON_ERROR"), default=False)
+
+if MAINTENANCE_ENABLE_REWRITE:
+    DEFAULT_REWRITE_TABLES = (GOLD_TRAINING_TABLE,)
+else:
+    DEFAULT_REWRITE_TABLES = ()
 
 
 @dataclass(frozen=True)
@@ -92,12 +106,6 @@ class MaintenanceResult:
     table_results_json: str
     expire_days: int
     orphan_days: int
-
-
-def parse_bool(value: str | None, *, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
 def split_csv(value: str) -> list[str]:
@@ -147,6 +155,7 @@ def utc_cutoff_string(days: int) -> str:
 
 def execute_sql_action(spark: SparkSession, statement: str, *, label: str) -> None:
     try:
+        # Materialize the procedure result without pulling rows into Python.
         spark.sql(statement).count()
     except Exception as exc:
         raise RuntimeError(f"{label} failed: {exc}") from exc
@@ -259,11 +268,11 @@ def maintenance_optimize() -> MaintenanceResult:
     validate_iceberg_catalog(spark)
 
     run_id = os.environ.get("RUN_ID") or os.environ.get("FLYTE_INTERNAL_EXECUTION_ID") or uuid.uuid4().hex
-    continue_on_error = parse_bool(os.environ.get("MAINTENANCE_CONTINUE_ON_ERROR"), default=True)
 
     expire_tables = parse_table_list("ICEBERG_MAINTENANCE_EXPIRE_TABLES", ",".join(DEFAULT_EXPIRE_TABLES))
     orphan_tables = parse_table_list("ICEBERG_MAINTENANCE_ORPHAN_TABLES", ",".join(expire_tables))
     rewrite_tables = parse_table_list("ICEBERG_MAINTENANCE_REWRITE_TABLES", ",".join(DEFAULT_REWRITE_TABLES))
+    rewrite_where = _env_str("ICEBERG_MAINTENANCE_REWRITE_WHERE", DEFAULT_REWRITE_WHERE)
 
     all_tables = dedupe_preserve_order(expire_tables + orphan_tables + rewrite_tables)
     for table_id in all_tables:
@@ -278,10 +287,11 @@ def maintenance_optimize() -> MaintenanceResult:
         expire_tables=expire_tables,
         orphan_tables=orphan_tables,
         rewrite_tables=rewrite_tables,
+        rewrite_enabled=MAINTENANCE_ENABLE_REWRITE,
         expire_days=ICEBERG_EXPIRE_DAYS,
         orphan_days=ICEBERG_ORPHAN_DAYS,
         retain_last=ICEBERG_RETAIN_LAST,
-        continue_on_error=continue_on_error,
+        continue_on_error=MAINTENANCE_CONTINUE_ON_ERROR,
     )
 
     expired_done: list[str] = []
@@ -357,7 +367,7 @@ def maintenance_optimize() -> MaintenanceResult:
                 )
             )
             log_json(msg="maintenance_expire_orphan_failed", table=table_id, error=str(exc))
-            if not continue_on_error:
+            if not MAINTENANCE_CONTINUE_ON_ERROR:
                 raise
 
     for table_id in orphan_only_tables:
@@ -405,7 +415,7 @@ def maintenance_optimize() -> MaintenanceResult:
                 )
             )
             log_json(msg="maintenance_orphan_cleanup_failed", table=table_id, error=str(exc))
-            if not continue_on_error:
+            if not MAINTENANCE_CONTINUE_ON_ERROR:
                 raise
 
     for table_id in rewrite_tables:
@@ -436,10 +446,10 @@ def maintenance_optimize() -> MaintenanceResult:
             continue
 
         try:
-            log_json(msg="maintenance_rewrite_start", table=table_id, where=DEFAULT_REWRITE_WHERE)
+            log_json(msg="maintenance_rewrite_start", table=table_id, where=rewrite_where)
             execute_sql_action(
                 spark,
-                rewrite_data_files_call(table_id, DEFAULT_REWRITE_WHERE),
+                rewrite_data_files_call(table_id, rewrite_where),
                 label=f"rewrite_data_files({table_id})",
             )
             log_json(msg="maintenance_rewrite_done", table=table_id)
@@ -463,7 +473,7 @@ def maintenance_optimize() -> MaintenanceResult:
                 )
             )
             log_json(msg="maintenance_rewrite_failed", table=table_id, error=str(exc))
-            if not continue_on_error:
+            if not MAINTENANCE_CONTINUE_ON_ERROR:
                 raise
 
     if failed:

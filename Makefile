@@ -5,10 +5,8 @@ core:
 
 elt:
 	bash src/infra/elt/iceberg.sh --rollout && bash src/infra/elt/spark_operator.sh --rollout && \
-	python3 src/infra/core/flyte_setup.py --rollout
+	python3 src/infra/core/flyte_setup.py --rollout && bash src/workflows/ELT/commands.sh
 
-prune-elt:
-	bash 
 
 backup-pg:
 	bash src/infra/core/postgres_cluster.sh backup && aws s3 ls $$PG_BACKUPS_S3_BUCKET/postgres_backups/ --recursive

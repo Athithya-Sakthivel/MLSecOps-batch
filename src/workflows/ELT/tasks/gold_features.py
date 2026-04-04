@@ -12,7 +12,7 @@ from typing import Any
 
 from flytekit import Resources, task
 from flytekitplugins.spark import Spark
-from pyspark.sql import DataFrame, Window
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.functions import broadcast
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType, TimestampType
@@ -73,7 +73,6 @@ INFERENCE_RUNTIME = _env_str("INFERENCE_RUNTIME", "onnxruntime")
 
 if ELT_PROFILE == "prod":
     TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
-    GOLD_REPARTITIONS = _env_int("GOLD_REPARTITIONS", 8, minimum=1)
     TASK_RETRIES = _env_int("GOLD_TASK_RETRIES", 1, minimum=0)
     SPARK_DRIVER_MEMORY = _env_str("SPARK_DRIVER_MEMORY", "2g")
     SPARK_EXECUTOR_MEMORY = _env_str("SPARK_EXECUTOR_MEMORY", "2g")
@@ -87,7 +86,6 @@ if ELT_PROFILE == "prod":
     SPARK_MAX_RESULT_SIZE = _env_str("SPARK_MAX_RESULT_SIZE", "256m")
 else:
     TASK_LIMITS = Resources(cpu="500m", mem="768Mi")
-    GOLD_REPARTITIONS = _env_int("GOLD_REPARTITIONS", 4, minimum=1)
     TASK_RETRIES = _env_int("GOLD_TASK_RETRIES", 1, minimum=0)
     SPARK_DRIVER_MEMORY = _env_str("SPARK_DRIVER_MEMORY", "1g")
     SPARK_EXECUTOR_MEMORY = _env_str("SPARK_EXECUTOR_MEMORY", "1g")
@@ -219,7 +217,7 @@ def normalize_text_expr(col_name: str) -> F.Column:
     return F.lower(F.trim(F.coalesce(F.col(col_name), F.lit(""))))
 
 
-def build_borough_map_df(spark) -> DataFrame:
+def build_borough_map_df(spark: SparkSession) -> DataFrame:
     rows = [
         ("unknown", 0, "unknown"),
         ("manhattan", 1, "Manhattan"),
@@ -245,7 +243,7 @@ def distinct_service_zone_values(silver_df: DataFrame) -> list[str]:
     return [row["service_zone_norm"] for row in rows]
 
 
-def build_service_zone_map_df(spark, service_zone_values: list[str]) -> DataFrame:
+def build_service_zone_map_df(spark: SparkSession, service_zone_values: list[str]) -> DataFrame:
     rows = [("unknown", 0, "unknown")]
     for idx, value in enumerate(service_zone_values, start=1):
         rows.append((value, idx, value))
@@ -662,10 +660,19 @@ def encode_categories(base: DataFrame, service_zone_map_df: DataFrame) -> DataFr
     )
 
 
+def _filter_current_run(df: DataFrame, run_id: str) -> DataFrame:
+    for candidate in ("silver_run_id", "bronze_run_id", "run_id"):
+        if candidate in df.columns:
+            return df.where(F.col(candidate) == F.lit(run_id))
+    return df
+
+
 def build_training_matrix(
     silver_df: DataFrame,
     run_id: str,
 ) -> tuple[DataFrame, list[str], list[dict], str]:
+    silver_df = _filter_current_run(silver_df, run_id)
+
     require_columns(
         silver_df,
         (
@@ -779,7 +786,7 @@ def gold_spark_conf() -> dict[str, str]:
     )
 
 
-def _build_contract_df(spark, *, row: dict[str, Any]) -> DataFrame:
+def _build_contract_df(spark: SparkSession, *, row: dict[str, Any]) -> DataFrame:
     return spark.createDataFrame([row], schema=GOLD_CONTRACT_SCHEMA)
 
 
@@ -822,15 +829,11 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
     )
 
     silver_df = spark.table(source_silver_table)
+    silver_df = _filter_current_run(silver_df, silver.run_id)
+
     training_df, service_zone_values, feature_spec_rows, schema_hash = build_training_matrix(
         silver_df,
         silver.run_id,
-    )
-
-    training_df = training_df.repartition(
-        GOLD_REPARTITIONS,
-        F.col("pickup_zone_id"),
-        F.col("pickup_hour"),
     )
 
     write_mode = write_partitioned_iceberg_table(
