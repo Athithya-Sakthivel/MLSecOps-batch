@@ -105,6 +105,7 @@ jobs:
               echo "[INFO] === Trivy Filesystem Scan ==="
               trivy fs \
                 --cache-dir "$TRIVY_CACHE_DIR" \
+                --ignorefile .trivyignore \
                 --scanners vuln,misconfig \
                 --severity "$TRIVY_SEVERITY" \
                 --ignore-unfixed \
