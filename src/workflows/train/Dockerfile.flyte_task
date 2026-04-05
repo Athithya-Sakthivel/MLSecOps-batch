@@ -48,5 +48,4 @@ RUN python -m pip install --no-index --find-links=/wheels -r /opt/app/src/workfl
 
 USER appuser
 
-# Uses tini as PID 1 to forward signals and reap the zombie processes, ensuring clean shutdown for Ray workers
 ENTRYPOINT ["/usr/bin/tini", "--"]
