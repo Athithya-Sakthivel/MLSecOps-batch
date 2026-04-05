@@ -168,7 +168,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
+.venv_train
+.venv_train_dev
 # Spyder project settings
 .spyderproject
 .spyproject
