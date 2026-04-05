@@ -12,7 +12,7 @@ INITDB_DB="${INITDB_DB:-flyte_admin}"
 ADDITIONAL_DBS=(datacatalog mlflow iceberg)
 ALL_DBS=("${INITDB_DB}" "${ADDITIONAL_DBS[@]}")
 
-TEST_IMAGE="${TEST_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18.3-minimal-trixie}"
+TEST_IMAGE="${TEST_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-120}"
 
 # --- Counters ---

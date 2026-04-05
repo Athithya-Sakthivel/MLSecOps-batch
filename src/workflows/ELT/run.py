@@ -712,10 +712,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     lint_sources()
     import_check(need_schedule=want_schedule)
     ensure_namespace_bootstrap_ready()
-
-    registration_version = register_entities()
-
     start_port_forward()
+    registration_version = register_entities()
     init_flytectl()
 
     if want_schedule:

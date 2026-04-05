@@ -1,263 +1,335 @@
 # Medallion Lakehouse (Bronze → Silver → Gold) + ML Feature Store–like contract + Flyte orchestration
 
-## End-to-end runtime model
+This package implements a three-stage ELT pipeline with a separate Iceberg maintenance path.
+
+- **Flyte** provides orchestration and execution contracts.
+- **Spark** performs all data processing.
+- **Iceberg** stores Bronze, Silver, Gold, and contract tables.
+- **S3** stores immutable data files.
+- **Launch plans** define execution entrypoints and schedules.
+
+## 1) System model
 
 ```text
 Control plane (Flyte) ───────► orchestration only
-Data plane (Spark)   ───────► all data movement, joins, feature generation, and Iceberg maintenance
+Data plane (Spark)   ───────► extraction, joins, feature generation, maintenance
 Storage (Iceberg)    ───────► table state, snapshots, transactions
 Object store (S3)    ───────► immutable data files
 Catalog DB           ───────► Iceberg metadata/state
-```
+````
 
-Flyte tasks run in Kubernetes pods, and the Spark task plugin provides the Spark session and Spark runtime needed by each task. The code is organized around registered workflows and launch plans: Flyte generates a default launch plan for each workflow when it is registered, and launch plans are the invocation mechanism for executions. Launch plans can also define fixed inputs, schedules, and other execution-time settings. ([Flyte][1])
+Flyte tasks run in Kubernetes pods. The Spark task plugin supplies the Spark session and runtime context used by each task.
 
-## 1) Core contracts
+The implementation is organized around:
 
-### Single runtime image
+* `workflows/elt_workflow.py`
+* `workflows/iceberg_maintenance_workflow.py`
+* `tasks/bronze_ingest.py`
+* `tasks/silver_transform.py`
+* `tasks/gold_features.py`
+* `tasks/maintenance_optimize.py`
+* `launch_plans.py`
 
-One shared runtime image is used by all task files.
+## 2) Implemented file responsibilities
 
-It contains:
+### `tasks/bronze_ingest.py`
 
-* Python runtime
-* Flytekit
-* Spark
-* Iceberg jars
-* Hadoop S3 support
-* Python libraries needed by the bronze extractor and downstream Spark tasks
+Bronze ingestion is the raw landing stage.
 
-### Versioning
+Implemented behavior:
 
-* Image version is separate from code version.
-* Code lineage is tracked by git SHA.
-* Execution lineage is tracked through Flyte execution IDs and registered workflow/launch-plan versions.
+* validates the Iceberg REST endpoint before data extraction
+* validates the Spark Iceberg catalog configuration
+* validates the HTTP source for the taxi zone lookup
+* streams the trips source and taxi zone source once
+* normalizes column names
+* converts values to the Bronze schema with minimal type cleanup
+* preserves lineage metadata:
 
-## 2) Final file-by-file plan
+  * `run_id`
+  * `ingestion_ts`
+  * `source_uri`
+  * `source_revision`
+  * `source_kind`
+  * `source_file`
+* writes the trips source to a Bronze Iceberg table in batches
+* writes the taxi zone source to a Bronze Iceberg table
+* deletes any existing Bronze trip rows for the current `run_id` before rewriting them, so reruns are idempotent for that execution identifier
+* creates Bronze/Silver/Gold namespaces if they do not already exist
 
-| File                                                          | Final responsibility                                                  | Must contain                                                                                                                                 | Must not contain                                                  |
-| ------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `src/workflows/ELT/launch_plans.py`                           | Single source of truth for Flyte execution entrypoints and schedules. | `LaunchPlan` definitions for manual ELT and scheduled maintenance; fixed defaults/schedules; exports.                                        | Task code, workflow orchestration logic, operational shell logic. |
-| `src/workflows/ELT/tasks/bronze_ingest.py`                    | Bronze landing task.                                                  | Source validation, extraction, minimal normalization, idempotent Bronze writes, lineage metadata.                                            | Joins, feature engineering, maintenance, workflow orchestration.  |
-| `src/workflows/ELT/tasks/silver_transform.py`                 | Silver canonicalization task.                                         | Bronze-to-Silver joins, deterministic trip-level canonical row construction, stable schema writes.                                           | External source access, feature contract freezing, maintenance.   |
-| `src/workflows/ELT/tasks/gold_features.py`                    | Gold feature-contract task.                                           | Frozen model-ready features, fixed schema/order/dtypes/null policy, point-in-time-safe aggregates, categorical encoding, contract artifacts. | Raw ingestion, ad hoc training logic, maintenance.                |
-| `src/workflows/ELT/tasks/maintenance_optimize.py`             | Iceberg housekeeping task.                                            | Snapshot expiration, orphan cleanup, optional compaction/rewrite operations.                                                                 | Business-data transforms, ELT orchestration, feature creation.    |
-| `src/workflows/ELT/workflows/elt_workflow.py`                 | Thin ELT orchestration DAG.                                           | The sequence `bronze_ingest -> silver_transform -> gold_features`.                                                                           | Business logic, source validation, maintenance, scheduling.       |
-| `src/workflows/ELT/workflows/iceberg_maintenance_workflow.py` | Thin maintenance orchestration DAG.                                   | The maintenance task invocation only.                                                                                                        | ELT steps, feature logic, external source ingestion.              |
-| `src/workflows/ELT/ops/register_elt_setup.sh`                 | Operator command for cluster bootstrap and registration.              | Namespace bootstrap, Spark ServiceAccount/RBAC, registration of tasks/workflows/launch plans, activation of scheduled launch plans.          | Running data jobs, debugging executions, cleanup logic.           |
-| `src/workflows/ELT/ops/execute_launch_plans.sh`               | Operator command for triggering executions from launch plans.         | Launch-plan-based execution submission.                                                                                                      | Registration, code changes, task internals.                       |
-| `src/workflows/ELT/ops/elt_lifecycle_manage.sh`               | Operator command for lifecycle management.                            | Diagnose, inspect, cleanup, zombie execution / SparkApplication handling.                                                                    | Business logic, registration, workflow definition.                |
+The task exposes a `BronzeIngestResult` containing:
 
-### Canonical ownership
+* `run_id`
+* Bronze trips table identifier
+* Bronze taxi zone table identifier
+* row counts
+* source references
+* write modes
 
-* Tasks own data work.
-* Workflows own orchestration only.
-* Launch plans own execution contracts and schedules.
-* Ops scripts own bootstrap, registration, execution triggering, diagnosis, and cleanup.
+### `tasks/silver_transform.py`
 
-### Final rule
+Silver transform produces the canonical trip-level dataset.
 
-If a file changes **data behavior**, it belongs in `tasks/`.
+Implemented behavior:
 
-If a file changes **step ordering**, it belongs in `workflows/`.
+* reads only from Bronze Iceberg tables
+* filters Bronze trips to the current `run_id`
+* reads the taxi zone lookup from Bronze
+* validates the Bronze schemas
+* enriches trips twice:
 
-If a file changes **how/when Flyte runs things**, it belongs in `launch_plans.py`.
+  * pickup enrichment through `pickup_location_id`
+  * dropoff enrichment through `dropoff_location_id`
+* derives a canonical trip schema with:
 
-If a file changes **how operators interact with the system**, it belongs in `ops/`.
+  * `trip_id`
+  * `pickup_date`
+  * `pickup_ts`
+  * `dropoff_ts`
+  * `pickup_hour`
+  * `pickup_dow`
+  * `pickup_month`
+  * `pickup_is_weekend`
+  * `trip_duration_seconds`
+  * `trip_duration_minutes`
+  * pickup/dropoff borough, zone, and service-zone fields
+  * fare and distance fields
+  * lineage fields from Bronze
+  * `bronze_run_id`
+  * `silver_run_id`
+* computes `trip_id` as a stable SHA-256 hash over the core trip attributes
+* filters invalid rows:
 
-## 3) Data contract for the source datasets
+  * null timestamps
+  * null location IDs
+  * non-positive trip duration
+  * negative distance
+  * negative fare
+  * negative total amount
+* deduplicates canonical rows on `trip_id`
+* writes the Silver table partitioned by `pickup_date`
+* creates the Silver namespace if required
 
-The source datasets are treated as a fact/dimension pair:
+The task exposes a `SilverTransformResult` containing:
 
-* trips table contains `PULocationID` and `DOLocationID`
-* taxi zone lookup contains `LocationID`
+* `run_id`
+* Silver table identifier
+* upstream Bronze table identifiers
+* write mode
+* status
 
-Join rules:
+### `tasks/gold_features.py`
 
-* `trips.PULocationID -> zones.LocationID`
-* `trips.DOLocationID -> zones.LocationID`
+Gold feature generation produces the frozen ML training matrix and the associated contract table.
 
-The Silver table must be a trip-level canonical table, not an analytics aggregate.
+Implemented behavior:
 
-## 4) Exact behavior of each task
+* reads only from the Silver Iceberg table
+* filters Silver rows to the current `run_id`
+* carries lineage fields into the training matrix:
 
-### `bronze_ingest.py`
+  * `trip_id`
+  * `pickup_ts`
+  * `as_of_ts`
+  * `as_of_date`
+  * `schema_version`
+  * `feature_version`
+* converts the Silver table into a fixed model-ready schema
+* encodes borough categories with a fixed integer mapping
+* encodes service-zone categories with a versioned lookup derived from the observed Silver values
+* encodes route pairs into a fixed hash bucket space
+* computes point-in-time-safe aggregates only:
 
-Purpose: land raw data with minimal transformation.
+  * `avg_duration_7d_zone_hour`
+  * `avg_fare_30d_zone`
+  * `trip_count_90d_zone_hour`
+* uses `pickup_ts` as the feature as-of timestamp
+* derives the final ordered output column set used for training and inference
+* enforces label and schema validity
+* validates:
 
-Rules:
+  * column presence
+  * `pickup_ts == as_of_ts`
+  * `as_of_date == date(pickup_ts)`
+  * uniqueness of `trip_id`
+  * categorical and count ranges
+  * label range
+* writes the training matrix to the Gold table partitioned by `as_of_date`
+* writes the contract table partitioned by `feature_version`
+* records contract metadata including:
 
-* validate the source URIs before Spark work begins
-* extract the two datasets once
-* write them to Iceberg Bronze tables with idempotent semantics
-* preserve lineage metadata such as `run_id`, `ingestion_ts`, `source_uri`, `source_revision`, `source_kind`, and `source_file`
-* only normalize column names and do the smallest required type cleanup
+  * `schema_hash`
+  * feature specification
+  * encoding specification
+  * aggregate specification
+  * label specification
+  * source Silver table
+  * source Silver snapshot ID
+  * training row count
+* validates contract stability for an existing feature version before writing a new contract row
 
-This task should fail fast if the raw source is inaccessible. It must not contain joins, feature logic, or maintenance logic.
+The task exposes a `GoldFeatureResult` containing:
 
-### `silver_transform.py`
+* `run_id`
+* Gold training table identifier
+* Gold contract table identifier
+* upstream Silver table identifier
+* upstream Silver snapshot ID
+* training row count
+* schema hash
+* feature version
+* schema version
+* write mode
+* status
 
-Purpose: produce the canonical trip dataset.
+### `tasks/maintenance_optimize.py`
 
-Rules:
+Maintenance is isolated from the ELT hot path.
 
-* read only from Bronze Iceberg tables
-* join the trips table to the taxi zone lookup twice:
+Implemented behavior:
 
-  * pickup enrichment via `PULocationID`
-  * dropoff enrichment via `DOLocationID`
-* produce stable canonical columns such as:
+* validates the Iceberg catalog before running maintenance actions
+* targets a configurable set of tables for:
 
-  * trip duration
-  * pickup hour
-  * day-of-week
-  * distance
-  * fare/tip/total amounts
-  * pickup/dropoff borough and zone fields
-* write deterministically so retries do not duplicate or corrupt the table
+  * snapshot expiration
+  * orphan file cleanup
+  * optional data-file rewrite
+* uses UTC cutoffs for maintenance windows
+* expires snapshots with:
 
-This is the canonical MLOps dataset. It should stay narrow, reproducible, and schema-stable.
+  * `CALL ... system.expire_snapshots(...)`
+* removes orphan files with:
 
-### `gold_features.py`
+  * `CALL ... system.remove_orphan_files(...)`
+* rewrites data files with:
 
-Purpose: produce the frozen model-ready matrix and the contract artifacts used by training and ONNX inference.
+  * `CALL ... system.rewrite_data_files(...)`
+* defaults compaction to cold partitions by using a rewrite predicate that excludes recent dates
+* keeps compaction opt-in
+* skips rewrite when a table lacks `as_of_date`
+* records per-table operation results
+* fails fast unless `MAINTENANCE_CONTINUE_ON_ERROR` is enabled
 
-Rules:
+The task exposes a `MaintenanceResult` containing:
 
-* read only from Silver Iceberg tables
-* enforce a fixed column order, dtypes, and null policy
-* use point-in-time-safe aggregates only
-* convert categorical values to stable integer IDs
-* keep the label explicit and singular for the dataset version
-* write both the training matrix and the contract table
-* include schema hash, encoding mappings, feature spec, and label spec
+* `run_id`
+* overall status
+* expired table list
+* rewritten table list
+* skipped table list
+* failed table list
+* JSON-encoded table results
+* retention windows
 
-Gold must be the exact feature matrix that training and ONNX inference consume identically.
+## 3) Workflow behavior
 
-### `maintenance_optimize.py`
+### `workflows/elt_workflow.py`
 
-Purpose: keep Iceberg healthy.
+This workflow is the ELT hot path.
 
-Iceberg snapshots accumulate with each write/update/delete/compaction. Regular snapshot expiration removes unneeded data files and keeps metadata small. `remove_orphan_files` cleans up files left behind by failed tasks or aborted jobs. `rewrite_data_files` compacts small files into larger ones and can remove dangling deletes.
-
-Use these maintenance actions:
-
-* `CALL ... system.expire_snapshots(...)`
-* `CALL ... system.remove_orphan_files(...)`
-* `CALL ... system.rewrite_data_files(...)`
-
-Compaction is opt-in per table and should only run when a table-specific predicate is supplied.
-
-### `elt_workflow.py`
-
-Purpose: be the thin orchestration layer for the ELT hot path.
-
-Recommended flow:
+Implemented sequence:
 
 1. `bronze_ingest`
 2. `silver_transform`
 3. `gold_features`
 
-If maintenance needs to run on a separate cadence, it should not be embedded in this workflow.
+The workflow is thin. It contains orchestration only.
 
-### `iceberg_maintenance_workflow.py`
+### `workflows/iceberg_maintenance_workflow.py`
 
-Purpose: be the thin orchestration layer for Iceberg housekeeping only.
+This workflow is the Iceberg housekeeping path.
 
-Recommended flow:
+Implemented sequence:
 
 1. `maintenance_optimize`
 
-This should be scheduled independently from ELT so compaction never becomes part of the ingestion critical path.
+The workflow is thin. It contains orchestration only.
 
-### `launch_plans.py`
+## 4) Launch plans
 
-Purpose: centralize launch-plan definitions.
+`launch_plans.py` centralizes Flyte execution entrypoints.
 
-Recommended launch plans:
+Implemented launch-plan responsibilities:
 
-* one manual launch plan for `elt_workflow`
-* one daily maintenance launch plan for snapshot expiration and orphan cleanup
-* one weekly maintenance launch plan for selected compaction jobs
+* manual ELT execution entrypoint
+* scheduled maintenance execution entrypoints
+* separation of ELT and maintenance schedules
 
-## 5) Runtime and execution model
+Launch plans are the execution contract layer. They are not data-processing logic.
 
-Use the Spark task pattern Flyte documents:
+## 5) Runtime and execution boundaries
 
-* task config carries Spark settings
-* `hadoop_conf` injects S3 access details for Spark-side I/O
-* the Spark plugin provides the Spark infrastructure the task needs by the time the task function runs
+Implemented runtime boundaries:
 
-That gives this runtime shape:
+* **Flyte** starts and schedules tasks and workflows
+* **Spark** executes all data transformations and Iceberg maintenance
+* **Iceberg** owns table state and snapshot history
+* **S3** stores immutable data files
+* **The shared runtime image** supplies Python, Flytekit, Spark, Iceberg jars, Hadoop S3 support, and task dependencies
 
-```text
-Flyte workflow
-  -> Bronze task pod
-  -> Spark work for bronze
-  -> Silver task pod
-  -> Spark work for silver
-  -> Gold task pod
-  -> Spark work for training matrix generation
-```
+The task configuration supplies:
 
-Maintenance runs separately:
+* Spark driver and executor settings
+* Spark Hadoop configuration for S3 access
+* task-level resource limits
+* execution environment variables
 
-```text
-Flyte maintenance workflow
-  -> Maintenance task pod
-  -> Spark work for Iceberg lifecycle operations
-```
+## 6) Data layout and contract behavior
 
-## 6) Bottleneck rules
+### Bronze
 
-* Only `bronze_ingest.py` talks to external raw datasets.
-* Only `silver_transform.py` does dataset joins and canonicalization.
-* Only `gold_features.py` does ML feature engineering and contract freezing.
-* Only `maintenance_optimize.py` does table hygiene.
-* The workflow files must stay thin.
-* Rebuild the shared image only when task dependencies change, not for workflow wiring changes.
-* Keep Spark jobs bounded and task-scoped.
-* Do not move long-running table cleanup into the ingestion path.
-* Do not use maintenance as a dependency of the ELT workflow if it can be scheduled separately.
+Bronze stores raw source data with minimal normalization and explicit lineage fields.
 
-## 7) Final invariants
+### Silver
 
-These should always hold:
+Silver stores a canonical trip-level dataset with deterministic joins and stable columns.
+
+### Gold
+
+Gold stores the frozen model-ready matrix and the contract artifacts that describe it.
+
+### Contract table
+
+The contract table records:
+
+* feature version
+* schema version
+* schema hash
+* model family
+* inference runtime
+* Gold table identifier
+* source Silver table identifier
+* source Silver snapshot ID
+* training row count
+* output column order
+* feature specification
+* encoding specification
+* aggregate specification
+* label specification
+* creation timestamp
+
+## 7) Invariants
+
+The implementation is organized around the following invariants:
 
 * Flyte orchestrates.
-* Spark executes.
-* Iceberg owns table state.
+* Spark computes.
+* Iceberg stores table state.
 * S3 stores immutable files.
 * Bronze is raw landing.
 * Silver is canonical curation.
-* Gold is the frozen model matrix.
-* Maintenance is file/snapshot hygiene.
-* The runtime image is shared.
-* Application code is external and versioned by git SHA.
+* Gold is the frozen training matrix.
+* Maintenance is separated from ingestion and feature generation.
+* Launch plans define execution entrypoints.
+* Workflows define ordering only.
+* Tasks own data behavior.
 
-## 8) Local operator model
+## 8) Operational separation
 
-The current local operator model is split across three scripts:
+The current implementation does not use a single monolithic runner. Execution is split across:
 
-* `register_elt_setup.sh` for bootstrap and registration
-* `execute_launch_plans.sh` for execution submission
-* `elt_lifecycle_manage.sh` for diagnosis and cleanup
+* task modules
+* workflow modules
+* launch-plan definitions
 
-That is the current replacement for the old `run.sh` pattern.
-
-## 9) Two separate execution modes:
-
-* ELT workflow
-
-  * manual or on a business schedule
-  * Bronze → Silver → Gold
-
-* Maintenance workflow
-
-  * separate daily and weekly launch plans
-  * daily: snapshot expiration + orphan cleanup
-  * weekly: optional compaction for selected tables only
-
-This keeps the ELT path fast and stable while preserving Iceberg health on a separate cadence.
-
-[1]: https://docs-legacy.flyte.org/en/latest/user_guide/basics/launch_plans.html "Launch plans"
+This keeps runtime behavior, orchestration, and data logic separated at the file boundary.

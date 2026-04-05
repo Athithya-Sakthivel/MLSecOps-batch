@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from flytekit import Resources, task
 from flytekitplugins.spark import Spark
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql.functions import broadcast
 
@@ -16,6 +16,7 @@ from src.workflows.ELT.tasks.bronze_ingest import (
     BRONZE_NAMESPACE,
     CATALOG_NAME,
     GOLD_NAMESPACE,
+    ICEBERG_TARGET_FILE_SIZE_BYTES,
     SILVER_NAMESPACE,
     SILVER_TRIPS_TABLE,
     BronzeIngestResult,
@@ -46,7 +47,6 @@ ELT_PROFILE = (
     .strip()
     .lower()
 )
-
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     value = int(os.environ.get(name, str(default)))
@@ -99,6 +99,11 @@ def require_columns(df: DataFrame, required: Sequence[str], label: str) -> None:
     missing = set(required) - set(df.columns)
     if missing:
         raise RuntimeError(f"{label} is missing required columns: {sorted(missing)}")
+
+
+def require_non_empty(df: DataFrame, label: str) -> None:
+    if not df.limit(1).collect():
+        raise RuntimeError(f"{label} is empty")
 
 
 def _present_columns(df: DataFrame, candidates: Sequence[str]) -> list[str]:
@@ -178,9 +183,7 @@ def ensure_trips_schema(df: DataFrame) -> DataFrame:
         ),
         _coalesced_typed_expr(df, ("vendor_id",), _safe_cast_long_expr, null_type="long").alias("vendor_id"),
         _coalesced_typed_expr(df, ("ratecode_id",), _safe_cast_long_expr, null_type="long").alias("ratecode_id"),
-        _coalesced_typed_expr(df, ("passenger_count",), _safe_cast_long_expr, null_type="long").alias(
-            "passenger_count"
-        ),
+        _coalesced_typed_expr(df, ("passenger_count",), _safe_cast_long_expr, null_type="long").alias("passenger_count"),
         _coalesced_typed_expr(df, ("payment_type",), _safe_cast_long_expr, null_type="long").alias("payment_type"),
         _coalesced_typed_expr(df, ("trip_type",), _safe_cast_long_expr, null_type="long").alias("trip_type"),
         _coalesced_typed_expr(df, ("trip_distance",), _safe_cast_double_expr, null_type="double").alias("trip_distance"),
@@ -273,6 +276,7 @@ def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_colu
         df.writeTo(table_id)
         .tableProperty("format-version", "2")
         .tableProperty("write.format.default", "parquet")
+        .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
     )
 
     if table_exists(df.sparkSession, table_id):
@@ -281,6 +285,23 @@ def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_colu
 
     writer.partitionedBy(F.col(partition_column)).create()
     return "create"
+
+
+def _dedupe_trip_rows(df: DataFrame) -> DataFrame:
+    ordering = [
+        F.col("ingestion_ts").desc_nulls_last(),
+        F.col("pickup_ts").desc_nulls_last(),
+        F.col("dropoff_ts").desc_nulls_last(),
+        F.col("source_revision").desc_nulls_last(),
+        F.col("source_file").desc_nulls_last(),
+        F.col("source_uri").desc_nulls_last(),
+    ]
+    window = Window.partitionBy("trip_id").orderBy(*ordering)
+    return (
+        df.withColumn("_trip_dedupe_rank", F.row_number().over(window))
+        .filter(F.col("_trip_dedupe_rank") == 1)
+        .drop("_trip_dedupe_rank")
+    )
 
 
 def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str) -> DataFrame:
@@ -432,12 +453,14 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
         "source_uri",
         "source_revision",
         "source_file",
+        "bronze_run_id",
+        "silver_run_id",
     }
     missing = required - set(canonical.columns)
     if missing:
         raise RuntimeError(f"silver canonical dataframe is missing required columns: {sorted(missing)}")
 
-    return canonical.filter(
+    canonical = canonical.filter(
         F.col("pickup_ts").isNotNull()
         & F.col("dropoff_ts").isNotNull()
         & F.col("pickup_location_id").isNotNull()
@@ -447,6 +470,12 @@ def build_canonical_frame(trips_df: DataFrame, zones_df: DataFrame, run_id: str)
         & (F.col("fare_amount") >= 0)
         & (F.col("total_amount") >= 0)
     )
+
+    canonical = canonical.withColumn("trip_id", stable_trip_id_expr())
+    canonical = _dedupe_trip_rows(canonical)
+
+    require_non_empty(canonical, "silver canonical dataframe")
+    return canonical
 
 
 def silver_spark_conf() -> dict[str, str]:
@@ -502,11 +531,11 @@ def silver_transform(bronze: BronzeIngestResult) -> SilverTransformResult:
         source_taxi_zone_table=bronze_taxi_zone_table,
     )
 
-    trips_df = (
-        spark.table(bronze_trips_table)
-        .where(F.col("run_id") == F.lit(bronze.run_id))
-    )
+    trips_df = spark.table(bronze_trips_table).where(F.col("run_id") == F.lit(bronze.run_id))
     zones_df = spark.table(bronze_taxi_zone_table)
+
+    require_non_empty(trips_df, "bronze trips source slice")
+    require_non_empty(zones_df, "bronze taxi zone source table")
 
     canonical_df = build_canonical_frame(trips_df, zones_df, bronze.run_id)
 

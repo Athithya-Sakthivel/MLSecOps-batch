@@ -912,7 +912,7 @@ cmd_deploy(){
   persist_artifacts
   print_connection_uris "${cluster_name}" "${pooler_name}"
 
-  printf '\n[SUCCESS] deployed CNPG cluster %s\n' "${cluster_name}"
+  printf '\n[SUCCESS] deployed CNPG cluster %s\n' "${cluster_name}. To validate: bash src/tests/infra/validate_postgres_cluster.sh"
 }
 
 cmd_backup(){

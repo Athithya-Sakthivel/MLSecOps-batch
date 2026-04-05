@@ -484,6 +484,19 @@ def probe_iceberg_rest_endpoint() -> None:
         raise RuntimeError(f"Iceberg REST endpoint {url} did not return valid JSON") from exc
 
 
+def probe_http_source(url: str) -> None:
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=ICEBERG_HTTP_TIMEOUT_SECONDS) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"expected HTTP 200 from {url}, got {resp.status}")
+            resp.read(1)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"source endpoint returned HTTP {exc.code} for {url}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"unable to reach source endpoint {url}: {exc}") from exc
+
+
 def validate_iceberg_catalog(spark: SparkSession) -> None:
     impl_key = f"spark.sql.catalog.{CATALOG_NAME}"
     type_key = f"spark.sql.catalog.{CATALOG_NAME}.type"
@@ -697,6 +710,14 @@ def write_trip_batch(
     return "append", True
 
 
+def delete_existing_trip_run_rows(spark: SparkSession, *, table_id: str, run_id: str) -> bool:
+    if not table_exists(spark, table_id):
+        return False
+    escaped_run_id = run_id.replace("'", "''")
+    spark.sql(f"DELETE FROM {table_id} WHERE run_id = '{escaped_run_id}'")
+    return True
+
+
 def write_taxi_zone_table(
     spark: SparkSession,
     rows: list[dict[str, str | None]],
@@ -799,15 +820,14 @@ def bronze_ingest() -> BronzeIngestResult:
     )
 
     probe_iceberg_rest_endpoint()
+    probe_http_source(TAXI_ZONE_LOOKUP_URL)
 
-    spark = get_spark_session()
-    spark.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "WARN"))
-
-    validate_iceberg_catalog(spark)
-
-    ensure_namespace(spark, CATALOG_NAME, BRONZE_NAMESPACE)
-    ensure_namespace(spark, CATALOG_NAME, SILVER_NAMESPACE)
-    ensure_namespace(spark, CATALOG_NAME, GOLD_NAMESPACE)
+    if not TRIPS_DATASET_ID:
+        raise RuntimeError("TRIPS_DATASET_ID is empty")
+    if TRIPS_DATASET_REVISION is not None and not TRIPS_DATASET_REVISION.strip():
+        raise RuntimeError("TRIPS_DATASET_REVISION is empty after stripping")
+    if not TAXI_ZONE_LOOKUP_URL.startswith(("http://", "https://")):
+        raise RuntimeError(f"TAXI_ZONE_LOOKUP_URL must be an http(s) URL, got {TAXI_ZONE_LOOKUP_URL!r}")
 
     trips_stream = load_streaming_dataset(
         TRIPS_DATASET_ID,
@@ -834,8 +854,22 @@ def bronze_ingest() -> BronzeIngestResult:
         trips_iter = islice(trips_iter, MAX_ROWS_TO_EXTRACT_FROM_DATASETS)
         taxi_iter = islice(taxi_iter, MAX_ROWS_TO_EXTRACT_FROM_DATASETS)
 
+    spark = get_spark_session()
+    spark.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "WARN"))
+
+    validate_iceberg_catalog(spark)
+
+    ensure_namespace(spark, CATALOG_NAME, BRONZE_NAMESPACE)
+    ensure_namespace(spark, CATALOG_NAME, SILVER_NAMESPACE)
+    ensure_namespace(spark, CATALOG_NAME, GOLD_NAMESPACE)
+
     trips_table_id = qualify_table_id(BRONZE_TRIPS_TABLE)
+    taxi_zone_table_id = qualify_table_id(BRONZE_TAXI_ZONE_TABLE)
+
     trips_table_exists = table_exists(spark, trips_table_id)
+    if trips_table_exists:
+        deleted = delete_existing_trip_run_rows(spark, table_id=trips_table_id, run_id=run_id)
+        log_json(msg="bronze_trip_run_reset", table=trips_table_id, run_id=run_id, deleted=deleted)
 
     trips_rows = 0
     trips_write_mode = "append" if trips_table_exists else "create"
@@ -874,7 +908,6 @@ def bronze_ingest() -> BronzeIngestResult:
         raise RuntimeError("no rows read from source 'trips'")
 
     taxi_zone_rows_list = [build_taxi_zone_source_row(dict(row)) for row in taxi_iter]
-    taxi_zone_table_id = qualify_table_id(BRONZE_TAXI_ZONE_TABLE)
     taxi_zone_write_mode = write_taxi_zone_table(
         spark,
         taxi_zone_rows_list,

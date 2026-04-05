@@ -10,7 +10,7 @@ spec:
     retentionPolicy: 30d
     barmanObjectStore:
       destinationPath: s3://e2e-mlops-data-681802563986/postgres_backups/
-      serverName: postgres-cluster-20260404133742
+      serverName: postgres-cluster-20260405032007
       s3Credentials:
         accessKeyId:
           name: aws-creds

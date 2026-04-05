@@ -15,7 +15,7 @@ from flytekitplugins.spark import Spark
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.functions import broadcast
-from pyspark.sql.types import IntegerType, StringType, StructField, StructType, TimestampType
+from pyspark.sql.types import IntegerType, LongType, StringType, StructField, StructType, TimestampType
 
 from src.workflows.ELT.tasks.bronze_ingest import (
     BRONZE_NAMESPACE,
@@ -54,6 +54,17 @@ ELT_PROFILE = (
     .lower()
 )
 
+FEATURE_VERSION = os.environ.get("GOLD_FEATURE_VERSION", "trip_eta_lgbm_v1").strip()
+SCHEMA_VERSION = os.environ.get("GOLD_SCHEMA_VERSION", "trip_eta_frozen_matrix_v1").strip()
+ROUTE_PAIR_BUCKETS = max(int(os.environ.get("ROUTE_PAIR_BUCKETS", "4096")), 1)
+ROUTE_PAIR_HASH_SALT = os.environ.get("ROUTE_PAIR_HASH_SALT", "trip_eta_route_pair_v1").strip()
+MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "lightgbm").strip()
+INFERENCE_RUNTIME = os.environ.get("INFERENCE_RUNTIME", "onnxruntime").strip()
+
+GOLD_MIN_LABEL_SECONDS = max(int(os.environ.get("GOLD_MIN_LABEL_SECONDS", "1")), 0)
+GOLD_MAX_LABEL_SECONDS = max(int(os.environ.get("GOLD_MAX_LABEL_SECONDS", "0")), 0)
+SOURCE_SILVER_SNAPSHOT_ID_HINT = os.environ.get("SOURCE_SILVER_SNAPSHOT_ID", "").strip()
+
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     value = int(os.environ.get(name, str(default)))
@@ -63,13 +74,6 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 def _env_str(name: str, default: str) -> str:
     return os.environ.get(name, default).strip()
 
-
-FEATURE_VERSION = _env_str("GOLD_FEATURE_VERSION", "trip_eta_lgbm_v1")
-SCHEMA_VERSION = _env_str("GOLD_SCHEMA_VERSION", "trip_eta_frozen_matrix_v1")
-ROUTE_PAIR_BUCKETS = _env_int("ROUTE_PAIR_BUCKETS", 4096, minimum=1)
-ROUTE_PAIR_HASH_SALT = _env_str("ROUTE_PAIR_HASH_SALT", "trip_eta_route_pair_v1")
-MODEL_FAMILY = _env_str("MODEL_FAMILY", "lightgbm")
-INFERENCE_RUNTIME = _env_str("INFERENCE_RUNTIME", "onnxruntime")
 
 if ELT_PROFILE == "prod":
     TASK_LIMITS = Resources(cpu="1000m", mem="1024Mi")
@@ -105,6 +109,8 @@ class GoldFeatureResult:
     gold_table: str
     contract_table: str
     source_silver_table: str
+    source_silver_snapshot_id: str
+    training_rows: int
     schema_hash: str
     feature_version: str
     schema_version: str
@@ -114,6 +120,7 @@ class GoldFeatureResult:
 
 GOLD_OUTPUT_COLUMNS: list[str] = [
     "trip_id",
+    "pickup_ts",
     "as_of_ts",
     "as_of_date",
     "schema_version",
@@ -145,6 +152,8 @@ GOLD_CONTRACT_SCHEMA = StructType(
         StructField("inference_runtime", StringType(), False),
         StructField("gold_table", StringType(), False),
         StructField("source_silver_table", StringType(), False),
+        StructField("source_silver_snapshot_id", StringType(), False),
+        StructField("training_row_count", LongType(), False),
         StructField("output_columns_json", StringType(), False),
         StructField("feature_spec_json", StringType(), False),
         StructField("encoding_spec_json", StringType(), False),
@@ -177,12 +186,71 @@ def require_columns(df: DataFrame, required: Sequence[str], label: str) -> None:
         raise RuntimeError(f"{label} is missing required columns: {sorted(missing)}")
 
 
+def require_non_empty(df: DataFrame, label: str) -> None:
+    if not df.limit(1).collect():
+        raise RuntimeError(f"{label} is empty")
+
+
+def _present_columns(df: DataFrame, candidates: Sequence[str]) -> list[str]:
+    return [candidate for candidate in candidates if candidate in df.columns]
+
+
+def _coalesced_typed_expr(
+    df: DataFrame,
+    candidates: Sequence[str],
+    builder: Any,
+    *,
+    null_type: str,
+) -> F.Column:
+    present = _present_columns(df, candidates)
+    if not present:
+        return F.lit(None).cast(null_type)
+    return F.coalesce(*[builder(F.col(column)) for column in present])
+
+
+def _safe_to_timestamp_expr(value: F.Column) -> F.Column:
+    raw = F.trim(value.cast("string"))
+    return F.when(
+        raw.isNull() | (raw == ""),
+        F.lit(None).cast("timestamp"),
+    ).otherwise(
+        F.coalesce(
+            F.to_timestamp(raw),
+            F.to_timestamp(raw, "yyyy-MM-dd HH:mm:ss"),
+            F.to_timestamp(raw, "yyyy-MM-dd HH:mm:ss.SSS"),
+            F.to_timestamp(raw, "yyyy-MM-dd'T'HH:mm:ss"),
+            F.to_timestamp(raw, "yyyy-MM-dd'T'HH:mm:ss.SSS"),
+        )
+    )
+
+
+def _safe_cast_long_expr(value: F.Column) -> F.Column:
+    raw = F.trim(value.cast("string"))
+    return F.when(
+        raw.isNull() | (raw == ""),
+        F.lit(None).cast("long"),
+    ).when(
+        raw.rlike(r"^[+-]?\d+$"),
+        raw.cast("long"),
+    ).otherwise(F.lit(None).cast("long"))
+
+
+def _safe_cast_double_expr(value: F.Column) -> F.Column:
+    raw = F.trim(value.cast("string"))
+    return F.when(
+        raw.isNull() | (raw == ""),
+        F.lit(None).cast("double"),
+    ).when(
+        raw.rlike(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$"),
+        raw.cast("double"),
+    ).otherwise(F.lit(None).cast("double"))
+
+
 def write_partitioned_iceberg_table(df: DataFrame, table_id: str, partition_column: str) -> str:
     table_id = qualify_table_id(table_id)
     writer = (
         df.writeTo(table_id)
         .tableProperty("format-version", "2")
-        .tableProperty("write.merge.schema", "true")
         .tableProperty("write.format.default", "parquet")
         .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
     )
@@ -200,7 +268,6 @@ def write_versioned_contract_table(df: DataFrame, table_id: str) -> str:
     writer = (
         df.writeTo(table_id)
         .tableProperty("format-version", "2")
-        .tableProperty("write.merge.schema", "true")
         .tableProperty("write.format.default", "parquet")
         .tableProperty("write.target-file-size-bytes", ICEBERG_TARGET_FILE_SIZE_BYTES)
     )
@@ -299,7 +366,7 @@ def build_window_features(df: DataFrame) -> DataFrame:
     )
 
 
-def build_feature_spec_rows(service_zone_values: list[str]) -> list[dict]:
+def build_feature_spec_rows(service_zone_values: list[str]) -> list[dict[str, Any]]:
     return [
         {
             "name": "trip_id",
@@ -307,6 +374,14 @@ def build_feature_spec_rows(service_zone_values: list[str]) -> list[dict]:
             "dtype": "string",
             "nullable": False,
             "unit": "identifier",
+            "missing_policy": "required",
+        },
+        {
+            "name": "pickup_ts",
+            "role": "metadata",
+            "dtype": "timestamp",
+            "nullable": False,
+            "unit": "timestamp_utc",
             "missing_policy": "required",
         },
         {
@@ -482,7 +557,7 @@ def build_feature_spec_rows(service_zone_values: list[str]) -> list[dict]:
     ]
 
 
-def build_encoding_spec(service_zone_values: list[str]) -> dict:
+def build_encoding_spec(service_zone_values: list[str]) -> dict[str, Any]:
     return {
         "pickup_borough_id": {
             "type": "fixed_enum",
@@ -542,7 +617,7 @@ def build_encoding_spec(service_zone_values: list[str]) -> dict:
     }
 
 
-def build_aggregate_spec(source_silver_table: str) -> list[dict]:
+def build_aggregate_spec(source_silver_table: str) -> list[dict[str, Any]]:
     return [
         {
             "name": "avg_duration_7d_zone_hour",
@@ -577,7 +652,7 @@ def build_aggregate_spec(source_silver_table: str) -> list[dict]:
     ]
 
 
-def build_label_spec(source_silver_table: str) -> dict:
+def build_label_spec(source_silver_table: str) -> dict[str, Any]:
     return {
         "name": "label_trip_duration_seconds",
         "dtype": "float64",
@@ -591,7 +666,7 @@ def build_label_spec(source_silver_table: str) -> dict:
     }
 
 
-def build_schema_hash(feature_spec_rows: list[dict]) -> str:
+def build_schema_hash(feature_spec_rows: list[dict[str, Any]]) -> str:
     canonical = json.dumps(feature_spec_rows, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -664,13 +739,163 @@ def _filter_current_run(df: DataFrame, run_id: str) -> DataFrame:
     for candidate in ("silver_run_id", "bronze_run_id", "run_id"):
         if candidate in df.columns:
             return df.where(F.col(candidate) == F.lit(run_id))
-    return df
+    raise RuntimeError("silver canonical table is missing a run identifier column")
+
+
+def _current_silver_snapshot_id(spark: SparkSession, table_id: str) -> str:
+    history_table = f"{table_id}.history"
+    try:
+        history_df = spark.table(history_table)
+    except Exception as exc:
+        raise RuntimeError(f"unable to read Iceberg history metadata table for {table_id}") from exc
+
+    rows = (
+        history_df.where(F.col("is_current_ancestor") == F.lit(True))
+        .orderBy(F.col("made_current_at").desc())
+        .limit(1)
+        .collect()
+    )
+    if not rows:
+        raise RuntimeError(f"no current snapshot found in Iceberg history table for {table_id}")
+
+    snapshot_id = rows[0]["snapshot_id"]
+    if snapshot_id is None:
+        raise RuntimeError(f"current snapshot id is null for {table_id}")
+    return str(snapshot_id)
+
+
+def _parse_json_value(value: str) -> Any:
+    return json.loads(value)
+
+
+def _latest_contract_row_for_feature_version(
+    spark: SparkSession,
+    *,
+    contract_table: str,
+    feature_version: str,
+):
+    if not table_exists(spark, contract_table):
+        return None
+
+    rows = (
+        spark.table(contract_table)
+        .where(F.col("feature_version") == F.lit(feature_version))
+        .orderBy(F.col("created_ts").desc())
+        .limit(1)
+        .collect()
+    )
+    return rows[0] if rows else None
+
+
+def _validate_contract_stability(
+    spark: SparkSession,
+    *,
+    contract_table: str,
+    new_row: dict[str, Any],
+) -> None:
+    existing = _latest_contract_row_for_feature_version(
+        spark,
+        contract_table=contract_table,
+        feature_version=str(new_row["feature_version"]),
+    )
+    if existing is None:
+        return
+
+    existing_map = existing.asDict(recursive=True)
+
+    stable_string_fields = (
+        "feature_version",
+        "schema_version",
+        "model_family",
+        "inference_runtime",
+        "gold_table",
+        "source_silver_table",
+    )
+    for field in stable_string_fields:
+        if str(existing_map.get(field, "")) != str(new_row.get(field, "")):
+            raise RuntimeError(
+                f"existing contract for feature_version={new_row['feature_version']!r} conflicts on {field}: "
+                f"existing={existing_map.get(field)!r}, new={new_row.get(field)!r}"
+            )
+
+    json_fields = (
+        "output_columns_json",
+        "feature_spec_json",
+        "encoding_spec_json",
+        "aggregate_spec_json",
+        "label_spec_json",
+    )
+    for field in json_fields:
+        existing_value = existing_map.get(field)
+        new_value = new_row.get(field)
+        if existing_value is None or new_value is None:
+            raise RuntimeError(f"contract field {field} is missing for stability comparison")
+        if _parse_json_value(str(existing_value)) != _parse_json_value(str(new_value)):
+            raise RuntimeError(
+                f"existing contract for feature_version={new_row['feature_version']!r} conflicts on {field}"
+            )
+
+
+def validate_training_frame(training_df: DataFrame, *, service_zone_count: int) -> None:
+    require_columns(training_df, GOLD_OUTPUT_COLUMNS, "gold training dataframe")
+
+    if training_df.where(F.col("pickup_ts").isNull() | F.col("as_of_ts").isNull()).limit(1).collect():
+        raise RuntimeError("gold training dataframe has null pickup_ts or as_of_ts")
+    if training_df.where(F.col("pickup_ts") != F.col("as_of_ts")).limit(1).collect():
+        raise RuntimeError("gold training dataframe violates pickup_ts == as_of_ts")
+    if training_df.where(F.to_date(F.col("pickup_ts")) != F.col("as_of_date")).limit(1).collect():
+        raise RuntimeError("gold training dataframe violates as_of_date == date(pickup_ts)")
+    if training_df.where(F.length(F.col("trip_id")) != F.lit(64)).limit(1).collect():
+        raise RuntimeError("gold training dataframe has invalid trip_id length")
+    if training_df.where(
+        F.col("schema_version") != F.lit(SCHEMA_VERSION)
+        | F.col("schema_version").isNull()
+        | F.col("feature_version") != F.lit(FEATURE_VERSION)
+        | F.col("feature_version").isNull()
+    ).limit(1).collect():
+        raise RuntimeError("gold training dataframe contains unexpected schema_version or feature_version values")
+    if training_df.where(F.col("label_trip_duration_seconds").isNull() | (F.col("label_trip_duration_seconds") < F.lit(float(GOLD_MIN_LABEL_SECONDS)))).limit(1).collect():
+        raise RuntimeError("gold training dataframe contains invalid label_trip_duration_seconds values")
+    if GOLD_MAX_LABEL_SECONDS > 0 and training_df.where(
+        F.col("label_trip_duration_seconds") > F.lit(float(GOLD_MAX_LABEL_SECONDS))
+    ).limit(1).collect():
+        raise RuntimeError("gold training dataframe exceeds GOLD_MAX_LABEL_SECONDS")
+
+    if training_df.groupBy("trip_id").count().where(F.col("count") > F.lit(1)).limit(1).collect():
+        raise RuntimeError("gold training dataframe has duplicate trip_id rows")
+
+    range_violation = training_df.where(
+        ~(
+            F.col("pickup_hour").between(0, 23)
+            & F.col("pickup_dow").between(1, 7)
+            & F.col("pickup_month").between(1, 12)
+            & F.col("pickup_is_weekend").isin(0, 1)
+            & F.col("pickup_borough_id").between(0, 6)
+            & F.col("dropoff_borough_id").between(0, 6)
+            & F.col("pickup_zone_id") >= F.lit(0)
+            & F.col("dropoff_zone_id") >= F.lit(0)
+            & F.col("pickup_service_zone_id").between(0, service_zone_count)
+            & F.col("dropoff_service_zone_id").between(0, service_zone_count)
+            & F.col("route_pair_id").between(0, ROUTE_PAIR_BUCKETS)
+            & F.col("trip_count_90d_zone_hour") >= F.lit(0)
+        )
+    )
+    if range_violation.limit(1).collect():
+        raise RuntimeError("gold training dataframe contains out-of-range categorical or count values")
+
+    summary = training_df.agg(
+        F.count(F.lit(1)).alias("rows"),
+        F.sum(F.col("avg_duration_7d_zone_hour").isNull().cast("int")).alias("avg_duration_7d_zone_hour_nulls"),
+        F.sum(F.col("avg_fare_30d_zone").isNull().cast("int")).alias("avg_fare_30d_zone_nulls"),
+        F.sum(F.col("trip_count_90d_zone_hour").isNull().cast("int")).alias("trip_count_90d_zone_hour_nulls"),
+    ).collect()[0].asDict()
+    log_json(msg="gold_training_quality", **summary)
 
 
 def build_training_matrix(
     silver_df: DataFrame,
     run_id: str,
-) -> tuple[DataFrame, list[str], list[dict], str]:
+) -> tuple[DataFrame, list[str], list[dict[str, Any]], str]:
     silver_df = _filter_current_run(silver_df, run_id)
 
     require_columns(
@@ -688,8 +913,14 @@ def build_training_matrix(
             "dropoff_zone",
             "dropoff_service_zone",
             "trip_duration_seconds",
+            "trip_duration_minutes",
             "fare_amount",
             "total_amount",
+            "source_uri",
+            "source_revision",
+            "source_file",
+            "source_kind",
+            "ingestion_ts",
         ),
         "silver canonical table",
     )
@@ -748,26 +979,21 @@ def build_training_matrix(
     schema_hash = build_schema_hash(feature_spec_rows)
 
     training = base.select(*GOLD_OUTPUT_COLUMNS)
-
-    required = {
-        "trip_id",
-        "as_of_ts",
-        "as_of_date",
-        "pickup_hour",
-        "pickup_zone_id",
-        "label_trip_duration_seconds",
-    }
-    missing = required - set(training.columns)
-    if missing:
-        raise RuntimeError(f"gold training dataframe is missing required columns: {sorted(missing)}")
+    require_columns(training, GOLD_OUTPUT_COLUMNS, "gold training dataframe")
 
     training = training.filter(
-        F.col("as_of_ts").isNotNull()
+        F.col("pickup_ts").isNotNull()
+        & F.col("as_of_ts").isNotNull()
+        & F.col("as_of_date").isNotNull()
         & F.col("trip_id").isNotNull()
         & F.col("label_trip_duration_seconds").isNotNull()
-        & (F.col("label_trip_duration_seconds") > 0)
+        & (F.col("label_trip_duration_seconds") >= F.lit(float(GOLD_MIN_LABEL_SECONDS)))
     )
 
+    if GOLD_MAX_LABEL_SECONDS > 0:
+        training = training.filter(F.col("label_trip_duration_seconds") <= F.lit(float(GOLD_MAX_LABEL_SECONDS)))
+
+    require_non_empty(training, "gold training dataframe")
     return training, service_zone_values, feature_spec_rows, schema_hash
 
 
@@ -788,6 +1014,16 @@ def gold_spark_conf() -> dict[str, str]:
 
 def _build_contract_df(spark: SparkSession, *, row: dict[str, Any]) -> DataFrame:
     return spark.createDataFrame([row], schema=GOLD_CONTRACT_SCHEMA)
+
+
+def _read_current_silver_snapshot_id(spark: SparkSession, source_silver_table: str) -> str:
+    snapshot_id = _current_silver_snapshot_id(spark, source_silver_table)
+    if SOURCE_SILVER_SNAPSHOT_ID_HINT and SOURCE_SILVER_SNAPSHOT_ID_HINT != snapshot_id:
+        raise RuntimeError(
+            f"silver snapshot mismatch: SOURCE_SILVER_SNAPSHOT_ID={SOURCE_SILVER_SNAPSHOT_ID_HINT!r}, "
+            f"current={snapshot_id!r}"
+        )
+    return snapshot_id
 
 
 @task(
@@ -814,27 +1050,38 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
     ensure_namespace(spark, CATALOG_NAME, BRONZE_NAMESPACE)
     ensure_namespace(spark, CATALOG_NAME, SILVER_NAMESPACE)
 
+    source_silver_snapshot_id = _read_current_silver_snapshot_id(spark, source_silver_table)
+
     log_json(
         msg="gold_features_start",
         profile=ELT_PROFILE,
         k8s_cluster=K8S_CLUSTER,
         run_id=silver.run_id,
         source_silver_table=source_silver_table,
+        source_silver_snapshot_id=source_silver_snapshot_id,
         gold_table=gold_table,
         contract_table=contract_table,
         feature_version=FEATURE_VERSION,
         schema_version=SCHEMA_VERSION,
         model_family=MODEL_FAMILY,
         inference_runtime=INFERENCE_RUNTIME,
+        gold_label_min_seconds=GOLD_MIN_LABEL_SECONDS,
+        gold_label_max_seconds=GOLD_MAX_LABEL_SECONDS,
     )
 
     silver_df = spark.table(source_silver_table)
     silver_df = _filter_current_run(silver_df, silver.run_id)
+    require_non_empty(silver_df, "source silver table slice")
 
     training_df, service_zone_values, feature_spec_rows, schema_hash = build_training_matrix(
         silver_df,
         silver.run_id,
     )
+
+    validate_training_frame(training_df, service_zone_count=len(service_zone_values))
+    training_row_count = training_df.count()
+    if training_row_count <= 0:
+        raise RuntimeError("gold training dataframe unexpectedly empty after validation")
 
     write_mode = write_partitioned_iceberg_table(
         training_df,
@@ -876,6 +1123,8 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
         "inference_runtime": INFERENCE_RUNTIME,
         "gold_table": gold_table,
         "source_silver_table": source_silver_table,
+        "source_silver_snapshot_id": source_silver_snapshot_id,
+        "training_row_count": training_row_count,
         "output_columns_json": json.dumps(GOLD_OUTPUT_COLUMNS, separators=(",", ":")),
         "feature_spec_json": feature_spec_json,
         "encoding_spec_json": encoding_spec_json,
@@ -883,6 +1132,12 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
         "label_spec_json": label_spec_json,
         "created_ts": datetime.now(timezone.utc),
     }
+
+    _validate_contract_stability(
+        spark,
+        contract_table=contract_table,
+        new_row=contract_row,
+    )
 
     contract_df = _build_contract_df(spark, row=contract_row)
     contract_write_mode = write_versioned_contract_table(contract_df, contract_table)
@@ -892,6 +1147,8 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
         gold_table=gold_table,
         contract_table=contract_table,
         source_silver_table=source_silver_table,
+        source_silver_snapshot_id=source_silver_snapshot_id,
+        training_rows=training_row_count,
         schema_hash=schema_hash,
         feature_version=FEATURE_VERSION,
         schema_version=SCHEMA_VERSION,
