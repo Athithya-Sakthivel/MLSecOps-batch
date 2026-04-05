@@ -307,7 +307,8 @@ def distinct_service_zone_values(silver_df: DataFrame) -> list[str]:
         .orderBy("service_zone_norm")
         .collect()
     )
-    return [row["service_zone_norm"] for row in rows]
+    values = [row["service_zone_norm"] for row in rows]
+    return [value for value in values if value != "unknown"]
 
 
 def build_service_zone_map_df(spark: SparkSession, service_zone_values: list[str]) -> DataFrame:
@@ -841,21 +842,32 @@ def validate_training_frame(training_df: DataFrame, *, service_zone_count: int) 
 
     if training_df.where(F.col("pickup_ts").isNull() | F.col("as_of_ts").isNull()).limit(1).collect():
         raise RuntimeError("gold training dataframe has null pickup_ts or as_of_ts")
+
     if training_df.where(F.col("pickup_ts") != F.col("as_of_ts")).limit(1).collect():
         raise RuntimeError("gold training dataframe violates pickup_ts == as_of_ts")
+
     if training_df.where(F.to_date(F.col("pickup_ts")) != F.col("as_of_date")).limit(1).collect():
         raise RuntimeError("gold training dataframe violates as_of_date == date(pickup_ts)")
-    if training_df.where(F.length(F.col("trip_id")) != F.lit(64)).limit(1).collect():
+
+    if training_df.where(F.col("trip_id").isNull() | (F.length(F.col("trip_id")) != F.lit(64))).limit(1).collect():
         raise RuntimeError("gold training dataframe has invalid trip_id length")
-    if training_df.where(
-        F.col("schema_version") != F.lit(SCHEMA_VERSION)
-        | F.col("schema_version").isNull()
-        | F.col("feature_version") != F.lit(FEATURE_VERSION)
+
+    version_violation = training_df.where(
+        F.col("schema_version").isNull()
+        | (F.col("schema_version") != F.lit(SCHEMA_VERSION))
         | F.col("feature_version").isNull()
-    ).limit(1).collect():
+        | (F.col("feature_version") != F.lit(FEATURE_VERSION))
+    )
+    if version_violation.limit(1).collect():
         raise RuntimeError("gold training dataframe contains unexpected schema_version or feature_version values")
-    if training_df.where(F.col("label_trip_duration_seconds").isNull() | (F.col("label_trip_duration_seconds") < F.lit(float(GOLD_MIN_LABEL_SECONDS)))).limit(1).collect():
+
+    if training_df.where(
+        F.col("label_trip_duration_seconds").isNull()
+        | F.isnan(F.col("label_trip_duration_seconds"))
+        | (F.col("label_trip_duration_seconds") < F.lit(float(GOLD_MIN_LABEL_SECONDS)))
+    ).limit(1).collect():
         raise RuntimeError("gold training dataframe contains invalid label_trip_duration_seconds values")
+
     if GOLD_MAX_LABEL_SECONDS > 0 and training_df.where(
         F.col("label_trip_duration_seconds") > F.lit(float(GOLD_MAX_LABEL_SECONDS))
     ).limit(1).collect():
@@ -866,18 +878,18 @@ def validate_training_frame(training_df: DataFrame, *, service_zone_count: int) 
 
     range_violation = training_df.where(
         ~(
-            F.col("pickup_hour").between(0, 23)
-            & F.col("pickup_dow").between(1, 7)
-            & F.col("pickup_month").between(1, 12)
-            & F.col("pickup_is_weekend").isin(0, 1)
-            & F.col("pickup_borough_id").between(0, 6)
-            & F.col("dropoff_borough_id").between(0, 6)
-            & F.col("pickup_zone_id") >= F.lit(0)
-            & F.col("dropoff_zone_id") >= F.lit(0)
-            & F.col("pickup_service_zone_id").between(0, service_zone_count)
-            & F.col("dropoff_service_zone_id").between(0, service_zone_count)
-            & F.col("route_pair_id").between(0, ROUTE_PAIR_BUCKETS)
-            & F.col("trip_count_90d_zone_hour") >= F.lit(0)
+            (F.col("pickup_hour").isNotNull() & F.col("pickup_hour").between(0, 23))
+            (F.col("pickup_dow").isNotNull() & F.col("pickup_dow").between(1, 7))
+            & (F.col("pickup_month").isNotNull() & F.col("pickup_month").between(1, 12))
+            & (F.col("pickup_is_weekend").isNotNull() & F.col("pickup_is_weekend").isin(0, 1))
+            & (F.col("pickup_borough_id").isNotNull() & F.col("pickup_borough_id").between(0, 6))
+            & (F.col("dropoff_borough_id").isNotNull() & F.col("dropoff_borough_id").between(0, 6))
+            & (F.col("pickup_zone_id").isNotNull() & (F.col("pickup_zone_id") >= F.lit(0)))
+            & (F.col("dropoff_zone_id").isNotNull() & (F.col("dropoff_zone_id") >= F.lit(0)))
+            & (F.col("pickup_service_zone_id").isNotNull() & F.col("pickup_service_zone_id").between(0, service_zone_count))
+            & (F.col("dropoff_service_zone_id").isNotNull() & F.col("dropoff_service_zone_id").between(0, service_zone_count))
+            & (F.col("route_pair_id").isNotNull() & F.col("route_pair_id").between(0, ROUTE_PAIR_BUCKETS))
+            & (F.col("trip_count_90d_zone_hour").isNotNull() & (F.col("trip_count_90d_zone_hour") >= F.lit(0)))
         )
     )
     if range_violation.limit(1).collect():
