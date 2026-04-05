@@ -41,7 +41,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 src/scripts/archive/cnpg-1.28.2.yaml
 src/scripts/archive/plans/
-
+tmp.md
 # Unit test / coverage reports
 htmlcov/
 .tox/
@@ -158,7 +158,7 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 tmp.md
-
+artifacts
 # Environments
 .env
 .envrc

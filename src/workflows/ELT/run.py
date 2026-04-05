@@ -35,12 +35,12 @@ SPARK_SERVICE_ACCOUNT = os.environ.get("SPARK_SERVICE_ACCOUNT", "spark").strip()
 
 ELT_TASK_IMAGE = os.environ.get(
     "ELT_TASK_IMAGE",
-    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-04-04-19-11--4f0f141@sha256:5aca09c143d6060764711d20d56e3140c5cde29d7b512134df72193ec2545724",
+    "ghcr.io/athithya-sakthivel/flyte-elt-task:2026-04-05-09-20--c840ebd@sha256:d7f6947cad11cee4051d83507dc4e5b3efd80a8f45c39fc31a3db60b497e6dfb",
 ).strip()
 if not ELT_TASK_IMAGE:
     raise RuntimeError("ELT_TASK_IMAGE must not be empty")
 os.environ["ELT_TASK_IMAGE"] = ELT_TASK_IMAGE
-
+# ghcr.io/athithya-sakthivel/flyte-elt-task:2026-04-04-19-11--4f0f141@sha256:5aca09c143d6060764711d20d56e3140c5cde29d7b512134df72193ec2545724
 WORKFLOW_SOURCE_FILE = SRC_ROOT / "workflows" / "ELT" / "launch_plans.py"
 WORKFLOW_SOURCE_REL = WORKFLOW_SOURCE_FILE.relative_to(SRC_ROOT)
 WORKFLOW_IMPORT_MODULE = os.environ.get("WORKFLOW_IMPORT_MODULE", "workflows.ELT.launch_plans").strip() or "workflows.ELT.launch_plans"
