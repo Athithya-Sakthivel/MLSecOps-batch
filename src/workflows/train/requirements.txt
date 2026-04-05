@@ -1,4 +1,4 @@
-setuptools==68.1.2
+setuptools==68.2.2
 flytekit==1.16.15
 lightgbm==4.6.0
 mlflow==3.10.1

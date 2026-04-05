@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import argparse
 import atexit
 import contextlib
 import functools
 import hashlib
 import importlib
+import json
 import os
 import shlex
 import shutil
@@ -40,7 +40,7 @@ ELT_TASK_IMAGE = os.environ.get(
 if not ELT_TASK_IMAGE:
     raise RuntimeError("ELT_TASK_IMAGE must not be empty")
 os.environ["ELT_TASK_IMAGE"] = ELT_TASK_IMAGE
-# ghcr.io/athithya-sakthivel/flyte-elt-task:2026-04-04-19-11--4f0f141@sha256:5aca09c143d6060764711d20d56e3140c5cde29d7b512134df72193ec2545724
+
 WORKFLOW_SOURCE_FILE = SRC_ROOT / "workflows" / "ELT" / "launch_plans.py"
 WORKFLOW_SOURCE_REL = WORKFLOW_SOURCE_FILE.relative_to(SRC_ROOT)
 WORKFLOW_IMPORT_MODULE = os.environ.get("WORKFLOW_IMPORT_MODULE", "workflows.ELT.launch_plans").strip() or "workflows.ELT.launch_plans"
@@ -98,18 +98,14 @@ PROFILE_PRESETS: dict[str, dict[str, str]] = {
     },
 }
 
-ELT_LAUNCH_PLAN_CANDIDATES = ("ELT_WORKFLOW_LP_NAME", "ELT_WORKFLOW_LP")
-MAINTENANCE_DAILY_LP_CANDIDATES = (
-    "ICEBERG_MAINTENANCE_DAILY_LP_NAME",
-    "ICEBERG_MAINTENANCE_DAILY_LP",
-    "ICEBERG_MAINTENANCE_HOURLY_LP_NAME",
-    "ICEBERG_MAINTENANCE_HOURLY_LP",
-)
-MAINTENANCE_WEEKLY_LP_CANDIDATES = (
-    "ICEBERG_MAINTENANCE_WEEKLY_LP_NAME",
-    "ICEBERG_MAINTENANCE_WEEKLY_LP",
-    "ICEBERG_MAINTENANCE_COMPACTION_LP_NAME",
-    "ICEBERG_MAINTENANCE_COMPACTION_LP",
+ELT_WORKFLOW_LP_ATTR = "ELT_WORKFLOW_LP_NAME"
+DAILY_LP_ATTR = "ICEBERG_MAINTENANCE_DAILY_LP_NAME"
+WEEKLY_LP_ATTR = "ICEBERG_MAINTENANCE_WEEKLY_LP_NAME"
+
+LAUNCH_PLAN_ATTRS: tuple[tuple[str, str], ...] = (
+    ("elt", ELT_WORKFLOW_LP_ATTR),
+    ("maintenance_daily", DAILY_LP_ATTR),
+    ("maintenance_weekly", WEEKLY_LP_ATTR),
 )
 
 REGISTRATION_ENV_KEYS = (
@@ -122,15 +118,19 @@ REGISTRATION_ENV_KEYS = (
     "ICEBERG_MAINTENANCE_WEEKLY_CRON",
 )
 
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}", file=sys.stderr)
+
 
 def fatal(msg: str) -> NoReturn:
     raise SystemExit(f"FATAL: {msg}")
 
+
 def require_bin(name: str) -> None:
     if shutil.which(name) is None:
         fatal(f"{name} not found in PATH")
+
 
 def run_cmd(
     args: Sequence[str],
@@ -161,6 +161,7 @@ def run_cmd(
         raise RuntimeError(f"command failed ({cp.returncode}): {' '.join(args)}{suffix}")
     return cp
 
+
 def port_is_open(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=1):
@@ -168,7 +169,9 @@ def port_is_open(host: str, port: int) -> bool:
     except OSError:
         return False
 
+
 PORT_FORWARD_PROC: subprocess.Popen[str] | None = None
+
 
 def stop_port_forward_if_any() -> None:
     global PORT_FORWARD_PROC
@@ -189,11 +192,14 @@ def stop_port_forward_if_any() -> None:
             with contextlib.suppress(Exception):
                 proc.wait(timeout=10)
 
+
 def cleanup() -> None:
     if USE_PORT_FORWARD:
         stop_port_forward_if_any()
 
+
 atexit.register(cleanup)
+
 
 def start_port_forward() -> None:
     global PORT_FORWARD_PROC
@@ -258,6 +264,7 @@ def start_port_forward() -> None:
         fatal(f"flyteadmin port-forward did not become ready\n{tail}")
     fatal("flyteadmin port-forward did not become ready")
 
+
 def init_flytectl() -> None:
     if not USE_PORT_FORWARD:
         return
@@ -272,6 +279,7 @@ def init_flytectl() -> None:
         ],
         capture_output=True,
     )
+
 
 def configure_runtime() -> None:
     preset = PROFILE_PRESETS.get(K8S_CLUSTER)
@@ -291,47 +299,42 @@ def configure_runtime() -> None:
         f"rewrite={os.environ['MAINTENANCE_ENABLE_REWRITE']}"
     )
 
+
 def lint_sources() -> None:
     require_bin("ruff")
     log(f"Running ruff on {ELT_ROOT}")
     run_cmd(["ruff", "check", str(ELT_ROOT)])
 
-def _module_attr_name(module: object, candidates: Sequence[str]) -> str:
-    for candidate in candidates:
-        value = getattr(module, candidate, None)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        if value is not None and hasattr(value, "name"):
-            name = getattr(value, "name", None)
-            if isinstance(name, str) and name.strip():
-                return name.strip()
-    raise AttributeError(f"none of these launch plan attributes were found: {list(candidates)}")
 
-def _resolve_launch_plan_name(module: object, candidates: Sequence[str]) -> str:
-    return _module_attr_name(module, candidates)
+def _module_attr_value(module: object, attr_name: str) -> str:
+    value = getattr(module, attr_name, None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is not None and hasattr(value, "name"):
+        name = getattr(value, "name", None)
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    raise AttributeError(f"launch plan attribute {attr_name!r} was not found or has no usable name")
 
-def import_check(*, need_schedule: bool) -> None:
+
+def import_check() -> None:
     try:
         mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
     except Exception as exc:
         fatal(f"failed to import {WORKFLOW_IMPORT_MODULE}: {exc}")
 
-    try:
-        _resolve_launch_plan_name(mod, ELT_LAUNCH_PLAN_CANDIDATES)
-    except Exception as exc:
-        fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose ELT launch plan: {exc}")
-
-    if need_schedule:
+    for _, attr_name in LAUNCH_PLAN_ATTRS:
         try:
-            _resolve_launch_plan_name(mod, MAINTENANCE_DAILY_LP_CANDIDATES)
-            _resolve_launch_plan_name(mod, MAINTENANCE_WEEKLY_LP_CANDIDATES)
+            _module_attr_value(mod, attr_name)
         except Exception as exc:
-            fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose maintenance launch plans: {exc}")
+            fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose {attr_name}: {exc}")
 
     log("import_ok")
 
+
 def _quota_values() -> dict[str, str]:
     return QUOTA_PRESETS[K8S_CLUSTER]
+
 
 def _ensure_namespace() -> None:
     run_cmd(
@@ -355,6 +358,7 @@ metadata:
   name: {TASK_NAMESPACE}
 """,
     )
+
 
 def _bootstrap_manifest() -> str:
     q = _quota_values()
@@ -418,6 +422,7 @@ spec:
     services: "{q['services']}"
 """
 
+
 def bootstrap_manifest_quota_line() -> str:
     q = _quota_values()
     return (
@@ -430,12 +435,14 @@ def bootstrap_manifest_quota_line() -> str:
         f"services={q['services']}"
     )
 
+
 def bootstrap_target_namespace() -> None:
     require_bin("kubectl")
     log(f"Applying namespace, RBAC, and quota bootstrap for {TASK_NAMESPACE}")
     _ensure_namespace()
     run_cmd(["kubectl", "apply", "-f", "-"], input_text=_bootstrap_manifest())
     log(f"Bootstrap applied for {TASK_NAMESPACE} with quota: {bootstrap_manifest_quota_line()}")
+
 
 def _can_i(verb: str, resource: str) -> bool:
     cp = run_cmd(
@@ -453,6 +460,7 @@ def _can_i(verb: str, resource: str) -> bool:
         capture_output=True,
     )
     return cp.returncode == 0 and cp.stdout.strip() == "yes"
+
 
 def ensure_namespace_bootstrap_ready() -> None:
     require_bin("kubectl")
@@ -491,6 +499,7 @@ def ensure_namespace_bootstrap_ready() -> None:
 
     log(f"Bootstrap verified for {TASK_NAMESPACE}")
 
+
 def dedupe_paths(items: list[Path]) -> list[Path]:
     seen: set[Path] = set()
     out: list[Path] = []
@@ -499,6 +508,7 @@ def dedupe_paths(items: list[Path]) -> list[Path]:
             seen.add(item)
             out.append(item)
     return out
+
 
 def registration_tree_files() -> list[Path]:
     files: list[Path] = [WORKFLOW_SOURCE_FILE]
@@ -509,6 +519,7 @@ def registration_tree_files() -> list[Path]:
         if root.is_dir():
             files.extend(sorted(p for p in root.rglob("*.py") if p.is_file()))
     return [path for path in dedupe_paths(files) if path.is_file()]
+
 
 @functools.lru_cache(maxsize=1)
 def compute_registration_version() -> str:
@@ -530,15 +541,18 @@ def compute_registration_version() -> str:
         tree.update(b"\0")
     return f"{git_sha[:12]}-{tree.hexdigest()[:16]}"
 
+
 def pyflyte_register_supports_copy_or_fast_flag() -> tuple[bool, bool]:
     help_text = run_cmd(["pyflyte", "register", "--help"], check=False, capture_output=True)
     combined = f"{help_text.stdout}\n{help_text.stderr}"
     return ("--copy" in combined, "--fast" in combined)
 
+
 def pyflyte_register_supports_service_account() -> bool:
     help_text = run_cmd(["pyflyte", "register", "--help"], check=False, capture_output=True)
     combined = f"{help_text.stdout}\n{help_text.stderr}"
     return "--service-account" in combined
+
 
 def build_register_env() -> dict[str, str]:
     register_env = os.environ.copy()
@@ -546,6 +560,7 @@ def build_register_env() -> dict[str, str]:
     existing_pythonpath = register_env.get("PYTHONPATH", "")
     register_env["PYTHONPATH"] = str(SRC_ROOT) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
     return register_env
+
 
 def build_register_command(registration_version: str) -> list[str]:
     cmd = [
@@ -578,6 +593,7 @@ def build_register_command(registration_version: str) -> list[str]:
     cmd.append(str(WORKFLOW_SOURCE_REL))
     return cmd
 
+
 def register_entities() -> str:
     require_bin("pyflyte")
     if not WORKFLOW_SOURCE_FILE.is_file():
@@ -600,33 +616,31 @@ def register_entities() -> str:
     log(f"Registration complete for version {registration_version}")
     return registration_version
 
+
 def fetch_launch_plan_exec_spec(
     launch_plan_name: str,
     exec_spec_file: Path,
     *,
-    latest: bool,
-    version: str | None,
+    version: str,
 ) -> None:
     exec_spec_file.unlink(missing_ok=True)
+    run_cmd(
+        [
+            "flytectl",
+            "get",
+            "launchplan",
+            "-p",
+            REMOTE_PROJECT,
+            "-d",
+            REMOTE_DOMAIN,
+            launch_plan_name,
+            "--version",
+            version,
+            "--execFile",
+            str(exec_spec_file),
+        ]
+    )
 
-    args = [
-        "flytectl",
-        "get",
-        "launchplan",
-        "-p",
-        REMOTE_PROJECT,
-        "-d",
-        REMOTE_DOMAIN,
-        launch_plan_name,
-    ]
-    if latest:
-        args.append("--latest")
-    else:
-        if not version:
-            fatal("launch-plan version required when latest is disabled")
-        args.extend(["--version", version])
-    args.extend(["--execFile", str(exec_spec_file)])
-    run_cmd(args)
 
 def create_execution_from_spec(exec_spec_file: Path) -> None:
     run_cmd(
@@ -643,7 +657,21 @@ def create_execution_from_spec(exec_spec_file: Path) -> None:
         ]
     )
 
-def _activate_launch_plan(launch_plan_name: str, version: str) -> None:
+
+def _module_launch_plan_name(module: object, attr_name: str) -> str:
+    return _module_attr_value(module, attr_name)
+
+
+def resolve_launch_plan_names() -> dict[str, str]:
+    mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
+    return {
+        "elt": _module_launch_plan_name(mod, ELT_WORKFLOW_LP_ATTR),
+        "maintenance_daily": _module_launch_plan_name(mod, DAILY_LP_ATTR),
+        "maintenance_weekly": _module_launch_plan_name(mod, WEEKLY_LP_ATTR),
+    }
+
+
+def activate_launch_plan(launch_plan_name: str, version: str) -> None:
     log(f"Activating launch plan: {launch_plan_name}")
     run_cmd(
         [
@@ -662,46 +690,38 @@ def _activate_launch_plan(launch_plan_name: str, version: str) -> None:
         ]
     )
 
-def activate_scheduled_launchplans(version: str) -> None:
-    mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
-    daily_lp = _resolve_launch_plan_name(mod, MAINTENANCE_DAILY_LP_CANDIDATES)
-    weekly_lp = _resolve_launch_plan_name(mod, MAINTENANCE_WEEKLY_LP_CANDIDATES)
-    _activate_launch_plan(daily_lp, version)
-    _activate_launch_plan(weekly_lp, version)
 
-def run_elt_workflow(version: str) -> None:
-    mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
-    launch_plan_name = _resolve_launch_plan_name(mod, ELT_LAUNCH_PLAN_CANDIDATES)
-
+def execute_launch_plan(launch_plan_name: str, version: str) -> None:
     with tempfile.TemporaryDirectory(prefix=f"{launch_plan_name}.") as tmpdir:
         exec_spec_file = Path(tmpdir) / "exec.yaml"
-        log(f"Launching: {launch_plan_name}")
-        fetch_launch_plan_exec_spec(launch_plan_name, exec_spec_file, latest=False, version=version)
-        log(f"Creating execution from {exec_spec_file}")
+        log(f"Preparing launch plan execution: {launch_plan_name} @ {version}")
+        fetch_launch_plan_exec_spec(launch_plan_name, exec_spec_file, version=version)
+        log(f"Submitting execution from {exec_spec_file}")
         create_execution_from_spec(exec_spec_file)
 
-def build_parser() -> argparse.ArgumentParser:
+
+def build_parser():
+    import argparse
+
     parser = argparse.ArgumentParser(
         prog="run.py",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Register ELT workflows and optionally launch ELT and/or scheduled maintenance.",
+        description="Register ELT workflows and submit the ELT plus maintenance launch plans.",
     )
     parser.add_argument(
         "commands",
-        nargs="+",
+        nargs="*",
         choices=("elt", "schedule"),
-        help="Use 'elt', 'schedule', or both as 'elt schedule'.",
+        help="Accepted for backward compatibility; the runner now registers and submits all three launch plans.",
     )
     return parser
 
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
-
     commands = list(dict.fromkeys(args.commands))
     if len(commands) != len(args.commands):
         fatal("duplicate command tokens are not allowed")
-    want_elt = "elt" in commands
-    want_schedule = "schedule" in commands
 
     configure_runtime()
 
@@ -710,25 +730,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     require_bin("python3")
 
     lint_sources()
-    import_check(need_schedule=want_schedule)
+    import_check()
     ensure_namespace_bootstrap_ready()
     start_port_forward()
     registration_version = register_entities()
     init_flytectl()
 
-    if want_schedule:
-        activate_scheduled_launchplans(registration_version)
-    if want_elt:
-        run_elt_workflow(registration_version)
+    launch_plan_names = resolve_launch_plan_names()
+    log(f"Resolved launch plans: {json.dumps(launch_plan_names, sort_keys=True)}")
 
-    if want_schedule and want_elt:
-        log("elt schedule selected; registration, activation, and ELT execution complete")
-    elif want_schedule:
-        log("schedule selected; registration and scheduled launch-plan activation complete")
-    else:
-        log("elt selected; registration and ELT execution complete")
+    activate_launch_plan(launch_plan_names["maintenance_daily"], registration_version)
+    activate_launch_plan(launch_plan_names["maintenance_weekly"], registration_version)
 
+    execute_launch_plan(launch_plan_names["elt"], registration_version)
+    execute_launch_plan(launch_plan_names["maintenance_daily"], registration_version)
+    execute_launch_plan(launch_plan_names["maintenance_weekly"], registration_version)
+
+    log("registration, activation, and execution complete for elt + both maintenance launch plans")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
