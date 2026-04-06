@@ -2,7 +2,7 @@
 # Ubuntu 24.04 base, explicit apt upgrade, verified Spark archive download.
 # - wheel-only Python installs keep flytekit out of its source-build path
 # - vulnerable Spark/Hadoop jars are removed and replaced with fixed lines
-# - the Spark jar set is kept in /opt/spark/jars and symlinked into pyspark's bundled jars
+# - the Spark jar set is copied into PySpark's bundled jars
 
 FROM ubuntu:24.04@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c
 
@@ -12,6 +12,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 ARG SPARK_VERSION=4.0.2
 ARG SPARK_PACKAGE=spark-4.0.2-bin-hadoop3
+ARG SPARK_DOWNLOAD_BASE=https://archive.apache.org/dist/spark
 
 ARG ICEBERG_VERSION=1.10.1
 ARG HADOOP_AWS_VERSION=3.4.3
@@ -83,9 +84,9 @@ RUN set -eux; \
 RUN set -eux; \
     tmpdir="$(mktemp -d)"; \
     curl -fsSLo "${tmpdir}/${SPARK_PACKAGE}.tgz" \
-      "https://downloads.apache.org/spark/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz"; \
+      "${SPARK_DOWNLOAD_BASE}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz"; \
     curl -fsSLo "${tmpdir}/${SPARK_PACKAGE}.tgz.sha512" \
-      "https://downloads.apache.org/spark/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz.sha512"; \
+      "${SPARK_DOWNLOAD_BASE}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz.sha512"; \
     (cd "${tmpdir}" && sha512sum -c "${SPARK_PACKAGE}.tgz.sha512"); \
     rm -rf /opt/spark; \
     mkdir -p /opt/spark; \
@@ -93,22 +94,20 @@ RUN set -eux; \
     rm -rf "${tmpdir}"
 
 RUN set -eux; \
-    PYSPARK_JARS_DIR="$(find /opt/venv/lib -type d -path '*/site-packages/pyspark/jars' | head -n1)"; \
-    test -n "${PYSPARK_JARS_DIR}"; \
+    PYSPARK_JARS_DIR="$("$VIRTUAL_ENV/bin/python" - <<'PY'
+import pathlib
+import pyspark
+print(pathlib.Path(pyspark.__file__).resolve().parent / "jars")
+PY
+)"; \
+    test -d "${PYSPARK_JARS_DIR}"; \
     rm -rf "${PYSPARK_JARS_DIR}"; \
-    ln -s "${SPARK_HOME}/jars" "${PYSPARK_JARS_DIR}"; \
-    JAR_DIRS=("${SPARK_HOME}/jars"); \
-    \
-    for dir in "${JAR_DIRS[@]}"; do \
-      mkdir -p "${dir}" "${SPARK_HOME}/work-dir" "${HF_HOME}" "${HUGGINGFACE_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${XDG_CACHE_HOME}"; \
-    done; \
+    mkdir -p "${PYSPARK_JARS_DIR}" "${SPARK_HOME}/work-dir" "${HF_HOME}" "${HUGGINGFACE_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${XDG_CACHE_HOME}"; \
+    SPARK_JARS_DIR="${SPARK_HOME}/jars"; \
     \
     remove_matching_jars() { \
       local pattern="$1"; \
-      local dir; \
-      for dir in "${JAR_DIRS[@]}"; do \
-        find "${dir}" -maxdepth 1 -type f -name "${pattern}" -delete; \
-      done; \
+      find "${SPARK_JARS_DIR}" -maxdepth 1 -type f -name "${pattern}" -delete; \
     }; \
     \
     download_maven_jar() { \
@@ -116,24 +115,21 @@ RUN set -eux; \
       local artifact="$2"; \
       local version="$3"; \
       local classifier="${4:-}"; \
-      local rel_path="${group//./\/}/${artifact}/${version}"; \
+      local rel_path="${group//./\\/}/${artifact}/${version}"; \
       local filename="${artifact}-${version}${classifier:+-${classifier}}.jar"; \
-      local base_url="https://repo1.maven.org/maven2/${rel_path}"; \
-      local tmpdir tmpfile checksum; \
+      local base_url="https://repo.maven.apache.org/maven2/${rel_path}"; \
+      local tmpdir tmpfile; \
       tmpdir="$(mktemp -d)"; \
       tmpfile="${tmpdir}/${filename}"; \
-      curl -fsSL --retry 3 --connect-timeout 10 -o "${tmpfile}" "${base_url}/${filename}"; \
-      if curl -fsSL --retry 3 --connect-timeout 10 -o "${tmpfile}.sha512" "${base_url}/${filename}.sha512"; then \
+      curl -fsSLo "${tmpfile}" "${base_url}/${filename}"; \
+      if curl -fsSLo "${tmpfile}.sha512" "${base_url}/${filename}.sha512"; then \
         (cd "${tmpdir}" && sha512sum -c "${filename}.sha512"); \
-      elif curl -fsSL --retry 3 --connect-timeout 10 -o "${tmpfile}.sha1" "${base_url}/${filename}.sha1"; then \
+      elif curl -fsSLo "${tmpfile}.sha1" "${base_url}/${filename}.sha1"; then \
         (cd "${tmpdir}" && sha1sum -c "${filename}.sha1"); \
       else \
         echo "WARN: no checksum for ${artifact}-${version}, skipping verification" >&2; \
       fi; \
-      local dir; \
-      for dir in "${JAR_DIRS[@]}"; do \
-        cp -f "${tmpfile}" "${dir}/${filename}"; \
-      done; \
+      cp -f "${tmpfile}" "${SPARK_JARS_DIR}/${filename}"; \
       rm -rf "${tmpdir}"; \
     }; \
     \
@@ -185,9 +181,14 @@ RUN set -eux; \
       "${SPARK_HOME}/examples/jars/jackson-core-asl-1.9.13.jar" \
       "${SPARK_HOME}/examples/jars/jackson-mapper-asl-1.9.13.jar"; \
     \
+    rm -rf "${PYSPARK_JARS_DIR}"; \
+    mkdir -p "${PYSPARK_JARS_DIR}"; \
+    cp -a "${SPARK_JARS_DIR}/." "${PYSPARK_JARS_DIR}/"; \
+    \
     chmod -R a+rX \
       "${SPARK_HOME}/jars" \
       "${SPARK_HOME}/work-dir" \
+      "${PYSPARK_JARS_DIR}" \
       "${HF_HOME}" \
       "${HUGGINGFACE_HUB_CACHE}" \
       "${HF_DATASETS_CACHE}" \
