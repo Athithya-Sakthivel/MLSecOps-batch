@@ -12,3 +12,10 @@ CVE-2024-53179 # kernel SMB client UAF; container image cannot patch host kernel
 CVE-2025-37899 # kernel ksmbd session logoff UAF; container image cannot patch host kernel
 CVE-2025-38118 # kernel Bluetooth MGMT UAF; container image cannot patch host kernel
 CVE-2026-23112 # kernel nvmet-tcp bounds check; container image cannot patch host kernel
+
+
+CVE-2025-52999 # shaded jackson-core inside hadoop-client-runtime-3.4.3.jar; no direct untrusted JSON parsing entrypoint in this runtime
+CVE-2025-67721 # shaded aircompressor inside iceberg-spark-runtime-4.0_2.13-1.10.1.jar; no standalone decompression service in this batch image
+CVE-2026-33870 # shaded Netty HTTP/1.1 codec inside Spark/AWS shaded jars; this image does not expose a Netty HTTP/1.1 server
+CVE-2025-55163 # shaded Netty HTTP/2 codec inside Spark/AWS shaded jars; this image does not expose a Netty HTTP/2 server
+CVE-2026-33871 # shaded Netty HTTP/2 codec inside Spark/AWS shaded jars; this image does not expose a Netty HTTP/2 server

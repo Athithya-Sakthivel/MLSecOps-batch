@@ -1,7 +1,7 @@
 # Flyte task image for ELT and iceberg maintenance.
-# Ubuntu 24.04 base, explicit apt upgrade, verified Spark archive download
+# Ubuntu 24.04 base, explicit apt upgrade, verified Spark archive download.
 # - wheel-only Python installs keep flytekit out of its source-build path
-# - vulnerable Spark/Hadoop jars are removed and replaced with fixed lines
+# - vulnerable Spark example jars are removed
 # - Spark Python runtime comes from the verified Spark distribution archive
 
 FROM ubuntu:24.04@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c
@@ -94,13 +94,20 @@ RUN set -eux; \
     rm -rf /opt/spark; \
     mkdir -p /opt/spark; \
     tar -xzf "${tmpdir}/${SPARK_PACKAGE}.tgz" -C /opt/spark --strip-components=1; \
+    test -x /opt/spark/bin/spark-submit; \
     PY4J_ZIP="$(find /opt/spark/python/lib -maxdepth 1 -type f -name 'py4j-*-src.zip' -print -quit)"; \
     test -n "${PY4J_ZIP}"; \
     ln -sf "$(basename "${PY4J_ZIP}")" /opt/spark/python/lib/py4j-src.zip
 
 RUN set -eux; \
     SPARK_JARS_DIR="${SPARK_HOME}/jars"; \
-    mkdir -p "${SPARK_JARS_DIR}" "${SPARK_HOME}/work-dir" "${HF_HOME}" "${HUGGINGFACE_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${XDG_CACHE_HOME}"; \
+    mkdir -p \
+      "${SPARK_JARS_DIR}" \
+      "${SPARK_HOME}/work-dir" \
+      "${HF_HOME}" \
+      "${HUGGINGFACE_HUB_CACHE}" \
+      "${HF_DATASETS_CACHE}" \
+      "${XDG_CACHE_HOME}"; \
     \
     verify_checksum() { \
       local file="$1"; \
@@ -142,19 +149,12 @@ RUN set -eux; \
       find "${SPARK_JARS_DIR}" -maxdepth 1 -type f -name "${pattern}" -delete; \
     }; \
     \
-    remove_matching_jars 'aircompressor-*.jar'; \
-    remove_matching_jars 'avro-*.jar'; \
-    remove_matching_jars 'bundle-*.jar'; \
-    remove_matching_jars 'commons-beanutils-*.jar'; \
-    remove_matching_jars 'derby-*.jar'; \
-    remove_matching_jars 'hadoop-aws-*.jar'; \
-    remove_matching_jars 'hadoop-client-api-*.jar'; \
-    remove_matching_jars 'hadoop-client-runtime-*.jar'; \
-    remove_matching_jars 'jackson-core-*.jar'; \
-    remove_matching_jars 'lz4-java-*.jar'; \
-    remove_matching_jars 'netty-*.jar'; \
+    find "${SPARK_HOME}" -type f \( \
+      -name 'jackson-core-asl-1.9.13.jar' -o \
+      -name 'jackson-mapper-asl-1.9.13.jar' \
+    \) -delete; \
     remove_matching_jars 'spark-connect-client-jvm_*.jar'; \
-    remove_matching_jars 'zookeeper-*.jar'; \
+    remove_matching_jars 'spark-*-yarn-shuffle.jar'; \
     \
     download_maven_jar org.apache.iceberg iceberg-spark-runtime-4.0_2.13 "${ICEBERG_VERSION}"; \
     download_maven_jar org.apache.hadoop hadoop-aws "${HADOOP_AWS_VERSION}"; \
@@ -186,9 +186,8 @@ RUN set -eux; \
     download_maven_jar io.netty netty-transport-native-unix-common "${NETTY_VERSION}"; \
     download_maven_jar io.netty netty-transport-native-epoll "${NETTY_VERSION}" linux-x86_64; \
     \
-    rm -f \
-      "${SPARK_HOME}/examples/jars/jackson-core-asl-1.9.13.jar" \
-      "${SPARK_HOME}/examples/jars/jackson-mapper-asl-1.9.13.jar"; \
+    test -z "$(find "${SPARK_HOME}" -type f \( -name 'jackson-core-asl-1.9.13.jar' -o -name 'jackson-mapper-asl-1.9.13.jar' \) -print -quit)"; \
+    test -z "$(find "${SPARK_JARS_DIR}" -maxdepth 1 -type f \( -name 'spark-connect-client-jvm_*.jar' -o -name 'spark-*-yarn-shuffle.jar' \) -print -quit)"; \
     \
     chmod -R a+rX \
       "${SPARK_HOME}" \
