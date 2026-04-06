@@ -1,4 +1,5 @@
 name: train-image-ci
+
 on:
   workflow_dispatch:
 
@@ -92,13 +93,16 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Scan image with Trivy
+        shell: bash
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.cache/trivy:/root/.cache/" \
+            -v "$PWD:/workspace" \
+            -w /workspace \
             "${TRIVY_IMAGE}" \
             image \
-            --ignorefile .trivyignore \
+            --ignorefile /workspace/.trivyignore \
             --scanners vuln \
             --severity HIGH,CRITICAL \
             --exit-on-eol 1 \
