@@ -1,5 +1,5 @@
 # Flyte task image for ELT and iceberg maintenance.
-# Ubuntu 24.04 base, explicit apt upgrade, verified Spark archive download.
+# Ubuntu 24.04 base, explicit apt upgrade, verified Spark download.
 # - wheel-only Python installs keep flytekit out of its source-build path
 # - vulnerable Spark example jars are removed
 # - Spark Python runtime comes from the verified Spark distribution archive
@@ -12,7 +12,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 ARG SPARK_VERSION=4.0.2
 ARG SPARK_PACKAGE=spark-4.0.2-bin-hadoop3
-ARG SPARK_DOWNLOAD_BASE=https://downloads.apache.org/spark
+ARG SPARK_PRIMARY_DOWNLOAD_BASE=https://downloads.apache.org/spark
+ARG SPARK_FALLBACK_DOWNLOAD_BASE=https://archive.apache.org/dist/spark
 
 ARG ICEBERG_VERSION=1.10.1
 ARG HADOOP_AWS_VERSION=3.4.3
@@ -72,7 +73,7 @@ RUN set -eux; \
     python3 -m venv /opt/venv; \
     /opt/venv/bin/pip install --upgrade \
       pip==26.0.1 \
-      setuptools==69.5.1 \
+      setuptools==78.1.1 \
       wheel==0.46.3; \
     /opt/venv/bin/pip install --only-binary=:all: \
       cloudpickle==3.1.2 \
@@ -84,15 +85,21 @@ RUN set -eux; \
 RUN set -eux; \
     tmpdir="$(mktemp -d)"; \
     trap 'rm -rf "${tmpdir}"' EXIT; \
-    curl -fL --retry 5 --retry-all-errors --connect-timeout 15 --max-time 900 \
-      -o "${tmpdir}/${SPARK_PACKAGE}.tgz" \
-      "${SPARK_DOWNLOAD_BASE}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz"; \
-    curl -fL --retry 5 --retry-all-errors --connect-timeout 15 --max-time 300 \
-      -o "${tmpdir}/${SPARK_PACKAGE}.tgz.sha512" \
-      "${SPARK_DOWNLOAD_BASE}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz.sha512"; \
-    expected="$(awk 'NF{print $1; exit}' "${tmpdir}/${SPARK_PACKAGE}.tgz.sha512")"; \
-    actual="$(sha512sum "${tmpdir}/${SPARK_PACKAGE}.tgz" | awk '{print $1}')"; \
-    test "${expected}" = "${actual}"; \
+    for base in "${SPARK_PRIMARY_DOWNLOAD_BASE}" "${SPARK_FALLBACK_DOWNLOAD_BASE}"; do \
+      if curl -fL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 900 \
+          -o "${tmpdir}/${SPARK_PACKAGE}.tgz" \
+          "${base}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz"; then \
+        if curl -fsS --connect-timeout 10 --max-time 30 \
+            -o "${tmpdir}/${SPARK_PACKAGE}.tgz.sha512" \
+            "${base}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz.sha512"; then \
+          expected="$(awk 'NF{print $1; exit}' "${tmpdir}/${SPARK_PACKAGE}.tgz.sha512")"; \
+          actual="$(sha512sum "${tmpdir}/${SPARK_PACKAGE}.tgz" | awk '{print $1}')"; \
+          test "${expected}" = "${actual}"; \
+          break; \
+        fi; \
+      fi; \
+    done; \
+    test -s "${tmpdir}/${SPARK_PACKAGE}.tgz"; \
     rm -rf /opt/spark; \
     mkdir -p /opt/spark; \
     tar -xzf "${tmpdir}/${SPARK_PACKAGE}.tgz" -C /opt/spark --strip-components=1; \
@@ -122,6 +129,12 @@ RUN set -eux; \
       test "${expected}" = "${actual}"; \
     }; \
     \
+    fetch_checksum() { \
+      local url="$1"; \
+      local dest="$2"; \
+      curl -fsS --connect-timeout 10 --max-time 30 -o "${dest}" "${url}"; \
+    }; \
+    \
     download_maven_jar() { \
       local group="$1"; \
       local artifact="$2"; \
@@ -135,11 +148,9 @@ RUN set -eux; \
       tmpfile="${tmpdir}/${filename}"; \
       curl -fL --retry 5 --retry-all-errors --connect-timeout 15 --max-time 300 \
         -o "${tmpfile}" "${base_url}/${filename}"; \
-      if curl -fL --retry 5 --retry-all-errors --connect-timeout 15 --max-time 120 \
-          -o "${tmpfile}.sha512" "${base_url}/${filename}.sha512"; then \
+      if fetch_checksum "${base_url}/${filename}.sha512" "${tmpfile}.sha512"; then \
         verify_checksum "${tmpfile}" "${tmpfile}.sha512" sha512sum; \
-      elif curl -fL --retry 5 --retry-all-errors --connect-timeout 15 --max-time 120 \
-          -o "${tmpfile}.sha1" "${base_url}/${filename}.sha1"; then \
+      elif fetch_checksum "${base_url}/${filename}.sha1" "${tmpfile}.sha1"; then \
         verify_checksum "${tmpfile}" "${tmpfile}.sha1" sha1sum; \
       else \
         echo "ERROR: missing checksum for ${artifact}-${version}" >&2; \
@@ -160,18 +171,6 @@ RUN set -eux; \
     \) -delete; \
     remove_matching_jars 'spark-connect-client-jvm_*.jar'; \
     remove_matching_jars 'spark-*-yarn-shuffle.jar'; \
-    remove_matching_jars 'aircompressor-*.jar'; \
-    remove_matching_jars 'avro-*.jar'; \
-    remove_matching_jars 'bundle-*.jar'; \
-    remove_matching_jars 'commons-beanutils-*.jar'; \
-    remove_matching_jars 'derby-*.jar'; \
-    remove_matching_jars 'hadoop-aws-*.jar'; \
-    remove_matching_jars 'hadoop-client-api-*.jar'; \
-    remove_matching_jars 'hadoop-client-runtime-*.jar'; \
-    remove_matching_jars 'jackson-core-*.jar'; \
-    remove_matching_jars 'lz4-java-*.jar'; \
-    remove_matching_jars 'netty-*.jar'; \
-    remove_matching_jars 'zookeeper-*.jar'; \
     \
     download_maven_jar org.apache.iceberg iceberg-spark-runtime-4.0_2.13 "${ICEBERG_VERSION}"; \
     download_maven_jar org.apache.hadoop hadoop-aws "${HADOOP_AWS_VERSION}"; \
