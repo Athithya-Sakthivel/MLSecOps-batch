@@ -3,6 +3,8 @@
 # - wheel-only Python installs keep flytekit out of its source-build path
 # - vulnerable Spark example jars are removed
 # - Spark Python runtime comes from the verified Spark distribution archive
+# - embedded Avro is stripped from hadoop-client-runtime to avoid shaded CVE exposure
+# - Derby jars are removed entirely
 
 FROM ubuntu:24.04@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c
 
@@ -25,7 +27,6 @@ ARG NETTY_VERSION=4.1.132.Final
 ARG AVRO_VERSION=1.11.4
 ARG BEANUTILS_VERSION=1.11.0
 ARG JACKSON_CORE_VERSION=2.15.0
-ARG DERBY_VERSION=10.17.1.0
 ARG ZOOKEEPER_VERSION=3.9.5
 ARG LZ4_VERSION=1.10.1
 ARG AIRCOMPRESSOR_VERSION=2.0.3
@@ -165,12 +166,39 @@ RUN set -eux; \
       find "${SPARK_JARS_DIR}" -maxdepth 1 -type f -name "${pattern}" -delete; \
     }; \
     \
+    strip_zip_prefix_from_matching_jars() { \
+      local pattern="$1"; \
+      local prefix="$2"; \
+      find "${SPARK_JARS_DIR}" -maxdepth 1 -type f -name "${pattern}" -print0 | \
+        while IFS= read -r -d '' jar_file; do \
+          python3 - "$jar_file" "$prefix" <<'PY'; \
+import os \
+import sys \
+import zipfile \
+\
+jar_path = sys.argv[1] \
+prefix = sys.argv[2] \
+tmp_path = jar_path + ".tmp" \
+\
+with zipfile.ZipFile(jar_path, "r") as src, zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as dst: \
+    for info in src.infolist(): \
+        if info.filename.startswith(prefix): \
+            continue \
+        dst.writestr(info, src.read(info.filename)) \
+\
+os.replace(tmp_path, jar_path) \
+PY \
+        done; \
+    }; \
+    \
     find "${SPARK_HOME}" -type f \( \
       -name 'jackson-core-asl-1.9.13.jar' -o \
       -name 'jackson-mapper-asl-1.9.13.jar' \
     \) -delete; \
     remove_matching_jars 'spark-connect-client-jvm_*.jar'; \
     remove_matching_jars 'spark-*-yarn-shuffle.jar'; \
+    remove_matching_jars 'avro-*.jar'; \
+    remove_matching_jars 'derby-*.jar'; \
     \
     download_maven_jar org.apache.iceberg iceberg-spark-runtime-4.0_2.13 "${ICEBERG_VERSION}"; \
     download_maven_jar org.apache.hadoop hadoop-aws "${HADOOP_AWS_VERSION}"; \
@@ -181,7 +209,6 @@ RUN set -eux; \
     download_maven_jar org.apache.avro avro "${AVRO_VERSION}"; \
     download_maven_jar commons-beanutils commons-beanutils "${BEANUTILS_VERSION}"; \
     download_maven_jar com.fasterxml.jackson.core jackson-core "${JACKSON_CORE_VERSION}"; \
-    download_maven_jar org.apache.derby derby "${DERBY_VERSION}"; \
     download_maven_jar org.apache.zookeeper zookeeper "${ZOOKEEPER_VERSION}"; \
     download_maven_jar at.yawk.lz4 lz4-java "${LZ4_VERSION}"; \
     download_maven_jar io.airlift aircompressor "${AIRCOMPRESSOR_VERSION}"; \
@@ -202,8 +229,12 @@ RUN set -eux; \
     download_maven_jar io.netty netty-transport-native-unix-common "${NETTY_VERSION}"; \
     download_maven_jar io.netty netty-transport-native-epoll "${NETTY_VERSION}" linux-x86_64; \
     \
+    strip_zip_prefix_from_matching_jars 'hadoop-client-runtime-*.jar' 'org/apache/avro/'; \
+    \
     test -z "$(find "${SPARK_HOME}" -type f \( -name 'jackson-core-asl-1.9.13.jar' -o -name 'jackson-mapper-asl-1.9.13.jar' \) -print -quit)"; \
     test -z "$(find "${SPARK_JARS_DIR}" -maxdepth 1 -type f \( -name 'spark-connect-client-jvm_*.jar' -o -name 'spark-*-yarn-shuffle.jar' \) -print -quit)"; \
+    test -z "$(find "${SPARK_JARS_DIR}" -maxdepth 1 -type f -name 'avro-*.jar' ! -name "avro-${AVRO_VERSION}.jar" -print -quit)"; \
+    test -z "$(find "${SPARK_JARS_DIR}" -maxdepth 1 -type f -name 'derby-*.jar' -print -quit)"; \
     \
     chmod -R a+rX \
       "${SPARK_HOME}" \
