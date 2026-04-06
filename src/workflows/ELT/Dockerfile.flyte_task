@@ -1,8 +1,7 @@
 # Flyte task image for ELT and iceberg maintenance.
-# Spark 4.0.2 Hadoop-free build to avoid bundled shaded Hadoop copies.
-# Single jar tree: PySpark's jars path is symlinked to /opt/spark/jars.
+# Ubuntu 24.04 base, explicit apt upgrade, verified Spark download.
 # - wheel-only Python installs keep flytekit out of its source-build path
-# - legacy Spark example jars are removed
+# - vulnerable Spark example jars are removed
 # - Spark Python runtime comes from the verified Spark distribution archive
 
 FROM ubuntu:24.04@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c
@@ -12,7 +11,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG DEBIAN_FRONTEND=noninteractive
 
 ARG SPARK_VERSION=4.0.2
-ARG SPARK_PACKAGE=spark-4.0.2-bin-without-hadoop
+ARG SPARK_PACKAGE=spark-4.0.2-bin-hadoop3
 ARG SPARK_PRIMARY_DOWNLOAD_BASE=https://downloads.apache.org/spark
 ARG SPARK_FALLBACK_DOWNLOAD_BASE=https://archive.apache.org/dist/spark
 
@@ -48,9 +47,7 @@ ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/opt/spark/python/lib/pyspark.zip:/opt/spark/python/lib/py4j-src.zip:/opt/app \
-    SPARK_HOME=/opt/spark \
-    PYTHONPATH="/opt/spark/python:/opt/spark/python/lib/py4j-src.zip"
+    PYTHONPATH=/opt/spark/python/lib/pyspark.zip:/opt/spark/python/lib/py4j-src.zip:/opt/app
 
 RUN set -eux; \
     apt-get update; \
@@ -76,35 +73,33 @@ RUN set -eux; \
     python3 -m venv /opt/venv; \
     /opt/venv/bin/pip install --upgrade \
       pip==26.0.1 \
-      setuptools==69.5.1 \
+      setuptools==78.1.1 \
       wheel==0.46.3; \
     /opt/venv/bin/pip install --only-binary=:all: \
       cloudpickle==3.1.2 \
       datasets==4.8.4 \
-      flytekit==1.16.16; \
+      flytekit==1.16.15; \
     /opt/venv/bin/pip install --only-binary=:all: --no-deps \
-      flytekitplugins-spark==1.16.16
+      flytekitplugins-spark==1.16.15
 
 RUN set -eux; \
     tmpdir="$(mktemp -d)"; \
     trap 'rm -rf "${tmpdir}"' EXIT; \
-    downloaded=0; \
     for base in "${SPARK_PRIMARY_DOWNLOAD_BASE}" "${SPARK_FALLBACK_DOWNLOAD_BASE}"; do \
       if curl -fL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 900 \
           -o "${tmpdir}/${SPARK_PACKAGE}.tgz" \
           "${base}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz"; then \
-        downloaded=1; \
         if curl -fsS --connect-timeout 10 --max-time 30 \
             -o "${tmpdir}/${SPARK_PACKAGE}.tgz.sha512" \
             "${base}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz.sha512"; then \
           expected="$(awk 'NF{print $1; exit}' "${tmpdir}/${SPARK_PACKAGE}.tgz.sha512")"; \
           actual="$(sha512sum "${tmpdir}/${SPARK_PACKAGE}.tgz" | awk '{print $1}')"; \
           test "${expected}" = "${actual}"; \
+          break; \
         fi; \
-        break; \
       fi; \
     done; \
-    test "${downloaded}" = 1; \
+    test -s "${tmpdir}/${SPARK_PACKAGE}.tgz"; \
     rm -rf /opt/spark; \
     mkdir -p /opt/spark; \
     tar -xzf "${tmpdir}/${SPARK_PACKAGE}.tgz" -C /opt/spark --strip-components=1; \
@@ -122,10 +117,6 @@ RUN set -eux; \
       "${HUGGINGFACE_HUB_CACHE}" \
       "${HF_DATASETS_CACHE}" \
       "${XDG_CACHE_HOME}"; \
-    PYSPARK_JARS_DIR="$(find /opt/venv/lib -type d -path '*/site-packages/pyspark/jars' | head -n1)"; \
-    test -n "${PYSPARK_JARS_DIR}"; \
-    rm -rf "${PYSPARK_JARS_DIR}"; \
-    ln -s "${SPARK_JARS_DIR}" "${PYSPARK_JARS_DIR}"; \
     \
     verify_checksum() { \
       local file="$1"; \
@@ -174,22 +165,12 @@ RUN set -eux; \
       find "${SPARK_JARS_DIR}" -maxdepth 1 -type f -name "${pattern}" -delete; \
     }; \
     \
+    find "${SPARK_HOME}" -type f \( \
+      -name 'jackson-core-asl-1.9.13.jar' -o \
+      -name 'jackson-mapper-asl-1.9.13.jar' \
+    \) -delete; \
     remove_matching_jars 'spark-connect-client-jvm_*.jar'; \
     remove_matching_jars 'spark-*-yarn-shuffle.jar'; \
-    remove_matching_jars 'jackson-core-asl-*.jar'; \
-    remove_matching_jars 'jackson-mapper-asl-*.jar'; \
-    remove_matching_jars 'aircompressor-*.jar'; \
-    remove_matching_jars 'avro-*.jar'; \
-    remove_matching_jars 'bundle-*.jar'; \
-    remove_matching_jars 'commons-beanutils-*.jar'; \
-    remove_matching_jars 'derby-*.jar'; \
-    remove_matching_jars 'hadoop-aws-*.jar'; \
-    remove_matching_jars 'hadoop-client-api-*.jar'; \
-    remove_matching_jars 'hadoop-client-runtime-*.jar'; \
-    remove_matching_jars 'jackson-core-*.jar'; \
-    remove_matching_jars 'lz4-java-*.jar'; \
-    remove_matching_jars 'netty-*.jar'; \
-    remove_matching_jars 'zookeeper-*.jar'; \
     \
     download_maven_jar org.apache.iceberg iceberg-spark-runtime-4.0_2.13 "${ICEBERG_VERSION}"; \
     download_maven_jar org.apache.hadoop hadoop-aws "${HADOOP_AWS_VERSION}"; \
@@ -221,7 +202,7 @@ RUN set -eux; \
     download_maven_jar io.netty netty-transport-native-unix-common "${NETTY_VERSION}"; \
     download_maven_jar io.netty netty-transport-native-epoll "${NETTY_VERSION}" linux-x86_64; \
     \
-    test -z "$(find "${SPARK_HOME}" -type f \( -name 'jackson-core-asl-*.jar' -o -name 'jackson-mapper-asl-*.jar' \) -print -quit)"; \
+    test -z "$(find "${SPARK_HOME}" -type f \( -name 'jackson-core-asl-1.9.13.jar' -o -name 'jackson-mapper-asl-1.9.13.jar' \) -print -quit)"; \
     test -z "$(find "${SPARK_JARS_DIR}" -maxdepth 1 -type f \( -name 'spark-connect-client-jvm_*.jar' -o -name 'spark-*-yarn-shuffle.jar' \) -print -quit)"; \
     \
     chmod -R a+rX \
