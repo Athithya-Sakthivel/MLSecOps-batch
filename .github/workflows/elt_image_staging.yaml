@@ -98,8 +98,6 @@ jobs:
 
       - name: Scan image with Trivy
         run: |
-          set -euo pipefail
-
           scan_image="${{ steps.build-image.outputs.imageid }}"
           test -n "${scan_image}"
 
