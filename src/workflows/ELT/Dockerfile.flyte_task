@@ -2,7 +2,7 @@
 # Ubuntu 24.04 base, explicit apt upgrade, verified Spark archive download.
 # - wheel-only Python installs keep flytekit out of its source-build path
 # - vulnerable Spark/Hadoop jars are removed and replaced with fixed lines
-# - the Spark jar set is copied into PySpark's bundled jars
+# - Spark Python runtime is taken from the verified Spark distribution archive
 
 FROM ubuntu:24.04@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c
 
@@ -45,7 +45,8 @@ ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
     LC_ALL=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/opt/spark/python/lib/pyspark.zip:/opt/spark/python/lib/py4j-src.zip:/opt/app
 
 RUN set -eux; \
     apt-get update; \
@@ -68,46 +69,52 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
-    python3 -m venv /opt/venv; \
-    /opt/venv/bin/pip install --upgrade \
-      pip==26.0.1 \
-      setuptools==78.1.1 \
-      wheel==0.46.3; \
-    /opt/venv/bin/pip install \
-      pyspark==${SPARK_VERSION}; \
-    /opt/venv/bin/pip install --only-binary=:all: \
-      cloudpickle==3.1.2 \
-      datasets==4.8.4 \
-      flytekit==1.16.15 \
-      flytekitplugins-spark==1.16.15
-
-RUN set -eux; \
     tmpdir="$(mktemp -d)"; \
     curl -fsSLo "${tmpdir}/${SPARK_PACKAGE}.tgz" \
       "${SPARK_DOWNLOAD_BASE}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz"; \
     curl -fsSLo "${tmpdir}/${SPARK_PACKAGE}.tgz.sha512" \
       "${SPARK_DOWNLOAD_BASE}/spark-${SPARK_VERSION}/${SPARK_PACKAGE}.tgz.sha512"; \
-    (cd "${tmpdir}" && sha512sum -c "${SPARK_PACKAGE}.tgz.sha512"); \
+    expected="$(tr -d '[:space:]' < "${tmpdir}/${SPARK_PACKAGE}.tgz.sha512")"; \
+    actual="$(sha512sum "${tmpdir}/${SPARK_PACKAGE}.tgz" | awk '{print $1}')"; \
+    test "${expected}" = "${actual}"; \
     rm -rf /opt/spark; \
     mkdir -p /opt/spark; \
     tar -xzf "${tmpdir}/${SPARK_PACKAGE}.tgz" -C /opt/spark --strip-components=1; \
-    rm -rf "${tmpdir}"
+    rm -rf "${tmpdir}"; \
+    PY4J_ZIP="$(find /opt/spark/python/lib -maxdepth 1 -type f -name 'py4j-*-src.zip' -print -quit)"; \
+    test -n "${PY4J_ZIP}"; \
+    ln -sf "$(basename "${PY4J_ZIP}")" /opt/spark/python/lib/py4j-src.zip
 
 RUN set -eux; \
-    PYSPARK_JARS_DIR="$("$VIRTUAL_ENV/bin/python" - <<'PY'
-import pathlib
-import pyspark
-print(pathlib.Path(pyspark.__file__).resolve().parent / "jars")
-PY
-)"; \
-    test -d "${PYSPARK_JARS_DIR}"; \
-    rm -rf "${PYSPARK_JARS_DIR}"; \
-    mkdir -p "${PYSPARK_JARS_DIR}" "${SPARK_HOME}/work-dir" "${HF_HOME}" "${HUGGINGFACE_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${XDG_CACHE_HOME}"; \
+    python3 -m venv /opt/venv; \
+    /opt/venv/bin/pip install --upgrade \
+      pip==26.0.1 \
+      setuptools==78.1.1 \
+      wheel==0.46.3; \
+    /opt/venv/bin/pip install --only-binary=:all: \
+      cloudpickle==3.1.2 \
+      datasets==4.8.4 \
+      flytekit==1.16.15; \
+    /opt/venv/bin/pip install --no-deps \
+      flytekitplugins-spark==1.16.15
+
+RUN set -eux; \
     SPARK_JARS_DIR="${SPARK_HOME}/jars"; \
+    mkdir -p \
+      "${SPARK_HOME}/work-dir" \
+      "${HF_HOME}" \
+      "${HUGGINGFACE_HUB_CACHE}" \
+      "${HF_DATASETS_CACHE}" \
+      "${XDG_CACHE_HOME}"; \
     \
-    remove_matching_jars() { \
-      local pattern="$1"; \
-      find "${SPARK_JARS_DIR}" -maxdepth 1 -type f -name "${pattern}" -delete; \
+    verify_download() { \
+      local file="$1"; \
+      local checksum_file="$2"; \
+      local algo="$3"; \
+      local expected actual; \
+      expected="$(tr -d '[:space:]' < "${checksum_file}")"; \
+      actual="$("${algo}" "${file}" | awk '{print $1}')"; \
+      test "${expected}" = "${actual}"; \
     }; \
     \
     download_maven_jar() { \
@@ -115,7 +122,7 @@ PY
       local artifact="$2"; \
       local version="$3"; \
       local classifier="${4:-}"; \
-      local rel_path="${group//./\\/}/${artifact}/${version}"; \
+      local rel_path="${group//./\/}/${artifact}/${version}"; \
       local filename="${artifact}-${version}${classifier:+-${classifier}}.jar"; \
       local base_url="https://repo.maven.apache.org/maven2/${rel_path}"; \
       local tmpdir tmpfile; \
@@ -123,14 +130,20 @@ PY
       tmpfile="${tmpdir}/${filename}"; \
       curl -fsSLo "${tmpfile}" "${base_url}/${filename}"; \
       if curl -fsSLo "${tmpfile}.sha512" "${base_url}/${filename}.sha512"; then \
-        (cd "${tmpdir}" && sha512sum -c "${filename}.sha512"); \
+        verify_download "${tmpfile}" "${tmpfile}.sha512" sha512sum; \
       elif curl -fsSLo "${tmpfile}.sha1" "${base_url}/${filename}.sha1"; then \
-        (cd "${tmpdir}" && sha1sum -c "${filename}.sha1"); \
+        verify_download "${tmpfile}" "${tmpfile}.sha1" sha1sum; \
       else \
-        echo "WARN: no checksum for ${artifact}-${version}, skipping verification" >&2; \
+        echo "ERROR: missing checksum for ${artifact}-${version}" >&2; \
+        exit 1; \
       fi; \
       cp -f "${tmpfile}" "${SPARK_JARS_DIR}/${filename}"; \
       rm -rf "${tmpdir}"; \
+    }; \
+    \
+    remove_matching_jars() { \
+      local pattern="$1"; \
+      find "${SPARK_JARS_DIR}" -maxdepth 1 -type f -name "${pattern}" -delete; \
     }; \
     \
     remove_matching_jars 'aircompressor-*.jar'; \
@@ -181,14 +194,9 @@ PY
       "${SPARK_HOME}/examples/jars/jackson-core-asl-1.9.13.jar" \
       "${SPARK_HOME}/examples/jars/jackson-mapper-asl-1.9.13.jar"; \
     \
-    rm -rf "${PYSPARK_JARS_DIR}"; \
-    mkdir -p "${PYSPARK_JARS_DIR}"; \
-    cp -a "${SPARK_JARS_DIR}/." "${PYSPARK_JARS_DIR}/"; \
-    \
     chmod -R a+rX \
-      "${SPARK_HOME}/jars" \
-      "${SPARK_HOME}/work-dir" \
-      "${PYSPARK_JARS_DIR}" \
+      "${SPARK_HOME}" \
+      /opt/venv \
       "${HF_HOME}" \
       "${HUGGINGFACE_HUB_CACHE}" \
       "${HF_DATASETS_CACHE}" \
