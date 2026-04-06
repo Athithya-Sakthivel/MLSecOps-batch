@@ -23,7 +23,7 @@ concurrency:
 
 env:
   TRIVY_IMAGE: ghcr.io/athithya-sakthivel/trivy:0.69.3-safe@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
-  TRIVY_CACHE_DIR: ${{ github.workspace }}/.trivy-cache
+  TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
 
 jobs:
   build-scan-push:
@@ -86,6 +86,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build image locally
+        id: build-image
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: ./
@@ -102,22 +103,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          scan_image="${{ steps.build-image.outputs.imageid }}"
+          test -n "${scan_image}"
+
+          ignore_args=()
+          if [[ -f .trivyignore ]]; then
+            ignore_args+=(--ignorefile /workspace/.trivyignore)
+          fi
+
           docker run --rm \
-            --user "$(id -u):$(id -g)" \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "${TRIVY_CACHE_DIR}:/trivy-cache" \
+            -v "${TRIVY_CACHE_DIR}:/root/.cache" \
             -v "$PWD:/workspace" \
             -w /workspace \
             "${TRIVY_IMAGE}" \
             image \
-            --cache-dir /trivy-cache \
-            --ignorefile /workspace/.trivyignore \
+            --cache-dir /root/.cache/trivy \
             --scanners vuln \
             --severity HIGH,CRITICAL \
             --exit-on-eol 1 \
             --exit-code 1 \
             --quiet \
-            "${{ steps.image-meta.outputs.elt_task_image }}"
+            "${ignore_args[@]}" \
+            "${scan_image}"
 
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
