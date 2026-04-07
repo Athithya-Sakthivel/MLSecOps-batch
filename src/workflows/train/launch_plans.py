@@ -1,10 +1,10 @@
-# src/workflows/train/launch_plans.py
 from __future__ import annotations
 
 import os
 
 from flytekit import LaunchPlan
-from workflows.train.train import train
+
+from workflows.train.workflow import train
 
 __all__ = [
     "TRAIN_WORKFLOW_LP",
@@ -16,10 +16,6 @@ DEFAULT_TUNING_SAMPLE_ROWS = 50_000
 DEFAULT_MAX_EVAL_ROWS = 250_000
 DEFAULT_MAX_BOOST_ROUNDS = 20_000
 
-MODEL_ARTIFACTS_S3_BUCKET = os.environ.get(
-    "MODEL_ARTIFACTS_S3_BUCKET",
-    "s3://e2e-mlops-data-681802563986/model-artifacts",
-)
 
 def _default_train_num_threads() -> int:
     cpu_count = os.cpu_count() or 1

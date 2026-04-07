@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import hashlib
@@ -9,9 +10,7 @@ from datetime import date
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from mlflow.models import infer_signature
-from onnxmltools import convert_lightgbm
-from onnxmltools.convert.common.data_types import FloatTensorType
+import polars as pl
 from pyiceberg.catalog import load_catalog
 from sklearn.metrics import mean_absolute_error, mean_squared_error, median_absolute_error
 
@@ -104,6 +103,8 @@ RAW_NUMERIC_COLUMNS = [
     "trip_count_90d_zone_hour",
 ]
 
+MODEL_INPUT_COLUMNS = RAW_CATEGORICAL_COLUMNS + RAW_NUMERIC_COLUMNS
+
 DERIVED_NUMERIC_COLUMNS = [
     "pickup_hour_sin",
     "pickup_hour_cos",
@@ -125,9 +126,114 @@ DERIVED_NUMERIC_COLUMNS = [
     "service_zone_pair_id",
 ]
 
-MODEL_FEATURE_COLUMNS = RAW_CATEGORICAL_COLUMNS + RAW_NUMERIC_COLUMNS + DERIVED_NUMERIC_COLUMNS
+MODEL_FEATURE_COLUMNS = [*MODEL_INPUT_COLUMNS, *DERIVED_NUMERIC_COLUMNS]
 
 CATEGORICAL_COLUMNS = list(RAW_CATEGORICAL_COLUMNS)
+
+
+@dataclass(frozen=True)
+class SnapshotLineage:
+    table_uuid: str
+    table_location: str
+    current_schema_id: int
+    current_snapshot_id: int | None
+    metadata_location: str
+    format_version: int
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CandidateConfig:
+    name: str
+    learning_rate: float
+    num_leaves: int
+    max_depth: int
+    min_child_samples: int
+    feature_fraction: float
+    subsample: float
+    reg_alpha: float
+    reg_lambda: float
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CandidateReport:
+    name: str
+    params: CandidateConfig
+    best_iteration: int
+    metrics: dict[str, float]
+    score: float
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ModelArtifactPlan:
+    artifact_root_s3_uri: str
+    onnx_model_s3_uri: str
+    mlflow_model_s3_uri: str
+    summary_s3_uri: str
+    manifest_s3_uri: str
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SplitFrames:
+    train_eval: pd.DataFrame
+    test: pd.DataFrame
+    train_eval_cutoff: str
+    test_start_date: str
+
+
+@dataclass(frozen=True)
+class TrainingResult:
+    table_identifier: str
+    schema_version: str
+    feature_version: str
+    lineage: SnapshotLineage
+    category_levels: dict[str, list[int]]
+    selected_candidate: CandidateConfig
+    candidate_reports: list[CandidateReport]
+    search_best_metrics: dict[str, float]
+    inner_metrics: dict[str, float]
+    holdout_metrics: dict[str, float]
+    holdout_baseline_metrics: dict[str, float]
+    label_cap_seconds: float
+    train_label_p50_seconds: float
+    best_iteration_inner: int
+    final_num_boost_round: int
+    train_rows: int
+    test_rows: int
+    artifact_plan: ModelArtifactPlan
+    model_input_columns: list[str]
+    model_feature_columns: list[str]
+
+    def to_json(self) -> str:
+        payload = asdict(self)
+        return json.dumps(payload, indent=2, default=str)
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
 
 BASE_LGBM_PARAMS: dict[str, object] = {
     "objective": "regression_l1",
@@ -148,133 +254,88 @@ BASE_LGBM_PARAMS: dict[str, object] = {
     "subsample_freq": 1,
 }
 
-CANDIDATE_CONFIGS: list[dict[str, object]] = [
-    {
-        "name": "best_trial_replay",
-        "learning_rate": 0.036521134985273,
-        "num_leaves": 20,
-        "max_depth": -1,
-        "min_child_samples": 36,
-        "feature_fraction": 0.745279704149923,
-        "subsample": 0.9041688589514847,
-        "reg_alpha": 0.0012819238704314968,
-        "reg_lambda": 0.0022138840237013553,
-    },
-    {
-        "name": "compact_regularized",
-        "learning_rate": 0.03,
-        "num_leaves": 31,
-        "max_depth": -1,
-        "min_child_samples": 30,
-        "feature_fraction": 0.85,
-        "subsample": 0.85,
-        "reg_alpha": 0.05,
-        "reg_lambda": 1.0,
-    },
-    {
-        "name": "wider_tree",
-        "learning_rate": 0.025,
-        "num_leaves": 63,
-        "max_depth": -1,
-        "min_child_samples": 20,
-        "feature_fraction": 0.80,
-        "subsample": 0.80,
-        "reg_alpha": 0.01,
-        "reg_lambda": 1.5,
-    },
-    {
-        "name": "deeper_tree",
-        "learning_rate": 0.035,
-        "num_leaves": 96,
-        "max_depth": 7,
-        "min_child_samples": 40,
-        "feature_fraction": 0.75,
-        "subsample": 0.90,
-        "reg_alpha": 0.10,
-        "reg_lambda": 2.0,
-    },
-    {
-        "name": "high_bias_low_variance",
-        "learning_rate": 0.05,
-        "num_leaves": 31,
-        "max_depth": -1,
-        "min_child_samples": 80,
-        "feature_fraction": 0.90,
-        "subsample": 0.90,
-        "reg_alpha": 0.20,
-        "reg_lambda": 3.0,
-    },
-    {
-        "name": "small_tree_fast",
-        "learning_rate": 0.04,
-        "num_leaves": 15,
-        "max_depth": -1,
-        "min_child_samples": 60,
-        "feature_fraction": 0.70,
-        "subsample": 0.90,
-        "reg_alpha": 0.0,
-        "reg_lambda": 0.5,
-    },
-    {
-        "name": "extra_wide_low_lr",
-        "learning_rate": 0.02,
-        "num_leaves": 128,
-        "max_depth": -1,
-        "min_child_samples": 15,
-        "feature_fraction": 0.75,
-        "subsample": 0.85,
-        "reg_alpha": 0.05,
-        "reg_lambda": 2.0,
-    },
+CANDIDATE_CONFIGS: list[CandidateConfig] = [
+    CandidateConfig(
+        name="best_trial_replay",
+        learning_rate=0.036521134985273,
+        num_leaves=20,
+        max_depth=-1,
+        min_child_samples=36,
+        feature_fraction=0.745279704149923,
+        subsample=0.9041688589514847,
+        reg_alpha=0.0012819238704314968,
+        reg_lambda=0.0022138840237013553,
+    ),
+    CandidateConfig(
+        name="compact_regularized",
+        learning_rate=0.03,
+        num_leaves=31,
+        max_depth=-1,
+        min_child_samples=30,
+        feature_fraction=0.85,
+        subsample=0.85,
+        reg_alpha=0.05,
+        reg_lambda=1.0,
+    ),
+    CandidateConfig(
+        name="wider_tree",
+        learning_rate=0.025,
+        num_leaves=63,
+        max_depth=-1,
+        min_child_samples=20,
+        feature_fraction=0.80,
+        subsample=0.80,
+        reg_alpha=0.01,
+        reg_lambda=1.5,
+    ),
+    CandidateConfig(
+        name="deeper_tree",
+        learning_rate=0.035,
+        num_leaves=96,
+        max_depth=7,
+        min_child_samples=40,
+        feature_fraction=0.75,
+        subsample=0.90,
+        reg_alpha=0.10,
+        reg_lambda=2.0,
+    ),
+    CandidateConfig(
+        name="high_bias_low_variance",
+        learning_rate=0.05,
+        num_leaves=31,
+        max_depth=-1,
+        min_child_samples=80,
+        feature_fraction=0.90,
+        subsample=0.90,
+        reg_alpha=0.20,
+        reg_lambda=3.0,
+    ),
+    CandidateConfig(
+        name="small_tree_fast",
+        learning_rate=0.04,
+        num_leaves=15,
+        max_depth=-1,
+        min_child_samples=60,
+        feature_fraction=0.70,
+        subsample=0.90,
+        reg_alpha=0.0,
+        reg_lambda=0.5,
+    ),
+    CandidateConfig(
+        name="extra_wide_low_lr",
+        learning_rate=0.02,
+        num_leaves=128,
+        max_depth=-1,
+        min_child_samples=15,
+        feature_fraction=0.75,
+        subsample=0.85,
+        reg_alpha=0.05,
+        reg_lambda=2.0,
+    ),
 ]
 
 
-@dataclass(frozen=True)
-class SplitFrames:
-    train_eval: pd.DataFrame
-    test: pd.DataFrame
-    train_eval_cutoff: str
-    test_start_date: str
-
-
-@dataclass(frozen=True)
-class ModelArtifactPlan:
-    artifact_root_s3_uri: str
-    onnx_model_s3_uri: str
-    mlflow_model_s3_uri: str
-    summary_s3_uri: str
-    manifest_s3_uri: str
-
-
-@dataclass(frozen=True)
-class TrainingResult:
-    table_identifier: str
-    schema_version: str
-    feature_version: str
-    lineage: dict[str, object]
-    category_levels: dict[str, list[int]]
-    selected_candidate: dict[str, object]
-    candidate_reports: list[dict[str, object]]
-    search_best_metrics: dict[str, float]
-    inner_metrics: dict[str, float]
-    holdout_metrics: dict[str, float]
-    holdout_baseline_metrics: dict[str, float]
-    label_cap_seconds: float
-    train_label_p50_seconds: float
-    best_iteration_inner: int
-    final_num_boost_round: int
-    train_rows: int
-    test_rows: int
-    artifact_plan: ModelArtifactPlan
-    model_input_columns: list[str]
-    model_feature_columns: list[str]
-
-    def to_json(self) -> str:
-        payload = asdict(self)
-        return json.dumps(payload, indent=2, default=str)
-
-
-def load_rest_catalog(catalog_name: str, iceberg_rest_uri: str, iceberg_warehouse: str) -> object:
+def load_rest_catalog(catalog_name: str, iceberg_rest_uri: str, iceberg_warehouse: str):
     return load_catalog(
         catalog_name,
         type="rest",
@@ -283,30 +344,31 @@ def load_rest_catalog(catalog_name: str, iceberg_rest_uri: str, iceberg_warehous
     )
 
 
-def load_iceberg_table(catalog_name: str, iceberg_rest_uri: str, iceberg_warehouse: str) -> object:
+def load_iceberg_table(catalog_name: str, iceberg_rest_uri: str, iceberg_warehouse: str):
     catalog = load_rest_catalog(catalog_name, iceberg_rest_uri, iceberg_warehouse)
     return catalog.load_table(TABLE_IDENTIFIER_TUPLE)
 
 
-def table_snapshot_lineage(table: object) -> dict[str, object]:
+def table_snapshot_lineage(table) -> SnapshotLineage:
     snapshot = table.current_snapshot()
     metadata = table.metadata
-    return {
-        "table_uuid": str(getattr(metadata, "table_uuid", "")),
-        "table_location": str(getattr(metadata, "location", "")),
-        "current_schema_id": int(getattr(metadata, "current_schema_id", -1)),
-        "current_snapshot_id": int(snapshot.snapshot_id) if snapshot is not None else None,
-        "metadata_location": str(getattr(metadata, "metadata_location", "")),
-        "format_version": int(getattr(metadata, "format_version", -1)),
-    }
+    return SnapshotLineage(
+        table_uuid=str(getattr(metadata, "table_uuid", "")),
+        table_location=str(getattr(metadata, "location", "")),
+        current_schema_id=int(getattr(metadata, "current_schema_id", -1)),
+        current_snapshot_id=int(snapshot.snapshot_id) if snapshot is not None else None,
+        metadata_location=str(getattr(metadata, "metadata_location", "")),
+        format_version=int(getattr(metadata, "format_version", -1)),
+    )
 
 
-def read_table_as_dataframe(table: object) -> pd.DataFrame:
-    df = table.scan().to_arrow().to_pandas()
-    df = df.reindex(columns=EXPECTED_COLUMNS).copy()
-    df["as_of_ts"] = pd.to_datetime(df["as_of_ts"], utc=True, errors="raise")
-    df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="raise").dt.date
-    return df
+def read_table_as_dataframe(table) -> pd.DataFrame:
+    lf = pl.scan_iceberg(table).select(EXPECTED_COLUMNS)
+    pdf = lf.collect(engine="streaming").to_pandas()
+    pdf = pdf.reindex(columns=EXPECTED_COLUMNS).copy()
+    pdf["as_of_ts"] = pd.to_datetime(pdf["as_of_ts"], utc=True, errors="raise")
+    pdf["as_of_date"] = pd.to_datetime(pdf["as_of_date"], errors="raise").dt.date
+    return pdf
 
 
 def validate_raw_dataframe(df: pd.DataFrame) -> None:
@@ -569,7 +631,7 @@ def predict_seconds_from_model(
 def fit_lgbm_candidate(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
-    candidate: dict[str, object],
+    candidate: CandidateConfig,
     label_cap_seconds: float,
     num_threads: int,
     category_levels: dict[str, list[int]],
@@ -578,14 +640,14 @@ def fit_lgbm_candidate(
     params = make_base_params(num_threads)
     params.update(
         {
-            "learning_rate": float(candidate["learning_rate"]),
-            "num_leaves": int(candidate["num_leaves"]),
-            "max_depth": int(candidate["max_depth"]),
-            "min_child_samples": int(candidate["min_child_samples"]),
-            "subsample": float(candidate["subsample"]),
-            "feature_fraction": float(candidate["feature_fraction"]),
-            "reg_alpha": float(candidate["reg_alpha"]),
-            "reg_lambda": float(candidate["reg_lambda"]),
+            "learning_rate": float(candidate.learning_rate),
+            "num_leaves": int(candidate.num_leaves),
+            "max_depth": int(candidate.max_depth),
+            "min_child_samples": int(candidate.min_child_samples),
+            "subsample": float(candidate.subsample),
+            "feature_fraction": float(candidate.feature_fraction),
+            "reg_alpha": float(candidate.reg_alpha),
+            "reg_lambda": float(candidate.reg_lambda),
         }
     )
 
@@ -640,14 +702,14 @@ def search_best_model(
     num_threads: int,
     tuning_sample_rows: int,
     max_boost_rounds: int,
-) -> tuple[dict[str, object], list[dict[str, object]], dict[str, float], int, dict[str, list[int]]]:
+) -> tuple[CandidateConfig, list[CandidateReport], dict[str, float], int, dict[str, list[int]]]:
     search_df = train_eval_df.sort_values("as_of_ts").reset_index(drop=True)
     search_df = evenly_spaced_sample(search_df, max_rows=min(len(search_df), int(tuning_sample_rows)))
     search_train_df, search_val_df, _ = split_by_date_fraction(search_df, 0.80)
 
     category_levels = build_category_levels(search_train_df)
-    candidate_reports: list[dict[str, object]] = []
-    best_candidate: dict[str, object] | None = None
+    candidate_reports: list[CandidateReport] = []
+    best_candidate: CandidateConfig | None = None
     best_model: lgb.LGBMRegressor | None = None
     best_iteration = 0
     best_metrics: dict[str, float] | None = None
@@ -665,23 +727,13 @@ def search_best_model(
         )
         score = float(metrics["mae_seconds_capped"])
         candidate_reports.append(
-            {
-                "name": candidate["name"],
-                "params": {
-                    k: (
-                        float(v)
-                        if isinstance(v, (np.floating,))
-                        else int(v)
-                        if isinstance(v, (np.integer,))
-                        else v
-                    )
-                    for k, v in candidate.items()
-                    if k != "name"
-                },
-                "best_iteration": int(candidate_best_iteration),
-                "metrics": metrics,
-                "score": score,
-            }
+            CandidateReport(
+                name=candidate.name,
+                params=candidate,
+                best_iteration=int(candidate_best_iteration),
+                metrics=metrics,
+                score=score,
+            )
         )
 
         if score < best_score:
@@ -699,7 +751,7 @@ def search_best_model(
 
 def train_final_model(
     train_eval_df: pd.DataFrame,
-    best_candidate: dict[str, object],
+    best_candidate: CandidateConfig,
     final_num_boost_round: int,
     label_cap_seconds: float,
     num_threads: int,
@@ -708,14 +760,14 @@ def train_final_model(
     params = make_base_params(num_threads)
     params.update(
         {
-            "learning_rate": float(best_candidate["learning_rate"]),
-            "num_leaves": int(best_candidate["num_leaves"]),
-            "max_depth": int(best_candidate["max_depth"]),
-            "min_child_samples": int(best_candidate["min_child_samples"]),
-            "subsample": float(best_candidate["subsample"]),
-            "feature_fraction": float(best_candidate["feature_fraction"]),
-            "reg_alpha": float(best_candidate["reg_alpha"]),
-            "reg_lambda": float(best_candidate["reg_lambda"]),
+            "learning_rate": float(best_candidate.learning_rate),
+            "num_leaves": int(best_candidate.num_leaves),
+            "max_depth": int(best_candidate.max_depth),
+            "min_child_samples": int(best_candidate.min_child_samples),
+            "subsample": float(best_candidate.subsample),
+            "feature_fraction": float(best_candidate.feature_fraction),
+            "reg_alpha": float(best_candidate.reg_alpha),
+            "reg_lambda": float(best_candidate.reg_lambda),
         }
     )
 
@@ -773,6 +825,9 @@ def compute_baseline_metrics(
 
 
 def export_onnx_model(final_model: lgb.LGBMRegressor, feature_count: int) -> object:
+    from onnxmltools import convert_lightgbm
+    from onnxmltools.convert.common.data_types import FloatTensorType
+
     initial_types = [("input", FloatTensorType([None, feature_count]))]
     onnx_model = convert_lightgbm(
         final_model.booster_,
@@ -781,18 +836,14 @@ def export_onnx_model(final_model: lgb.LGBMRegressor, feature_count: int) -> obj
     return onnx_model
 
 
-def infer_mlflow_signature(input_example: pd.DataFrame, predictions: np.ndarray):
-    return infer_signature(input_example, pd.DataFrame({PREDICTION_COLUMN: predictions}))
-
-
 def build_artifact_plan(
     model_artifacts_s3_bucket: str,
     feature_version: str,
-    lineage: dict[str, object],
+    lineage: SnapshotLineage,
     train_eval_cutoff: str,
 ) -> ModelArtifactPlan:
     bucket = model_artifacts_s3_bucket.rstrip("/")
-    artifact_root = f"{bucket}/{feature_version}/{lineage['table_uuid']}/{train_eval_cutoff}"
+    artifact_root = f"{bucket}/{feature_version}/{lineage.table_uuid}/{train_eval_cutoff}"
     return ModelArtifactPlan(
         artifact_root_s3_uri=artifact_root,
         onnx_model_s3_uri=f"{artifact_root}/onnx_model",
@@ -804,10 +855,10 @@ def build_artifact_plan(
 
 def build_training_result(
     *,
-    lineage: dict[str, object],
+    lineage: SnapshotLineage,
     category_levels: dict[str, list[int]],
-    selected_candidate: dict[str, object],
-    candidate_reports: list[dict[str, object]],
+    selected_candidate: CandidateConfig,
+    candidate_reports: list[CandidateReport],
     search_best_metrics: dict[str, float],
     inner_metrics: dict[str, float],
     holdout_metrics: dict[str, float],
@@ -839,6 +890,6 @@ def build_training_result(
         train_rows=int(train_rows),
         test_rows=int(test_rows),
         artifact_plan=artifact_plan,
-        model_input_columns=RAW_CATEGORICAL_COLUMNS + RAW_NUMERIC_COLUMNS,
+        model_input_columns=MODEL_INPUT_COLUMNS,
         model_feature_columns=MODEL_FEATURE_COLUMNS,
     )

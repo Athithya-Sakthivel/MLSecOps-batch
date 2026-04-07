@@ -136,6 +136,8 @@ if ! grep -qs 'export PATH=$HOME/.local/bin:$PATH' "${HOME}/.bashrc"; then
 fi
 
 log "creating Python virtual environments"
+
+# flyte local environments needs only the packages that are imported at module load time
 python3 -m venv .venv_elt
 .venv_elt/bin/python -m pip install --upgrade pip wheel setuptools
 .venv_elt/bin/python -m pip install \
@@ -143,15 +145,13 @@ python3 -m venv .venv_elt
   flytekitplugins-spark==1.16.15 \
   pyspark==4.1.1 \
   cloudpickle==3.1.2
-
 python3 -m venv .venv_train
 .venv_train/bin/python -m pip install --upgrade pip wheel setuptools
-.venv_train/bin/python -m pip install \
-  flytekit==1.16.15 \
-  flyteplugins-ray==2.0.6 \
-  numpy==1.26.4 \
-  pandas==2.2.3
+.venv_train/bin/python -m pip install boto3==1.42.70 flytekit==1.16.16 mlflow==3.10.1 numpy==2.4.4 pandas==2.3.3 \
+ lightgbm==4.6.0 onnx==1.21.0 onnxruntime==1.24.4 onnxmltools==1.16.0 pyiceberg==0.11.0 scikit-learn==1.8.0 polars==1.39.3
 
+
+# local testing requries all packages
 python3 -m venv .venv_deploy
 .venv_deploy/bin/python -m pip install --upgrade pip wheel setuptools
 .venv_deploy/bin/python -m pip install -r src/workflows/deploy/requirements.txt
@@ -160,9 +160,9 @@ log "installing Python packages"
 python3 -m pip install --no-cache-dir --break-system-packages \
   pyarrow==23.0.1 \
   boto3==1.42.81 \
-  pandas==3.0.1 \
   pre-commit==4.5.1 \
-  datasets==4.8.4
+  datasets==4.8.4 \
+  pyyaml==6.0.3
 
 log "installing pre-commit hooks"
 pre-commit install --install-hooks

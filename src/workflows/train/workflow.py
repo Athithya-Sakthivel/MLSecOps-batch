@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,10 +22,8 @@ from workflows.train.core import (
     EXPECTED_FEATURE_VERSION,
     INNER_VALIDATION_FRACTION,
     LABEL_COLUMN,
-    MODEL_FAMILY,
     MODEL_FEATURE_COLUMNS,
     PREDICTION_COLUMN,
-    TARGET_TRANSFORM,
     TrainingResult,
     build_artifact_plan,
     build_training_result,
@@ -48,17 +45,28 @@ from workflows.train.core import (
     validate_raw_dataframe,
 )
 
-ICEBERG_REST_URI = os.environ.get("ICEBERG_REST_URI", "http://iceberg-rest.default.svc.cluster.local:8181")
+ICEBERG_REST_URI = os.environ.get(
+    "ICEBERG_REST_URI",
+    "http://iceberg-rest.default.svc.cluster.local:8181",
+)
 ICEBERG_WAREHOUSE = os.environ.get(
     "ICEBERG_WAREHOUSE",
     "s3://e2e-mlops-data-681802563986/iceberg/warehouse/",
 )
 ICEBERG_CATALOG_NAME = os.environ.get("ICEBERG_CATALOG_NAME", "default")
-MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow.mlflow.svc.cluster.local:5000")
+MLFLOW_TRACKING_URI = os.environ.get(
+    "MLFLOW_TRACKING_URI",
+    "http://mlflow.mlflow.svc.cluster.local:5000",
+)
 MODEL_ARTIFACTS_S3_BUCKET = os.environ.get(
     "MODEL_ARTIFACTS_S3_BUCKET",
     "s3://e2e-mlops-data-681802563986/model-artifacts",
 )
+USE_IAM = os.environ.get("USE_IAM", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+MODEL_FAMILY = "lightgbm"
+TARGET_TRANSFORM = "log1p"
+MAX_PREDICTION_SECONDS = 24.0 * 3600.0
 
 PYFUNC_MODEL_NAME = "trip_eta_lgbm_pyfunc"
 RAW_ONNX_FILENAME = "model.onnx"
@@ -78,7 +86,24 @@ def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     return bucket, key
 
 
+def _require_static_aws_credentials_if_needed() -> None:
+    if USE_IAM:
+        return
+
+    missing: list[str] = []
+    for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        if not os.environ.get(key, "").strip():
+            missing.append(key)
+
+    if missing:
+        raise RuntimeError(
+            "USE_IAM=false requires static AWS credentials in the runtime environment: "
+            + ", ".join(missing)
+        )
+
+
 def _s3_client():
+    _require_static_aws_credentials_if_needed()
     return boto3.client("s3")
 
 
@@ -119,7 +144,7 @@ def _predict_seconds_from_model(
     else:
         preds_log = model.predict(features, num_iteration=num_iteration)
     preds_seconds = from_log_target(preds_log)
-    return clip_seconds(preds_seconds, float(24.0 * 3600.0))
+    return clip_seconds(preds_seconds, MAX_PREDICTION_SECONDS)
 
 
 def _evaluate_model(
@@ -151,7 +176,7 @@ def _evaluate_model(
 
 
 class Log1pLightGBMPyFuncModel(mlflow.pyfunc.PythonModel):
-    def load_context(self, context) -> None:
+    def load_context(self, context: object) -> None:
         summary_path = Path(context.artifacts["summary"])
         onnx_path = Path(context.artifacts["onnx_model"])
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -166,7 +191,7 @@ class Log1pLightGBMPyFuncModel(mlflow.pyfunc.PythonModel):
         )
         self._input_name = self._onnx_session.get_inputs()[0].name
 
-    def predict(self, context, model_input) -> pd.DataFrame:
+    def predict(self, context: object, model_input: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(model_input, pd.DataFrame):
             if hasattr(model_input, "to_pandas"):
                 model_input = model_input.to_pandas()
@@ -194,14 +219,14 @@ def _materialize_training_bundle(
     manifest_path = local_bundle / MANIFEST_FILENAME
 
     onnx.save_model(onnx_model, str(raw_onnx_path))
-    write_json(summary_path, asdict(training_result))
+    write_json(summary_path, training_result.as_dict())
     write_json(
         manifest_path,
         {
             "table_identifier": training_result.table_identifier,
             "schema_version": training_result.schema_version,
             "feature_version": training_result.feature_version,
-            "artifact_plan": asdict(training_result.artifact_plan),
+            "artifact_plan": training_result.artifact_plan.as_dict(),
             "train_rows": training_result.train_rows,
             "test_rows": training_result.test_rows,
             "best_iteration_inner": training_result.best_iteration_inner,
@@ -219,6 +244,8 @@ def train_model_task(
     tuning_sample_rows: int,
     max_boost_rounds: int,
 ) -> TrainingResult:
+    _require_static_aws_credentials_if_needed()
+
     table = load_iceberg_table(ICEBERG_CATALOG_NAME, ICEBERG_REST_URI, ICEBERG_WAREHOUSE)
     raw_df = read_table_as_dataframe(table)
     validate_raw_dataframe(raw_df)
@@ -320,6 +347,8 @@ def evaluate_and_register_task(
     mlflow_experiment_name: str,
     max_eval_rows: int,
 ) -> str:
+    _require_static_aws_credentials_if_needed()
+
     artifact_plan = training_result.artifact_plan
     table = load_iceberg_table(ICEBERG_CATALOG_NAME, ICEBERG_REST_URI, ICEBERG_WAREHOUSE)
     raw_df = read_table_as_dataframe(table)
@@ -364,10 +393,11 @@ def evaluate_and_register_task(
                     "summary_s3_uri": artifact_plan.summary_s3_uri,
                     "manifest_s3_uri": artifact_plan.manifest_s3_uri,
                     "test_digest": feature_digest(test_df, ["trip_id", "as_of_ts"]),
+                    "use_iam": str(USE_IAM).lower(),
                 }
             )
 
-            mlflow.log_metrics(_numeric_metrics(asdict(training_result)["holdout_metrics"]))
+            mlflow.log_metrics(_numeric_metrics(training_result.holdout_metrics))
             mlflow.log_metrics(
                 {
                     "holdout_baseline_mae_seconds_capped": float(training_result.holdout_baseline_metrics["mae"]),
@@ -376,8 +406,8 @@ def evaluate_and_register_task(
                 }
             )
 
-            mlflow.log_dict(asdict(training_result), "training_summary.json")
-            mlflow.log_dict(asdict(artifact_plan), "artifact_plan.json")
+            mlflow.log_dict(training_result.as_dict(), "training_summary.json")
+            mlflow.log_dict(artifact_plan.as_dict(), "artifact_plan.json")
 
             model_info = mlflow.pyfunc.log_model(
                 name=PYFUNC_MODEL_NAME,
@@ -411,7 +441,7 @@ def evaluate_and_register_task(
                 {
                     "run_id": mlflow.active_run().info.run_id if mlflow.active_run() else None,
                     "model_uri": model_info.model_uri,
-                    "artifact_plan": asdict(artifact_plan),
+                    "artifact_plan": artifact_plan.as_dict(),
                     "evaluation_metrics": _numeric_metrics(eval_result.metrics),
                 },
                 indent=2,

@@ -6,16 +6,19 @@ core:
 elt:
 	make core
 	bash src/infra/elt/iceberg.sh --rollout && bash src/infra/elt/spark_operator.sh --rollout && \
-	python3 src/infra/core/flyte_setup.py --rollout && bash src/workflows/ELT/run.sh && sleep 3600 && bash src/infra/elt/spark_operator.sh --delete
-
-
+	python3 src/infra/core/flyte_setup.py --rollout && bash src/workflows/ELT/run.sh && sleep 1800
 
 backup-pg:
 	bash src/infra/core/postgres_cluster.sh backup && aws s3 ls $$PG_BACKUPS_S3_BUCKET/postgres_backups/ --recursive
 
+prune-elt:
+	bash src/infra/elt/spark_operator.sh --cleanup
+	
 train:
-	python3 src/infra/train/mlflow_server.py
+	python3 src/infra/train/mlflow_server.py --rollout && bash src/workflows/train/commands.sh
 
+prune-train:
+	python3 src/infra/train/mlflow_server.py --delete
 
 set-sa:
 	bash src/core/default_storage_class.sh
