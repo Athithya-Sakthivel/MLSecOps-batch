@@ -1,26 +1,25 @@
-CVE-2024-6345 # setuptools<70 required by flytekit; package_index not used
-CVE-2025-47273 # setuptools constraint; no PackageIndex usage in runtime
+CVE-2024-6345  # setuptools<70 required by flytekit; package_index not used in this runtime
+CVE-2025-47273 # setuptools constraint; no PackageIndex usage at runtime
 
-CVE-2026-0861 # glibc (libc6/libc-bin); no direct usage of memalign from user input
-CVE-2025-69720 # ncurses/libtinfo; no TTY interaction in container
-CVE-2025-7458 # libsqlite3; no untrusted SQL execution path
-CVE-2026-29111 # libsystemd/libudev; container does not run systemd
-CVE-2023-45853 # zlib; no direct zip manipulation with untrusted input
+CVE-2026-0861  # glibc (libc6/libc-bin); no direct memalign usage with untrusted input
+CVE-2025-69720 # ncurses/libtinfo; container has no interactive TTY usage
+CVE-2025-7458  # libsqlite3; no untrusted SQL execution path
+CVE-2026-29111 # libsystemd/libudev; container does not run systemd/udev
+CVE-2023-45853 # zlib; no direct zip handling of untrusted input
 
-CVE-2024-35870 # kernel SMB client UAF; container image cannot patch host kernel
-CVE-2024-53179 # kernel SMB client UAF; container image cannot patch host kernel
-CVE-2025-37899 # kernel ksmbd session logoff UAF; container image cannot patch host kernel
-CVE-2025-38118 # kernel Bluetooth MGMT UAF; container image cannot patch host kernel
-CVE-2026-23112 # kernel nvmet-tcp bounds check; container image cannot patch host kernel
+CVE-2024-35870 # kernel SMB client UAF; not applicable (container cannot patch or use host kernel paths)
+CVE-2024-53179 # kernel SMB client UAF; not applicable (host kernel responsibility)
+CVE-2025-37899 # kernel ksmbd UAF; not applicable (kernel-space issue)
+CVE-2025-38118 # kernel Bluetooth MGMT UAF; not applicable (no Bluetooth stack in container)
+CVE-2026-23112 # kernel nvmet-tcp bounds check; not applicable (kernel-space issue)
 
+CVE-2025-52999 # shaded jackson-core in Hadoop; no untrusted JSON parsing entrypoint
+CVE-2025-67721 # shaded aircompressor in Iceberg; no standalone decompression service exposed
+CVE-2026-33870 # shaded Netty HTTP/1.1; no HTTP server exposed from this runtime
+CVE-2025-55163 # shaded Netty HTTP/2; no HTTP/2 server exposure
+CVE-2026-33871 # shaded Netty HTTP/2; no HTTP/2 server exposure
+CVE-2024-47561 # shaded Avro in Hadoop; only relevant if untrusted schema/data is processed
 
-CVE-2025-52999 # shaded jackson-core inside hadoop-client-runtime-3.4.3.jar; no direct untrusted JSON parsing entrypoint in this runtime
-CVE-2025-67721 # shaded aircompressor inside iceberg-spark-runtime-4.0_2.13-1.10.1.jar; no standalone decompression service in this batch image
-CVE-2026-33870 # shaded Netty HTTP/1.1 codec inside Spark/AWS shaded jars; this image does not expose a Netty HTTP/1.1 server
-CVE-2025-55163 # shaded Netty HTTP/2 codec inside Spark/AWS shaded jars; this image does not expose a Netty HTTP/2 server
-CVE-2026-33871 # shaded Netty HTTP/2 codec inside Spark/AWS shaded jars; this image does not expose a Netty HTTP/2 server
-CVE-2024-47561 # shaded Avro inside hadoop-client-runtime; runtime-exposed only if Avro schema parsing/serialization is used
-CVE-2019-10172
-CVE-2019-10202
-CVE-2022-46337
-CVE-2019-10202
+CVE-2019-10172 # Jackson 1.x (Codehaus) XXE/deserialization; no usage with untrusted XML/inputs
+CVE-2019-10202 # Jackson 1.x deserialization issue; no untrusted data binding path
+CVE-2022-46337 # Apache Derby LDAP auth issue; not applicable (Derby/LDAP auth not used)

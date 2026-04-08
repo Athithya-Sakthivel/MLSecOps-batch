@@ -1,4 +1,4 @@
-# src/workflows/train/run.py
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -22,7 +22,7 @@ from typing import NoReturn
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
-TRAIN_ROOT = SRC_ROOT / "workflows" / "train"
+TRAIN_PACKAGE_ROOT = SRC_ROOT / "workflows" / "train"
 
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
@@ -58,7 +58,7 @@ TRAIN_SERVICE_ACCOUNT = _env_str("TRAIN_SERVICE_ACCOUNT", "ray") or "ray"
 TRAIN_TASK_IMAGE = os.environ.get("TRAIN_TASK_IMAGE")
 if not TRAIN_TASK_IMAGE:
     raise RuntimeError("TRAIN_TASK_IMAGE environment variable must be set and non-empty")
-    
+
 WORKFLOW_SOURCE_FILE = SRC_ROOT / "workflows" / "train" / "launch_plans.py"
 WORKFLOW_SOURCE_REL = WORKFLOW_SOURCE_FILE.relative_to(SRC_ROOT)
 WORKFLOW_IMPORT_MODULE = _env_str("WORKFLOW_IMPORT_MODULE", "workflows.train.launch_plans")
@@ -167,8 +167,6 @@ def stop_port_forward_if_any() -> None:
     if pid is not None and (proc is None or proc.pid != pid):
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
-        with contextlib.suppress(Exception):
-            os.waitpid(pid, 0)
 
     PORT_FORWARD_PID_FILE.unlink(missing_ok=True)
 
@@ -272,8 +270,8 @@ def init_flytectl() -> None:
 
 def lint_sources() -> None:
     require_bin("ruff")
-    log(f"Running ruff on {TRAIN_ROOT}")
-    run_cmd(["ruff", "check", str(TRAIN_ROOT)])
+    log(f"Running ruff on {TRAIN_PACKAGE_ROOT}")
+    run_cmd(["ruff", "check", str(TRAIN_PACKAGE_ROOT)])
 
 
 def import_check() -> None:
@@ -479,7 +477,7 @@ def registration_tree_files() -> list[Path]:
         files.append(path)
     for extra in (
         SRC_ROOT / "workflows" / "train" / "requirements.txt",
-        SRC_ROOT / "workflows" / "train" / "Dockerfile.task_image",
+        SRC_ROOT / "workflows" / "train" / "Dockerfile.flyte_task",
     ):
         if extra.is_file():
             files.append(extra)

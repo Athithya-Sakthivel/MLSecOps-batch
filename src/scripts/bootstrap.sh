@@ -170,7 +170,7 @@ pre-commit install --install-hooks
 clear
 log "verifying installed tools"
 gitleaks version
-helm version
+echo "helm version $(helm version)"
 aws --version
 ruff version
 pre-commit --version

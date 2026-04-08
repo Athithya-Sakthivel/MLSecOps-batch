@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import hashlib
@@ -30,7 +29,7 @@ INNER_VALIDATION_FRACTION = 0.10
 LABEL_CAP_QUANTILE = 0.99
 
 MAX_PREDICTION_SECONDS = 24.0 * 3600.0
-MAX_BOOST_ROUNDS = 20000
+MAX_BOOST_ROUNDS = 20_000
 EARLY_STOPPING_ROUNDS = 150
 DEFAULT_TARGET_OPSET = 17
 
@@ -127,7 +126,6 @@ DERIVED_NUMERIC_COLUMNS = [
 ]
 
 MODEL_FEATURE_COLUMNS = [*MODEL_INPUT_COLUMNS, *DERIVED_NUMERIC_COLUMNS]
-
 CATEGORICAL_COLUMNS = list(RAW_CATEGORICAL_COLUMNS)
 
 
@@ -694,91 +692,6 @@ def fit_lgbm_candidate(
         "medae_seconds_capped": capped_metrics["medae"],
     }
     return model, best_iteration, metrics
-
-
-def search_best_model(
-    train_eval_df: pd.DataFrame,
-    label_cap_seconds: float,
-    num_threads: int,
-    tuning_sample_rows: int,
-    max_boost_rounds: int,
-) -> tuple[CandidateConfig, list[CandidateReport], dict[str, float], int, dict[str, list[int]]]:
-    search_df = train_eval_df.sort_values("as_of_ts").reset_index(drop=True)
-    search_df = evenly_spaced_sample(search_df, max_rows=min(len(search_df), int(tuning_sample_rows)))
-    search_train_df, search_val_df, _ = split_by_date_fraction(search_df, 0.80)
-
-    category_levels = build_category_levels(search_train_df)
-    candidate_reports: list[CandidateReport] = []
-    best_candidate: CandidateConfig | None = None
-    best_model: lgb.LGBMRegressor | None = None
-    best_iteration = 0
-    best_metrics: dict[str, float] | None = None
-    best_score = float("inf")
-
-    for candidate in CANDIDATE_CONFIGS:
-        model, candidate_best_iteration, metrics = fit_lgbm_candidate(
-            train_df=search_train_df,
-            val_df=search_val_df,
-            candidate=candidate,
-            label_cap_seconds=label_cap_seconds,
-            num_threads=num_threads,
-            category_levels=category_levels,
-            max_boost_rounds=max_boost_rounds,
-        )
-        score = float(metrics["mae_seconds_capped"])
-        candidate_reports.append(
-            CandidateReport(
-                name=candidate.name,
-                params=candidate,
-                best_iteration=int(candidate_best_iteration),
-                metrics=metrics,
-                score=score,
-            )
-        )
-
-        if score < best_score:
-            best_score = score
-            best_candidate = candidate
-            best_model = model
-            best_iteration = int(candidate_best_iteration)
-            best_metrics = metrics
-
-    if best_candidate is None or best_model is None or best_metrics is None:
-        raise RuntimeError("Hyperparameter search failed to produce a valid model.")
-
-    return best_candidate, candidate_reports, best_metrics, best_iteration, category_levels
-
-
-def train_final_model(
-    train_eval_df: pd.DataFrame,
-    best_candidate: CandidateConfig,
-    final_num_boost_round: int,
-    label_cap_seconds: float,
-    num_threads: int,
-    category_levels: dict[str, list[int]],
-) -> lgb.LGBMRegressor:
-    params = make_base_params(num_threads)
-    params.update(
-        {
-            "learning_rate": float(best_candidate.learning_rate),
-            "num_leaves": int(best_candidate.num_leaves),
-            "max_depth": int(best_candidate.max_depth),
-            "min_child_samples": int(best_candidate.min_child_samples),
-            "subsample": float(best_candidate.subsample),
-            "feature_fraction": float(best_candidate.feature_fraction),
-            "reg_alpha": float(best_candidate.reg_alpha),
-            "reg_lambda": float(best_candidate.reg_lambda),
-        }
-    )
-
-    train_prepared = prepare_training_frame(train_eval_df, category_levels)
-    train_X = train_prepared[MODEL_FEATURE_COLUMNS]
-    y_train_raw = train_prepared[LABEL_COLUMN].to_numpy(dtype="float32")
-    y_train = to_log_target(y_train_raw, label_cap_seconds)
-
-    model = lgb.LGBMRegressor(**params, n_estimators=int(final_num_boost_round))
-    model.fit(train_X, y_train, categorical_feature=CATEGORICAL_COLUMNS)
-    return model
 
 
 def evaluate_model(

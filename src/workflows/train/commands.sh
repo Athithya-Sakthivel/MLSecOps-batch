@@ -1,6 +1,6 @@
 ruff check src/workflows/train --fix
 export S3_BUCKET="e2e-mlops-data-681802563986"
-export TRAIN_TASK_IMAGE="ghcr.io/athithya-sakthivel/flyte-train-task:2026-04-07-06-38--9ad73cd@sha256:4b0f8885660d7d73b97c47bb867b3f2b3c9f9bd75f5b55f259054230215ab8d6"
+export TRAIN_TASK_IMAGE="ghcr.io/athithya-sakthivel/flyte-train-task:2026-04-08-06-13--3f952fd@sha256:d32ea377b38ac7879268cb3849009201d8de6ed8a82e54d12debafd65caef588"
 export TRAIN_PROFILE="${TRAIN_PROFILE:-staging}"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 source .venv_train/bin/activate

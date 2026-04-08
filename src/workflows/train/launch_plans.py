@@ -4,7 +4,7 @@ import os
 
 from flytekit import LaunchPlan
 
-from workflows.train.workflow import train
+from workflows.train.workflows.training_workflow import train
 
 __all__ = [
     "TRAIN_WORKFLOW_LP",
