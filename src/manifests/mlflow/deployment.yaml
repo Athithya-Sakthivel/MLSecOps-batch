@@ -24,7 +24,7 @@ spec:
         app.kubernetes.io/name: mlflow
         app.kubernetes.io/component: server
       annotations:
-        mlflow.io/config-checksum: 1dd185913b53eee6e2669bbdfa9790b625af02519d18b2bf529fc49f193b01f8
+        mlflow.io/config-checksum: 7d464c1665410f372a17f88603ae9972acef8a5f0a3ed9ccaecbe0602bc922f7
     spec:
       serviceAccountName: mlflow
       securityContext:
@@ -44,7 +44,7 @@ spec:
             app.kubernetes.io/component: server
       containers:
       - name: mlflow
-        image: ghcr.io/athithya-sakthivel/mlflow:2026-04-03-20-21--861d47a@sha256:9bb811f9af11963e9eecd331cc05fe8dd7a9f683216ec1a36453643fe85e55d7
+        image: ghcr.io/athithya-sakthivel/mlflow:2026-04-08-05-42--36c7d29@sha256:8415ae125e0b2ea8185c4c98d07d96c970ee54af1859b59becd48ac5879cacfa
         imagePullPolicy: IfNotPresent
         command:
         - /bin/sh

@@ -31,8 +31,8 @@ DB_HOST = os.environ.get("DB_HOST", "")
 DB_NAME = os.environ.get("DB_NAME", "mlflow")
 
 DB_SECRET_NAMESPACE = os.environ.get("DB_SECRET_NAMESPACE", POSTGRES_NS)
-DB_USERNAME_KEY = os.environ.get("DB_USERNAME_KEY", "username")
-DB_PASSWORD_KEY = os.environ.get("DB_PASSWORD_KEY", "password")
+DB_USERNAME_KEY = os.environ.get("DB_USERNAME_KEY", "username")  # which field in the secret contains the DB username
+DB_PASSWORD_KEY = os.environ.get("DB_PASSWORD_KEY", "password")  # which field in the secret contains the DB password
 DB_PORT_KEY = os.environ.get("DB_PORT_KEY", "port")
 
 MLFLOW_NAME = os.environ.get("MLFLOW_NAME", "mlflow")
@@ -42,7 +42,7 @@ SERVICE_ACCOUNT_NAME = os.environ.get("SERVICE_ACCOUNT_NAME", MLFLOW_NAME)
 MLFLOW_PORT = int(os.environ.get("MLFLOW_PORT", "5000"))
 MLFLOW_IMAGE = os.environ.get(
     "MLFLOW_IMAGE",
-    "ghcr.io/athithya-sakthivel/mlflow:2026-04-03-20-21--861d47a@sha256:9bb811f9af11963e9eecd331cc05fe8dd7a9f683216ec1a36453643fe85e55d7",
+    "ghcr.io/athithya-sakthivel/mlflow:2026-04-08-05-42--36c7d29@sha256:8415ae125e0b2ea8185c4c98d07d96c970ee54af1859b59becd48ac5879cacfa",
 ).strip()
 
 MLFLOW_WORKERS = int(os.environ.get("MLFLOW_WORKERS", "1"))
@@ -58,6 +58,13 @@ MLFLOW_SERVER_ENABLE_JOB_EXECUTION = os.environ.get(
     "MLFLOW_SERVER_ENABLE_JOB_EXECUTION",
     "false",
 ).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+MLFLOW_DB_AUTO_MIGRATE_ON_START = os.environ.get(
+    "MLFLOW_DB_AUTO_MIGRATE_ON_START",
+    "true",
+).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+MLFLOW_DB_MIGRATE_TIMEOUT_SECONDS = int(os.environ.get("MLFLOW_DB_MIGRATE_TIMEOUT_SECONDS", "900"))
 
 MLFLOW_SERVER_ALLOWED_HOSTS = os.environ.get("MLFLOW_SERVER_ALLOWED_HOSTS", "").strip()
 MLFLOW_SERVER_CORS_ALLOWED_ORIGINS = os.environ.get("MLFLOW_SERVER_CORS_ALLOWED_ORIGINS", "").strip()
@@ -369,6 +376,8 @@ def build_common_env() -> list[dict[str, Any]]:
         {"name": "MLFLOW_WORKERS", "value": str(MLFLOW_WORKERS)},
         {"name": "MLFLOW_SECRETS_CACHE_TTL", "value": str(MLFLOW_SECRETS_CACHE_TTL)},
         {"name": "MLFLOW_SECRETS_CACHE_MAX_SIZE", "value": str(MLFLOW_SECRETS_CACHE_MAX_SIZE)},
+        {"name": "MLFLOW_DB_AUTO_MIGRATE_ON_START", "value": "true" if MLFLOW_DB_AUTO_MIGRATE_ON_START else "false"},
+        {"name": "MLFLOW_DB_MIGRATE_TIMEOUT_SECONDS", "value": str(MLFLOW_DB_MIGRATE_TIMEOUT_SECONDS)},
         {"name": "MLFLOW_ARTIFACTS_DESTINATION", "value": artifact_destination()},
         {
             "name": "MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE",
@@ -466,6 +475,74 @@ def server_cli_args() -> list[str]:
     return args
 
 
+def migration_script() -> str:
+    return r'''if [ "${MLFLOW_DB_AUTO_MIGRATE_ON_START}" = "true" ]; then
+  echo "[mlflow][server] running database migration check" >&2
+  python3 - <<'PY'
+import hashlib
+import os
+import subprocess
+import sys
+from contextlib import suppress
+from urllib.parse import quote
+
+import psycopg2
+
+def fatal(msg: str) -> None:
+    print(f"[mlflow][migrate][FATAL] {msg}", file=sys.stderr, flush=True)
+    raise SystemExit(1)
+
+user = os.environ["DB_USER"]
+password = os.environ["DB_PASSWORD"]
+host = os.environ["DB_HOST"]
+port = int(os.environ["DB_PORT"])
+dbname = os.environ["DB_NAME"]
+timeout_seconds = int(os.environ.get("MLFLOW_DB_MIGRATE_TIMEOUT_SECONDS", "900"))
+
+backend_uri = "postgresql://%s:%s@%s:%s/%s" % (
+    quote(user, safe=""),
+    quote(password, safe=""),
+    host,
+    port,
+    dbname,
+)
+
+lock_seed = f"{host}:{port}/{dbname}".encode("utf-8")
+digest = hashlib.sha256(lock_seed).digest()
+lock_key_a = int.from_bytes(digest[:4], "big", signed=True)
+lock_key_b = int.from_bytes(digest[4:8], "big", signed=True)
+
+conn = None
+try:
+    conn = psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=dbname,
+        user=user,
+        password=password,
+        connect_timeout=10,
+    )
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_lock(%s, %s)", (lock_key_a, lock_key_b))
+    print("[mlflow][migrate] acquired advisory lock", file=sys.stderr, flush=True)
+
+    cmd = ["mlflow", "db", "upgrade", backend_uri]
+    print(f"[mlflow][migrate] running: {' '.join(cmd[:-1])} <masked-uri>", file=sys.stderr, flush=True)
+    subprocess.run(cmd, check=True, timeout=timeout_seconds)
+    print("[mlflow][migrate] database schema is current", file=sys.stderr, flush=True)
+finally:
+    if conn is not None:
+        with suppress(Exception):
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(%s, %s)", (lock_key_a, lock_key_b))
+        with suppress(Exception):
+            conn.close()
+PY
+fi
+'''
+
+
 def server_script() -> str:
     cli_args = server_cli_args()
     cli_lines = ["exec mlflow server \\"]
@@ -473,6 +550,7 @@ def server_script() -> str:
         suffix = " \\" if idx < len(cli_args) - 1 else ""
         cli_lines.append(f"  {arg}{suffix}")
     cli_block = "\n".join(cli_lines)
+    migrate_block = migration_script()
 
     return rf'''set -eu
 echo "[mlflow][server] starting" >&2
@@ -483,6 +561,8 @@ echo "[mlflow][server] artifacts=${{MLFLOW_ARTIFACTS_DESTINATION}}" >&2
 echo "[mlflow][server] workers=${{MLFLOW_WORKERS}}" >&2
 echo "[mlflow][server] disable_security_middleware=${{MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE}}" >&2
 echo "[mlflow][server] enable_job_execution=${{MLFLOW_SERVER_ENABLE_JOB_EXECUTION}}" >&2
+echo "[mlflow][server] db_auto_migrate_on_start=${{MLFLOW_DB_AUTO_MIGRATE_ON_START}}" >&2
+echo "[mlflow][server] db_migrate_timeout_seconds=${{MLFLOW_DB_MIGRATE_TIMEOUT_SECONDS}}" >&2
 echo "[mlflow][server] allowed_hosts=${{MLFLOW_SERVER_ALLOWED_HOSTS}}" >&2
 echo "[mlflow][server] x_frame_options=${{MLFLOW_SERVER_X_FRAME_OPTIONS}}" >&2
 echo "[mlflow][server] secrets_cache_ttl=${{MLFLOW_SECRETS_CACHE_TTL}}" >&2
@@ -506,6 +586,7 @@ print(
 PY
 )"
 echo "[mlflow][server] backend_uri=postgresql://${{DB_USER}}:*****@${{DB_HOST}}:${{DB_PORT}}/${{DB_NAME}}" >&2
+{migrate_block}
 {cli_block}
 '''
 
@@ -616,6 +697,8 @@ def deployment_manifest() -> dict[str, Any]:
         "workers": MLFLOW_WORKERS,
         "security_middleware_disabled": MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE,
         "job_execution_enabled": MLFLOW_SERVER_ENABLE_JOB_EXECUTION,
+        "db_auto_migrate_on_start": MLFLOW_DB_AUTO_MIGRATE_ON_START,
+        "db_migrate_timeout_seconds": MLFLOW_DB_MIGRATE_TIMEOUT_SECONDS,
         "allowed_hosts": resolve_allowed_hosts(),
         "cors_allowed_origins": MLFLOW_SERVER_CORS_ALLOWED_ORIGINS,
         "x_frame_options": validate_x_frame_options(),
@@ -859,6 +942,8 @@ def print_summary() -> None:
     print(f"Workers: {MLFLOW_WORKERS}")
     print(f"Security middleware disabled: {MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE}")
     print(f"Job execution enabled: {MLFLOW_SERVER_ENABLE_JOB_EXECUTION}")
+    print(f"DB auto-migrate on start: {MLFLOW_DB_AUTO_MIGRATE_ON_START}")
+    print(f"DB migrate timeout seconds: {MLFLOW_DB_MIGRATE_TIMEOUT_SECONDS}")
     print(f"Allowed hosts: {resolve_allowed_hosts()}")
     print(f"X-Frame-Options: {validate_x_frame_options()}")
     if MLFLOW_SERVER_CORS_ALLOWED_ORIGINS:
@@ -973,6 +1058,8 @@ def cli() -> int:
                 "  MLFLOW_WORKERS=1\n"
                 "  MLFLOW_SECRETS_CACHE_TTL=30\n"
                 "  MLFLOW_SECRETS_CACHE_MAX_SIZE=128\n"
+                "  MLFLOW_DB_AUTO_MIGRATE_ON_START=true|false\n"
+                "  MLFLOW_DB_MIGRATE_TIMEOUT_SECONDS=900\n"
                 "  MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE=false\n"
                 "  MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false\n"
                 "  MLFLOW_SERVER_ALLOWED_HOSTS=auto\n"
