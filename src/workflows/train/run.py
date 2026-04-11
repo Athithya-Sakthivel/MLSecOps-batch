@@ -80,8 +80,6 @@ PYFLYTE_REGISTER_EXTRA_ARGS = _env_str("PYFLYTE_REGISTER_EXTRA_ARGS", "")
 
 RESOURCE_QUOTA_NAME = _env_str("TRAIN_RESOURCE_QUOTA_NAME", "ray-workload-quota")
 
-# Namespace quota. This is separate from Flyte Admin's admission caps.
-# The runner can enforce namespace quota, but it cannot override Flyte platform limits.
 RESOURCE_QUOTA_KIND_REQUESTS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_KIND_REQUESTS_CPU", "8")
 RESOURCE_QUOTA_KIND_REQUESTS_MEMORY = _env_str("TRAIN_RESOURCE_QUOTA_KIND_REQUESTS_MEMORY", "4Gi")
 RESOURCE_QUOTA_KIND_LIMITS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_KIND_LIMITS_CPU", "16")
@@ -98,12 +96,11 @@ RESOURCE_QUOTA_EKS_PODS = _env_str("TRAIN_RESOURCE_QUOTA_EKS_PODS", "150")
 RESOURCE_QUOTA_EKS_PVC = _env_str("TRAIN_RESOURCE_QUOTA_EKS_PVC", "80")
 RESOURCE_QUOTA_EKS_SERVICES = _env_str("TRAIN_RESOURCE_QUOTA_EKS_SERVICES", "150")
 
-# Optional resource defaults for task decorators if those decorators are env-driven.
-# These values are safe for the current Flyte admission caps you observed.
 TRAIN_TASK_REQUESTS_CPU = _env_str("TRAIN_TASK_REQUESTS_CPU", "1")
 TRAIN_TASK_REQUESTS_MEMORY = _env_str("TRAIN_TASK_REQUESTS_MEMORY", "512Mi")
 TRAIN_TASK_LIMITS_CPU = _env_str("TRAIN_TASK_LIMITS_CPU", "2")
 TRAIN_TASK_LIMITS_MEMORY = _env_str("TRAIN_TASK_LIMITS_MEMORY", "1Gi")
+TRAIN_DEFAULT_NUM_THREADS = _env_str("TRAIN_DEFAULT_NUM_THREADS", "2")
 
 
 def log(msg: str) -> None:
@@ -184,6 +181,8 @@ def stop_port_forward_if_any() -> None:
     if pid is not None and (proc is None or proc.pid != pid):
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
+        with contextlib.suppress(Exception):
+            os.waitpid(pid, 0)
 
     PORT_FORWARD_PID_FILE.unlink(missing_ok=True)
 
@@ -281,86 +280,6 @@ def init_flytectl() -> None:
     )
 
 
-def prepare_flyte_runtime() -> None:
-    ensure_namespace_bootstrap_ready()
-    start_port_forward()
-    init_flytectl()
-
-
-def lint_sources() -> None:
-    require_bin("ruff")
-    log(f"Running ruff on {TRAIN_PACKAGE_ROOT}")
-    run_cmd(["ruff", "check", str(TRAIN_PACKAGE_ROOT)])
-
-
-def _export_resource_env_defaults() -> None:
-    """
-    Optional hook for task decorators that read resource values from env.
-    This does not override hardcoded decorators. It only sets sane defaults.
-    """
-    os.environ.setdefault("TRAIN_TASK_REQUESTS_CPU", TRAIN_TASK_REQUESTS_CPU)
-    os.environ.setdefault("TRAIN_TASK_REQUESTS_MEMORY", TRAIN_TASK_REQUESTS_MEMORY)
-    os.environ.setdefault("TRAIN_TASK_LIMITS_CPU", TRAIN_TASK_LIMITS_CPU)
-    os.environ.setdefault("TRAIN_TASK_LIMITS_MEMORY", TRAIN_TASK_LIMITS_MEMORY)
-
-
-def import_check() -> None:
-    _export_resource_env_defaults()
-
-    mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
-    if not hasattr(mod, "TRAIN_WORKFLOW_LP"):
-        fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose TRAIN_WORKFLOW_LP")
-    if not hasattr(mod, "TRAIN_WORKFLOW_LP_NAME"):
-        fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose TRAIN_WORKFLOW_LP_NAME")
-    log("import_ok")
-
-
-def _quota_values() -> dict[str, str]:
-    if K8S_CLUSTER == "kind":
-        return {
-            "requests_cpu": RESOURCE_QUOTA_KIND_REQUESTS_CPU,
-            "requests_memory": RESOURCE_QUOTA_KIND_REQUESTS_MEMORY,
-            "limits_cpu": RESOURCE_QUOTA_KIND_LIMITS_CPU,
-            "limits_memory": RESOURCE_QUOTA_KIND_LIMITS_MEMORY,
-            "pods": RESOURCE_QUOTA_KIND_PODS,
-            "persistentvolumeclaims": RESOURCE_QUOTA_KIND_PVC,
-            "services": RESOURCE_QUOTA_KIND_SERVICES,
-        }
-    return {
-        "requests_cpu": RESOURCE_QUOTA_EKS_REQUESTS_CPU,
-        "requests_memory": RESOURCE_QUOTA_EKS_REQUESTS_MEMORY,
-        "limits_cpu": RESOURCE_QUOTA_EKS_LIMITS_CPU,
-        "limits_memory": RESOURCE_QUOTA_EKS_LIMITS_MEMORY,
-        "pods": RESOURCE_QUOTA_EKS_PODS,
-        "persistentvolumeclaims": RESOURCE_QUOTA_EKS_PVC,
-        "services": RESOURCE_QUOTA_EKS_SERVICES,
-    }
-
-
-def _ensure_namespace() -> None:
-    run_cmd(
-        [
-            "kubectl",
-            "create",
-            "namespace",
-            TASK_NAMESPACE,
-            "--dry-run=client",
-            "-o",
-            "yaml",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    run_cmd(
-        ["kubectl", "apply", "-f", "-"],
-        input_text=f"""apiVersion: v1
-kind: Namespace
-metadata:
-  name: {TASK_NAMESPACE}
-""",
-    )
-
-
 def _bootstrap_manifest() -> str:
     q = _quota_values()
     return f"""apiVersion: v1
@@ -424,6 +343,28 @@ spec:
 """
 
 
+def _quota_values() -> dict[str, str]:
+    if K8S_CLUSTER == "kind":
+        return {
+            "requests_cpu": RESOURCE_QUOTA_KIND_REQUESTS_CPU,
+            "requests_memory": RESOURCE_QUOTA_KIND_REQUESTS_MEMORY,
+            "limits_cpu": RESOURCE_QUOTA_KIND_LIMITS_CPU,
+            "limits_memory": RESOURCE_QUOTA_KIND_LIMITS_MEMORY,
+            "pods": RESOURCE_QUOTA_KIND_PODS,
+            "persistentvolumeclaims": RESOURCE_QUOTA_KIND_PVC,
+            "services": RESOURCE_QUOTA_KIND_SERVICES,
+        }
+    return {
+        "requests_cpu": RESOURCE_QUOTA_EKS_REQUESTS_CPU,
+        "requests_memory": RESOURCE_QUOTA_EKS_REQUESTS_MEMORY,
+        "limits_cpu": RESOURCE_QUOTA_EKS_LIMITS_CPU,
+        "limits_memory": RESOURCE_QUOTA_EKS_LIMITS_MEMORY,
+        "pods": RESOURCE_QUOTA_EKS_PODS,
+        "persistentvolumeclaims": RESOURCE_QUOTA_EKS_PVC,
+        "services": RESOURCE_QUOTA_EKS_SERVICES,
+    }
+
+
 def bootstrap_manifest_quota_line() -> str:
     q = _quota_values()
     return (
@@ -434,6 +375,30 @@ def bootstrap_manifest_quota_line() -> str:
         f"pods={q['pods']}, "
         f"persistentvolumeclaims={q['persistentvolumeclaims']}, "
         f"services={q['services']}"
+    )
+
+
+def _ensure_namespace() -> None:
+    run_cmd(
+        [
+            "kubectl",
+            "create",
+            "namespace",
+            TASK_NAMESPACE,
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    run_cmd(
+        ["kubectl", "apply", "-f", "-"],
+        input_text=f"""apiVersion: v1
+kind: Namespace
+metadata:
+  name: {TASK_NAMESPACE}
+""",
     )
 
 
@@ -501,37 +466,29 @@ def ensure_namespace_bootstrap_ready() -> None:
     log(f"Bootstrap verified for {TASK_NAMESPACE}")
 
 
-def registration_tree_files() -> list[Path]:
-    files: list[Path] = []
-    for path in sorted((SRC_ROOT / "workflows" / "train").rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        files.append(path)
-    for extra in (
-        SRC_ROOT / "workflows" / "train" / "requirements.txt",
-        SRC_ROOT / "workflows" / "train" / "Dockerfile.flyte_task",
-    ):
-        if extra.is_file():
-            files.append(extra)
-    return files
+def lint_sources() -> None:
+    require_bin("ruff")
+    log(f"Running ruff on {TRAIN_PACKAGE_ROOT}")
+    run_cmd(["ruff", "check", str(TRAIN_PACKAGE_ROOT)])
 
 
-@functools.lru_cache(maxsize=1)
-def compute_registration_version() -> str:
-    git_sha = run_cmd(["git", "rev-parse", "HEAD"], capture_output=True).stdout.strip()
-    tree = hashlib.sha256()
-    tree.update(f"TRAIN_TASK_IMAGE={TRAIN_TASK_IMAGE}".encode())
-    tree.update(b"\0")
-    tree.update(f"TRAIN_PROFILE={TRAIN_PROFILE}".encode())
-    tree.update(b"\0")
-    tree.update(f"K8S_CLUSTER={K8S_CLUSTER}".encode())
-    tree.update(b"\0")
-    for path in registration_tree_files():
-        tree.update(path.relative_to(REPO_ROOT).as_posix().encode("utf-8"))
-        tree.update(b"\0")
-        tree.update(path.read_bytes())
-        tree.update(b"\0")
-    return f"{git_sha[:12]}-{tree.hexdigest()[:16]}"
+def _export_resource_env_defaults() -> None:
+    os.environ.setdefault("TRAIN_TASK_REQUESTS_CPU", TRAIN_TASK_REQUESTS_CPU)
+    os.environ.setdefault("TRAIN_TASK_REQUESTS_MEMORY", TRAIN_TASK_REQUESTS_MEMORY)
+    os.environ.setdefault("TRAIN_TASK_LIMITS_CPU", TRAIN_TASK_LIMITS_CPU)
+    os.environ.setdefault("TRAIN_TASK_LIMITS_MEMORY", TRAIN_TASK_LIMITS_MEMORY)
+    os.environ.setdefault("TRAIN_DEFAULT_NUM_THREADS", TRAIN_DEFAULT_NUM_THREADS)
+
+
+def import_check() -> None:
+    _export_resource_env_defaults()
+
+    mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
+    if not hasattr(mod, "TRAIN_WORKFLOW_LP"):
+        fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose TRAIN_WORKFLOW_LP")
+    if not hasattr(mod, "TRAIN_WORKFLOW_LP_NAME"):
+        fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose TRAIN_WORKFLOW_LP_NAME")
+    log("import_ok")
 
 
 def resolve_train_launchplan_name() -> str:
@@ -548,6 +505,45 @@ def resolve_train_launchplan_name() -> str:
     if not isinstance(name, str) or not name.strip():
         fatal("could not resolve TRAIN launch plan name")
     return name.strip()
+
+
+def registration_tree_files() -> list[Path]:
+    files: list[Path] = []
+    for path in sorted((SRC_ROOT / "workflows" / "train").rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        files.append(path)
+    for extra in (
+        SRC_ROOT / "workflows" / "train" / "requirements.txt",
+        SRC_ROOT / "workflows" / "train" / "Dockerfile.task_image",
+    ):
+        if extra.is_file():
+            files.append(extra)
+    return files
+
+
+@functools.lru_cache(maxsize=1)
+def compute_registration_version() -> str:
+    git_sha = run_cmd(["git", "rev-parse", "HEAD"], capture_output=True).stdout.strip()
+    tree = hashlib.sha256()
+    for item in (
+        f"TRAIN_TASK_IMAGE={TRAIN_TASK_IMAGE}",
+        f"TRAIN_PROFILE={TRAIN_PROFILE}",
+        f"K8S_CLUSTER={K8S_CLUSTER}",
+        f"TRAIN_TASK_REQUESTS_CPU={TRAIN_TASK_REQUESTS_CPU}",
+        f"TRAIN_TASK_REQUESTS_MEMORY={TRAIN_TASK_REQUESTS_MEMORY}",
+        f"TRAIN_TASK_LIMITS_CPU={TRAIN_TASK_LIMITS_CPU}",
+        f"TRAIN_TASK_LIMITS_MEMORY={TRAIN_TASK_LIMITS_MEMORY}",
+        f"TRAIN_DEFAULT_NUM_THREADS={TRAIN_DEFAULT_NUM_THREADS}",
+    ):
+        tree.update(item.encode())
+        tree.update(b"\0")
+    for path in registration_tree_files():
+        tree.update(path.relative_to(REPO_ROOT).as_posix().encode("utf-8"))
+        tree.update(b"\0")
+        tree.update(path.read_bytes())
+        tree.update(b"\0")
+    return f"{git_sha[:12]}-{tree.hexdigest()[:16]}"
 
 
 def pyflyte_register_supports_copy_or_fast_flag() -> tuple[bool, bool]:
@@ -569,6 +565,7 @@ def build_register_env() -> dict[str, str]:
     register_env["TRAIN_TASK_REQUESTS_MEMORY"] = TRAIN_TASK_REQUESTS_MEMORY
     register_env["TRAIN_TASK_LIMITS_CPU"] = TRAIN_TASK_LIMITS_CPU
     register_env["TRAIN_TASK_LIMITS_MEMORY"] = TRAIN_TASK_LIMITS_MEMORY
+    register_env["TRAIN_DEFAULT_NUM_THREADS"] = TRAIN_DEFAULT_NUM_THREADS
     existing_pythonpath = register_env.get("PYTHONPATH", "")
     register_env["PYTHONPATH"] = str(SRC_ROOT) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
     return register_env
@@ -622,7 +619,11 @@ def register_entities() -> str:
     log(f"Source file: {WORKFLOW_SOURCE_FILE}")
     log(f"Profile: {TRAIN_PROFILE} | Cluster: {K8S_CLUSTER} | Namespace: {TASK_NAMESPACE}")
     log(f"Task image: {TRAIN_TASK_IMAGE}")
-    log(f"Task resource defaults: requests={TRAIN_TASK_REQUESTS_CPU}/{TRAIN_TASK_REQUESTS_MEMORY} limits={TRAIN_TASK_LIMITS_CPU}/{TRAIN_TASK_LIMITS_MEMORY}")
+    log(
+        "Task resource defaults: "
+        f"requests={TRAIN_TASK_REQUESTS_CPU}/{TRAIN_TASK_REQUESTS_MEMORY} "
+        f"limits={TRAIN_TASK_LIMITS_CPU}/{TRAIN_TASK_LIMITS_MEMORY}"
+    )
     log(f"Registration version: {registration_version}")
 
     register_env = build_register_env()
@@ -683,7 +684,9 @@ def create_execution_from_spec(exec_spec_file: Path) -> None:
 
 
 def execute_launch_plan(*, latest: bool | None = None, version: str | None = None) -> None:
+    require_bin("kubectl")
     require_bin("flytectl")
+
     require_preflight_for_execution()
 
     start_port_forward()
@@ -714,6 +717,205 @@ def register_and_run() -> None:
     execute_launch_plan(version=registration_version)
 
 
+def get_execution_pods(execution_id: str) -> list[str]:
+    cp = run_cmd(
+        [
+            "kubectl",
+            "get",
+            "pods",
+            "-n",
+            TASK_NAMESPACE,
+            "-l",
+            f"execution-id={execution_id}",
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+        ],
+        check=False,
+        capture_output=True,
+    )
+    pods = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
+    if pods:
+        return pods
+
+    cp = run_cmd(
+        [
+            "kubectl",
+            "get",
+            "pods",
+            "-n",
+            TASK_NAMESPACE,
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+        ],
+        check=False,
+        capture_output=True,
+    )
+    return [line.strip() for line in cp.stdout.splitlines() if execution_id in line]
+
+
+def get_execution_rayjobs(execution_id: str) -> list[str]:
+    cp = run_cmd(
+        [
+            "kubectl",
+            "get",
+            "rayjobs",
+            "-n",
+            TASK_NAMESPACE,
+            "-l",
+            f"execution-id={execution_id}",
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+        ],
+        check=False,
+        capture_output=True,
+    )
+    jobs = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
+    if jobs:
+        return jobs
+
+    cp = run_cmd(
+        [
+            "kubectl",
+            "get",
+            "rayjobs",
+            "-n",
+            TASK_NAMESPACE,
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+        ],
+        check=False,
+        capture_output=True,
+    )
+    return [line.strip() for line in cp.stdout.splitlines() if execution_id in line]
+
+
+def diagnose_execution(execution_id: str) -> None:
+    start_port_forward()
+    init_flytectl()
+
+    print("=== EXECUTION ===")
+    run_cmd(
+        [
+            "flytectl",
+            "get",
+            "execution",
+            execution_id,
+            "-p",
+            REMOTE_PROJECT,
+            "-d",
+            REMOTE_DOMAIN,
+        ],
+        check=False,
+    )
+
+    print("=== EXECUTION DETAILS ===")
+    run_cmd(
+        [
+            "flytectl",
+            "get",
+            "execution",
+            execution_id,
+            "-p",
+            REMOTE_PROJECT,
+            "-d",
+            REMOTE_DOMAIN,
+            "--details",
+        ],
+        check=False,
+    )
+
+    pods = get_execution_pods(execution_id)
+    if pods:
+        print("=== MATCHING PODS ===")
+        run_cmd(["kubectl", "get", "pods", "-n", TASK_NAMESPACE, "-o", "wide"], check=False)
+        for pod in pods:
+            print(f"--- POD {pod} ---")
+            run_cmd(["kubectl", "describe", "pod", pod, "-n", TASK_NAMESPACE], check=False)
+            run_cmd(
+                ["kubectl", "logs", pod, "-n", TASK_NAMESPACE, "--all-containers=true", "--tail=120"],
+                check=False,
+            )
+    else:
+        print(f"No pod matched execution {execution_id}")
+
+    jobs = get_execution_rayjobs(execution_id)
+    if jobs:
+        print("=== MATCHING RAYJOBS ===")
+        run_cmd(["kubectl", "get", "rayjobs", "-n", TASK_NAMESPACE, "-o", "wide"], check=False)
+        for job in jobs:
+            print(f"--- RAYJOB {job} ---")
+            run_cmd(["kubectl", "describe", "rayjob", job, "-n", TASK_NAMESPACE], check=False)
+    else:
+        print(f"No RayJob matched execution {execution_id}")
+
+
+def delete_execution(execution_id: str) -> None:
+    start_port_forward()
+    init_flytectl()
+
+    log(f"Deleting execution {execution_id}")
+    run_cmd(
+        ["flytectl", "delete", "execution", execution_id, "-p", REMOTE_PROJECT, "-d", REMOTE_DOMAIN],
+        check=False,
+    )
+
+    run_cmd(
+        [
+            "kubectl",
+            "delete",
+            "rayjob",
+            "-n",
+            TASK_NAMESPACE,
+            "-l",
+            f"execution-id={execution_id}",
+            "--ignore-not-found=true",
+        ],
+        check=False,
+    )
+    run_cmd(
+        [
+            "kubectl",
+            "delete",
+            "pod",
+            "-n",
+            TASK_NAMESPACE,
+            "-l",
+            f"execution-id={execution_id}",
+            "--ignore-not-found=true",
+        ],
+        check=False,
+    )
+
+
+def cleanup_stale_resources() -> None:
+    run_cmd(
+        [
+            "kubectl",
+            "delete",
+            "rayjob",
+            "-n",
+            TASK_NAMESPACE,
+            "-l",
+            "execution-id",
+            "--ignore-not-found=true",
+        ],
+        check=False,
+    )
+    run_cmd(
+        [
+            "kubectl",
+            "delete",
+            "pod",
+            "-n",
+            TASK_NAMESPACE,
+            "-l",
+            "execution-id",
+            "--ignore-not-found=true",
+        ],
+        check=False,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run.py",
@@ -725,6 +927,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("register", help="Register train workflows and launch plans")
     sub.add_parser("train", help="Execute the train workflow")
     sub.add_parser("up", help="Register and then execute train")
+    sub.add_parser("diagnose", help="Inspect a Flyte execution and related Kubernetes resources").add_argument("execution_id")
+    sub.add_parser("delete", help="Delete a Flyte execution and matching Kubernetes resources").add_argument("execution_id")
+    sub.add_parser("reset", help="Delete leftover train Ray / pod resources in the target namespace")
     return parser
 
 
@@ -755,6 +960,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         start_port_forward()
         init_flytectl()
         register_and_run()
+        return 0
+
+    if args.command == "diagnose":
+        diagnose_execution(args.execution_id)
+        return 0
+
+    if args.command == "delete":
+        delete_execution(args.execution_id)
+        return 0
+
+    if args.command == "reset":
+        cleanup_stale_resources()
         return 0
 
     return 1

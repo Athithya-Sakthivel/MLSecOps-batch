@@ -8,8 +8,7 @@ import math
 import os
 import sys
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -41,20 +40,214 @@ def configure_logging() -> None:
 configure_logging()
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------
+# Core ELT / training contract
+# ---------------------------------------------------------------------
 
-@contextmanager
-def log_step(step_name: str) -> Iterator[None]:
-    started = time.perf_counter()
-    logger.info("%s started", step_name)
+TABLE_IDENTIFIER_TUPLE = ("gold", "trip_training_matrix")
+TABLE_IDENTIFIER = "gold.trip_training_matrix"
+
+CONTRACT_TABLE_IDENTIFIER_TUPLE = ("gold", "trip_training_contracts")
+CONTRACT_TABLE_IDENTIFIER = "gold.trip_training_contracts"
+
+EXPECTED_SCHEMA_VERSION = "trip_eta_frozen_matrix_v1"
+EXPECTED_FEATURE_VERSION = "trip_eta_lgbm_v1"
+MODEL_FAMILY = "lightgbm"
+INFERENCE_RUNTIME = "onnxruntime"
+PREPROCESSING_VERSION = "matrix_identity_v1"
+TARGET_TRANSFORM = "log1p"
+
+LABEL_COLUMN = "label_trip_duration_seconds"
+PREDICTION_COLUMN = "prediction_seconds"
+
+FIXED_TEST_START_DATE = date(2025, 1, 7)
+INNER_VALIDATION_FRACTION = 0.10
+LABEL_CAP_QUANTILE = 0.99
+
+MAX_PREDICTION_SECONDS = 24.0 * 3600.0
+MAX_BOOST_ROUNDS = 20_000
+EARLY_STOPPING_ROUNDS = 150
+DEFAULT_TARGET_OPSET = 17
+
+# The frozen matrix contract from ELT.
+MATRIX_FEATURE_COLUMNS = [
+    "pickup_hour",
+    "pickup_dow",
+    "pickup_month",
+    "pickup_is_weekend",
+    "pickup_borough_id",
+    "pickup_zone_id",
+    "pickup_service_zone_id",
+    "dropoff_borough_id",
+    "dropoff_zone_id",
+    "dropoff_service_zone_id",
+    "route_pair_id",
+    "avg_duration_7d_zone_hour",
+    "avg_fare_30d_zone",
+    "trip_count_90d_zone_hour",
+]
+
+REQUEST_FEATURE_COLUMNS = MATRIX_FEATURE_COLUMNS
+ENGINEERED_FEATURE_COLUMNS = MATRIX_FEATURE_COLUMNS
+MODEL_INPUT_COLUMNS = MATRIX_FEATURE_COLUMNS
+MODEL_FEATURE_COLUMNS = MATRIX_FEATURE_COLUMNS
+
+NUMERIC_FEATURE_COLUMNS = [
+    "avg_duration_7d_zone_hour",
+    "avg_fare_30d_zone",
+    "trip_count_90d_zone_hour",
+]
+
+CATEGORICAL_COLUMNS = [
+    "pickup_hour",
+    "pickup_dow",
+    "pickup_month",
+    "pickup_is_weekend",
+    "pickup_borough_id",
+    "pickup_zone_id",
+    "pickup_service_zone_id",
+    "dropoff_borough_id",
+    "dropoff_zone_id",
+    "dropoff_service_zone_id",
+    "route_pair_id",
+]
+
+OUTPUT_COLUMNS = [
+    "trip_id",
+    "pickup_ts",
+    "as_of_ts",
+    "as_of_date",
+    "schema_version",
+    "feature_version",
+    *MATRIX_FEATURE_COLUMNS,
+    LABEL_COLUMN,
+]
+
+EXPECTED_COLUMNS = OUTPUT_COLUMNS
+
+CONTRACT_COLUMNS = [
+    "run_id",
+    "feature_version",
+    "schema_version",
+    "schema_hash",
+    "model_family",
+    "inference_runtime",
+    "gold_table",
+    "source_silver_table",
+    "source_silver_snapshot_id",
+    "training_row_count",
+    "output_columns_json",
+    "feature_spec_json",
+    "encoding_spec_json",
+    "aggregate_spec_json",
+    "label_spec_json",
+    "created_ts",
+]
+
+
+def _stable_json_dumps(obj: object) -> str:
+    return json.dumps(
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def ordered_columns_hash(columns: Sequence[str]) -> str:
+    return sha256_text("\n".join(columns))
+
+
+def write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_stable_json_dumps(payload), encoding="utf-8")
+
+
+def _validate_sha256_hex(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{field_name} must be a non-empty sha256 hex string")
+
+    normalized = value.strip().lower()
+    if len(normalized) != 64:
+        raise RuntimeError(f"{field_name} must be a 64-character sha256 hex string")
+
+    if any(ch not in "0123456789abcdef" for ch in normalized):
+        raise RuntimeError(f"{field_name} must contain only lowercase hex characters")
+
+    return normalized
+
+
+def _validate_json_text(value: object, field_name: str) -> object:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{field_name} must be a non-empty JSON string")
     try:
-        yield
-    except Exception:
-        elapsed = time.perf_counter() - started
-        logger.exception("%s failed after %.2fs", step_name, elapsed)
-        raise
-    else:
-        elapsed = time.perf_counter() - started
-        logger.info("%s completed in %.2fs", step_name, elapsed)
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{field_name} must contain valid JSON") from exc
+
+
+def _require_nonempty_str(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _require_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise RuntimeError(f"{field_name} must be an integer")
+    try:
+        return int(value)
+    except Exception as exc:
+        raise RuntimeError(f"{field_name} must be an integer") from exc
+
+
+def _require_float(value: object, field_name: str) -> float:
+    try:
+        return float(value)
+    except Exception as exc:
+        raise RuntimeError(f"{field_name} must be numeric") from exc
+
+
+def _require_sequence_of_str(values: Sequence[str], field_name: str) -> tuple[str, ...]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(values):
+        if not isinstance(item, str) or not item.strip():
+            raise RuntimeError(f"{field_name}[{idx}] must be a non-empty string")
+        value = item.strip()
+        if value in seen:
+            raise RuntimeError(f"{field_name} contains duplicate value: {value}")
+        seen.add(value)
+        cleaned.append(value)
+    if not cleaned:
+        raise RuntimeError(f"{field_name} must not be empty")
+    return tuple(cleaned)
+
+
+def _read_iceberg_table_as_dataframe(
+    table,
+    columns: Sequence[str],
+) -> pd.DataFrame:
+    lf = pl.scan_iceberg(table).select(list(columns))
+    pdf = lf.collect(engine="streaming").to_pandas()
+    pdf = pdf.reindex(columns=list(columns)).copy()
+    return pdf
 
 
 def parse_s3_uri(s3_uri: str) -> tuple[str, str]:
@@ -104,167 +297,55 @@ def download_file_from_s3(s3_uri: str, local_path: Path, *, use_iam: bool) -> Pa
     return local_path
 
 
-def write_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+@dataclass(frozen=True, slots=True)
+class ELTContract:
+    run_id: str
+    feature_version: str
+    schema_version: str
+    schema_hash: str
+    model_family: str
+    inference_runtime: str
+    gold_table: str
+    source_silver_table: str
+    source_silver_snapshot_id: str
+    training_row_count: int
+    output_columns_json: str
+    feature_spec_json: str
+    encoding_spec_json: str
+    aggregate_spec_json: str
+    label_spec_json: str
+    created_ts: object
 
-def train_final_model(
-    train_eval_df: pd.DataFrame,
-    best_candidate: CandidateConfig,
-    final_num_boost_round: int,
-    label_cap_seconds: float,
-    num_threads: int,
-    category_levels: dict[str, list[int]],
-) -> lgb.LGBMRegressor:
-    params = make_base_params(num_threads)
-    params.update(
-        {
-            "learning_rate": float(best_candidate.learning_rate),
-            "num_leaves": int(best_candidate.num_leaves),
-            "max_depth": int(best_candidate.max_depth),
-            "min_child_samples": int(best_candidate.min_child_samples),
-            "subsample": float(best_candidate.subsample),
-            "feature_fraction": float(best_candidate.feature_fraction),
-            "reg_alpha": float(best_candidate.reg_alpha),
-            "reg_lambda": float(best_candidate.reg_lambda),
-        }
-    )
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.run_id, "run_id")
+        _require_nonempty_str(self.feature_version, "feature_version")
+        _require_nonempty_str(self.schema_version, "schema_version")
+        _validate_sha256_hex(self.schema_hash, "schema_hash")
+        _require_nonempty_str(self.model_family, "model_family")
+        _require_nonempty_str(self.inference_runtime, "inference_runtime")
+        _require_nonempty_str(self.gold_table, "gold_table")
+        _require_nonempty_str(self.source_silver_table, "source_silver_table")
+        _require_nonempty_str(self.source_silver_snapshot_id, "source_silver_snapshot_id")
+        if self.training_row_count <= 0:
+            raise RuntimeError("training_row_count must be > 0")
 
-    train_prepared = prepare_training_frame(train_eval_df, category_levels)
-    train_X = train_prepared[MODEL_FEATURE_COLUMNS]
-    y_train_raw = train_prepared[LABEL_COLUMN].to_numpy(dtype="float32")
-    y_train = to_log_target(y_train_raw, label_cap_seconds)
+        output_columns = _validate_json_text(self.output_columns_json, "output_columns_json")
+        if not isinstance(output_columns, list) or not output_columns:
+            raise RuntimeError("output_columns_json must be a non-empty JSON array")
 
-    model = lgb.LGBMRegressor(**params, n_estimators=int(final_num_boost_round))
-    model.fit(train_X, y_train, categorical_feature=CATEGORICAL_COLUMNS)
-    return model
+        _validate_json_text(self.feature_spec_json, "feature_spec_json")
+        _validate_json_text(self.encoding_spec_json, "encoding_spec_json")
+        _validate_json_text(self.aggregate_spec_json, "aggregate_spec_json")
+        _validate_json_text(self.label_spec_json, "label_spec_json")
 
-    
-def numeric_metrics(metrics: dict[str, object]) -> dict[str, float]:
-    out: dict[str, float] = {}
-    for key, value in metrics.items():
-        if isinstance(value, (int, float, np.floating)):
-            out[key] = float(value)
-    return out
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
 
-
-TABLE_IDENTIFIER_TUPLE = ("gold", "trip_training_matrix")
-TABLE_IDENTIFIER = "gold.trip_training_matrix"
-
-EXPECTED_SCHEMA_VERSION = "trip_eta_frozen_matrix_v1"
-EXPECTED_FEATURE_VERSION = "trip_eta_lgbm_v1"
-MODEL_FAMILY = "lightgbm"
-TARGET_TRANSFORM = "log1p"
-
-LABEL_COLUMN = "label_trip_duration_seconds"
-PREDICTION_COLUMN = "prediction_seconds"
-
-FIXED_TEST_START_DATE = date(2025, 1, 7)
-INNER_VALIDATION_FRACTION = 0.10
-LABEL_CAP_QUANTILE = 0.99
-
-MAX_PREDICTION_SECONDS = 24.0 * 3600.0
-MAX_BOOST_ROUNDS = 20_000
-EARLY_STOPPING_ROUNDS = 150
-DEFAULT_TARGET_OPSET = 17
-
-EXPECTED_COLUMNS = [
-    "trip_id",
-    "as_of_ts",
-    "as_of_date",
-    "schema_version",
-    "feature_version",
-    "pickup_hour",
-    "pickup_dow",
-    "pickup_month",
-    "pickup_is_weekend",
-    "pickup_borough_id",
-    "pickup_zone_id",
-    "pickup_service_zone_id",
-    "dropoff_borough_id",
-    "dropoff_zone_id",
-    "dropoff_service_zone_id",
-    "route_pair_id",
-    "avg_duration_7d_zone_hour",
-    "avg_fare_30d_zone",
-    "trip_count_90d_zone_hour",
-    LABEL_COLUMN,
-]
-
-REQUIRED_NON_NULL_COLUMNS = [
-    "trip_id",
-    "as_of_ts",
-    "as_of_date",
-    "schema_version",
-    "feature_version",
-    "pickup_hour",
-    "pickup_dow",
-    "pickup_month",
-    "pickup_is_weekend",
-    "pickup_borough_id",
-    "pickup_zone_id",
-    "pickup_service_zone_id",
-    "dropoff_borough_id",
-    "dropoff_zone_id",
-    "dropoff_service_zone_id",
-    "route_pair_id",
-    "trip_count_90d_zone_hour",
-    LABEL_COLUMN,
-]
-
-ALLOWED_NULL_COLUMNS = {
-    "avg_duration_7d_zone_hour",
-    "avg_fare_30d_zone",
-}
-
-RAW_CATEGORICAL_COLUMNS = [
-    "pickup_hour",
-    "pickup_dow",
-    "pickup_month",
-    "pickup_is_weekend",
-    "pickup_borough_id",
-    "pickup_zone_id",
-    "pickup_service_zone_id",
-    "dropoff_borough_id",
-    "dropoff_zone_id",
-    "dropoff_service_zone_id",
-    "route_pair_id",
-]
-
-RAW_NUMERIC_COLUMNS = [
-    "avg_duration_7d_zone_hour",
-    "avg_fare_30d_zone",
-    "trip_count_90d_zone_hour",
-]
-
-MODEL_INPUT_COLUMNS = RAW_CATEGORICAL_COLUMNS + RAW_NUMERIC_COLUMNS
-
-DERIVED_NUMERIC_COLUMNS = [
-    "pickup_hour_sin",
-    "pickup_hour_cos",
-    "pickup_dow_sin",
-    "pickup_dow_cos",
-    "avg_duration_7d_zone_hour_is_missing",
-    "avg_fare_30d_zone_is_missing",
-    "avg_duration_7d_zone_hour_log1p",
-    "avg_fare_30d_zone_log1p",
-    "trip_count_90d_zone_hour_log1p",
-    "pickup_zone_hour_id",
-    "dropoff_zone_hour_id",
-    "pickup_zone_dow_id",
-    "dropoff_zone_dow_id",
-    "route_hour_id",
-    "route_dow_id",
-    "zone_pair_id",
-    "borough_pair_id",
-    "service_zone_pair_id",
-]
-
-MODEL_FEATURE_COLUMNS = [*MODEL_INPUT_COLUMNS, *DERIVED_NUMERIC_COLUMNS]
-CATEGORICAL_COLUMNS = list(RAW_CATEGORICAL_COLUMNS)
+    def to_json(self) -> str:
+        return _stable_json_dumps(asdict(self))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SnapshotLineage:
     table_uuid: str
     table_location: str
@@ -280,7 +361,7 @@ class SnapshotLineage:
         return asdict(self)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CandidateConfig:
     name: str
     learning_rate: float
@@ -299,7 +380,7 @@ class CandidateConfig:
         return asdict(self)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CandidateReport:
     name: str
     params: CandidateConfig
@@ -314,12 +395,12 @@ class CandidateReport:
         return asdict(self)
 
 
-@dataclass(frozen=True)
-class ModelArtifactPlan:
+@dataclass(frozen=True, slots=True)
+class BundleArtifactPlan:
     artifact_root_s3_uri: str
-    onnx_model_s3_uri: str
-    mlflow_model_s3_uri: str
-    summary_s3_uri: str
+    model_s3_uri: str
+    schema_s3_uri: str
+    metadata_s3_uri: str
     manifest_s3_uri: str
 
     def __getitem__(self, key: str):
@@ -329,7 +410,7 @@ class ModelArtifactPlan:
         return asdict(self)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SplitFrames:
     train_eval: pd.DataFrame
     test: pd.DataFrame
@@ -337,11 +418,13 @@ class SplitFrames:
     test_start_date: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TrainingResult:
     table_identifier: str
     schema_version: str
     feature_version: str
+    preprocessing_version: str
+    elt_contract: ELTContract
     lineage: SnapshotLineage
     category_levels: dict[str, list[int]]
     selected_candidate: CandidateConfig
@@ -356,16 +439,758 @@ class TrainingResult:
     final_num_boost_round: int
     train_rows: int
     test_rows: int
-    artifact_plan: ModelArtifactPlan
+    request_feature_columns: list[str]
+    engineered_feature_columns: list[str]
     model_input_columns: list[str]
     model_feature_columns: list[str]
+    model_name: str
+    model_version: str
+    bundle_contract: dict[str, object]
+    bundle_metadata: dict[str, object]
+    artifact_plan: BundleArtifactPlan
 
     def to_json(self) -> str:
         payload = asdict(self)
-        return json.dumps(payload, indent=2, default=str)
+        return _stable_json_dumps(payload)
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def read_contract_table_as_dataframe(table) -> pd.DataFrame:
+    pdf = _read_iceberg_table_as_dataframe(table, CONTRACT_COLUMNS)
+    if "created_ts" in pdf.columns:
+        pdf["created_ts"] = pd.to_datetime(pdf["created_ts"], utc=True, errors="raise")
+    return pdf
+
+
+def validate_contract_dataframe(df: pd.DataFrame) -> None:
+    if df.empty:
+        raise ValueError("Contract table is empty.")
+
+    if list(df.columns) != CONTRACT_COLUMNS:
+        raise ValueError(
+            "Contract schema mismatch.\n"
+            f"Expected: {CONTRACT_COLUMNS}\n"
+            f"Actual:   {list(df.columns)}"
+        )
+
+    required_non_null = CONTRACT_COLUMNS
+    for col_name in required_non_null:
+        if df[col_name].isna().any():
+            raise ValueError(f"{col_name} contains nulls but is required to be non-null.")
+
+    _validate_sha256_hex(df["schema_hash"].iloc[0], "schema_hash")
+
+    output_columns = _validate_json_text(df["output_columns_json"].iloc[0], "output_columns_json")
+    if not isinstance(output_columns, list) or output_columns != EXPECTED_COLUMNS:
+        raise ValueError(
+            "output_columns_json does not match the expected frozen matrix columns."
+        )
+
+    _validate_json_text(df["feature_spec_json"].iloc[0], "feature_spec_json")
+    _validate_json_text(df["encoding_spec_json"].iloc[0], "encoding_spec_json")
+    _validate_json_text(df["aggregate_spec_json"].iloc[0], "aggregate_spec_json")
+    _validate_json_text(df["label_spec_json"].iloc[0], "label_spec_json")
+
+    if int(df["training_row_count"].iloc[0]) <= 0:
+        raise ValueError("training_row_count must be > 0")
+
+
+def _contract_row_to_dataclass(row: pd.Series) -> ELTContract:
+    return ELTContract(
+        run_id=_require_nonempty_str(row["run_id"], "run_id"),
+        feature_version=_require_nonempty_str(row["feature_version"], "feature_version"),
+        schema_version=_require_nonempty_str(row["schema_version"], "schema_version"),
+        schema_hash=_validate_sha256_hex(row["schema_hash"], "schema_hash"),
+        model_family=_require_nonempty_str(row["model_family"], "model_family"),
+        inference_runtime=_require_nonempty_str(row["inference_runtime"], "inference_runtime"),
+        gold_table=_require_nonempty_str(row["gold_table"], "gold_table"),
+        source_silver_table=_require_nonempty_str(row["source_silver_table"], "source_silver_table"),
+        source_silver_snapshot_id=_require_nonempty_str(
+            row["source_silver_snapshot_id"], "source_silver_snapshot_id"
+        ),
+        training_row_count=_require_int(row["training_row_count"], "training_row_count"),
+        output_columns_json=_require_nonempty_str(row["output_columns_json"], "output_columns_json"),
+        feature_spec_json=_require_nonempty_str(row["feature_spec_json"], "feature_spec_json"),
+        encoding_spec_json=_require_nonempty_str(row["encoding_spec_json"], "encoding_spec_json"),
+        aggregate_spec_json=_require_nonempty_str(row["aggregate_spec_json"], "aggregate_spec_json"),
+        label_spec_json=_require_nonempty_str(row["label_spec_json"], "label_spec_json"),
+        created_ts=row["created_ts"],
+    )
+
+
+def load_elt_contract(
+    catalog_name: str,
+    iceberg_rest_uri: str,
+    iceberg_warehouse: str,
+) -> ELTContract:
+    table = load_iceberg_table(
+        catalog_name,
+        iceberg_rest_uri,
+        iceberg_warehouse,
+        CONTRACT_TABLE_IDENTIFIER_TUPLE,
+    )
+    df = read_contract_table_as_dataframe(table)
+    validate_contract_dataframe(df)
+
+    if "created_ts" in df.columns:
+        df = df.sort_values("created_ts")
+
+    row = df.iloc[-1]
+    return _contract_row_to_dataclass(row)
+
+
+def build_bundle_contract(
+    *,
+    output_names: Sequence[str],
+    input_name: str = "input",
+    feature_order: Sequence[str] = REQUEST_FEATURE_COLUMNS,
+    request_feature_order: Sequence[str] = REQUEST_FEATURE_COLUMNS,
+    engineered_feature_order: Sequence[str] = ENGINEERED_FEATURE_COLUMNS,
+    schema_version: str = EXPECTED_SCHEMA_VERSION,
+    feature_version: str = EXPECTED_FEATURE_VERSION,
+    preprocessing_version: str = PREPROCESSING_VERSION,
+    target_transform: str = TARGET_TRANSFORM,
+    allow_extra_features: bool = False,
+) -> dict[str, object]:
+    feature_order_tuple = _require_sequence_of_str(feature_order, "feature_order")
+    request_feature_order_tuple = _require_sequence_of_str(
+        request_feature_order, "request_feature_order"
+    )
+    engineered_feature_order_tuple = _require_sequence_of_str(
+        engineered_feature_order, "engineered_feature_order"
+    )
+    output_names_tuple = _require_sequence_of_str(output_names, "output_names")
+
+    if feature_order_tuple != request_feature_order_tuple:
+        raise ValueError("feature_order and request_feature_order must match exactly")
+    if feature_order_tuple != engineered_feature_order_tuple:
+        raise ValueError("feature_order and engineered_feature_order must match exactly")
+
+    return {
+        "schema_version": schema_version,
+        "feature_version": feature_version,
+        "preprocessing_version": preprocessing_version,
+        "target_transform": target_transform,
+        "input_name": input_name,
+        "feature_order": list(feature_order_tuple),
+        "request_feature_order": list(request_feature_order_tuple),
+        "engineered_feature_order": list(engineered_feature_order_tuple),
+        "output_names": list(output_names_tuple),
+        "allow_extra_features": bool(allow_extra_features),
+        "feature_order_hash": ordered_columns_hash(feature_order_tuple),
+        "request_feature_order_hash": ordered_columns_hash(request_feature_order_tuple),
+        "engineered_feature_order_hash": ordered_columns_hash(engineered_feature_order_tuple),
+    }
+
+
+def build_bundle_metadata(
+    *,
+    elt_contract: ELTContract,
+    lineage: SnapshotLineage,
+    artifact_plan: BundleArtifactPlan,
+    model_name: str,
+    model_version: str,
+    bundle_contract: dict[str, object],
+    category_levels: dict[str, list[int]],
+    selected_candidate: CandidateConfig,
+    candidate_reports: Sequence[CandidateReport],
+    search_best_metrics: dict[str, float],
+    inner_metrics: dict[str, float],
+    holdout_metrics: dict[str, float],
+    holdout_baseline_metrics: dict[str, float],
+    label_cap_seconds: float,
+    train_label_p50_seconds: float,
+    best_iteration_inner: int,
+    final_num_boost_round: int,
+    train_rows: int,
+    test_rows: int,
+) -> dict[str, object]:
+    return {
+        "run_id": elt_contract.run_id,
+        "feature_version": elt_contract.feature_version,
+        "schema_version": elt_contract.schema_version,
+        "schema_hash": elt_contract.schema_hash,
+        "model_family": elt_contract.model_family,
+        "inference_runtime": elt_contract.inference_runtime,
+        "gold_table": elt_contract.gold_table,
+        "source_silver_table": elt_contract.source_silver_table,
+        "source_silver_snapshot_id": elt_contract.source_silver_snapshot_id,
+        "training_row_count": elt_contract.training_row_count,
+        "output_columns_json": elt_contract.output_columns_json,
+        "feature_spec_json": elt_contract.feature_spec_json,
+        "encoding_spec_json": elt_contract.encoding_spec_json,
+        "aggregate_spec_json": elt_contract.aggregate_spec_json,
+        "label_spec_json": elt_contract.label_spec_json,
+        "created_ts": elt_contract.created_ts,
+        "lineage": lineage.as_dict(),
+        "artifact_plan": artifact_plan.as_dict(),
+        "model_name": model_name,
+        "model_version": model_version,
+        "preprocessing_version": bundle_contract["preprocessing_version"],
+        "request_feature_order": list(bundle_contract["request_feature_order"]),
+        "engineered_feature_order": list(bundle_contract["engineered_feature_order"]),
+        "request_feature_order_hash": bundle_contract["request_feature_order_hash"],
+        "engineered_feature_order_hash": bundle_contract["engineered_feature_order_hash"],
+        "category_levels": {key: [int(v) for v in values] for key, values in category_levels.items()},
+        "selected_candidate": selected_candidate.as_dict(),
+        "candidate_reports": [report.as_dict() for report in candidate_reports],
+        "search_best_metrics": dict(search_best_metrics),
+        "inner_metrics": dict(inner_metrics),
+        "holdout_metrics": dict(holdout_metrics),
+        "holdout_baseline_metrics": dict(holdout_baseline_metrics),
+        "label_cap_seconds": float(label_cap_seconds),
+        "train_label_p50_seconds": float(train_label_p50_seconds),
+        "best_iteration_inner": int(best_iteration_inner),
+        "final_num_boost_round": int(final_num_boost_round),
+        "train_rows": int(train_rows),
+        "test_rows": int(test_rows),
+    }
+
+
+def load_iceberg_table(
+    catalog_name: str,
+    iceberg_rest_uri: str,
+    iceberg_warehouse: str,
+    table_identifier: tuple[str, str] = TABLE_IDENTIFIER_TUPLE,
+):
+    catalog = load_catalog(
+        catalog_name,
+        type="rest",
+        uri=iceberg_rest_uri,
+        warehouse=iceberg_warehouse,
+    )
+    return catalog.load_table(table_identifier)
+
+
+def table_snapshot_lineage(table) -> SnapshotLineage:
+    snapshot = table.current_snapshot()
+    metadata = table.metadata
+    return SnapshotLineage(
+        table_uuid=str(getattr(metadata, "table_uuid", "")),
+        table_location=str(getattr(metadata, "location", "")),
+        current_schema_id=int(getattr(metadata, "current_schema_id", -1)),
+        current_snapshot_id=int(snapshot.snapshot_id) if snapshot is not None else None,
+        metadata_location=str(getattr(metadata, "metadata_location", "")),
+        format_version=int(getattr(metadata, "format_version", -1)),
+    )
+
+
+def read_table_as_dataframe(table) -> pd.DataFrame:
+    pdf = _read_iceberg_table_as_dataframe(table, EXPECTED_COLUMNS)
+    pdf["as_of_ts"] = pd.to_datetime(pdf["as_of_ts"], utc=True, errors="raise")
+    pdf["as_of_date"] = pd.to_datetime(pdf["as_of_date"], errors="raise").dt.date
+    return pdf
+
+
+def validate_raw_dataframe(df: pd.DataFrame) -> None:
+    if df.empty:
+        raise ValueError("Gold dataset is empty.")
+
+    if list(df.columns) != EXPECTED_COLUMNS:
+        raise ValueError(
+            "Gold schema mismatch.\n"
+            f"Expected: {EXPECTED_COLUMNS}\n"
+            f"Actual:   {list(df.columns)}"
+        )
+
+    if df["schema_version"].nunique(dropna=False) != 1:
+        raise ValueError("schema_version is not single-valued.")
+    if df["feature_version"].nunique(dropna=False) != 1:
+        raise ValueError("feature_version is not single-valued.")
+    if str(df["schema_version"].iloc[0]) != EXPECTED_SCHEMA_VERSION:
+        raise ValueError(
+            f"schema_version must be {EXPECTED_SCHEMA_VERSION!r}, got {df['schema_version'].iloc[0]!r}"
+        )
+    if str(df["feature_version"].iloc[0]) != EXPECTED_FEATURE_VERSION:
+        raise ValueError(
+            f"feature_version must be {EXPECTED_FEATURE_VERSION!r}, got {df['feature_version'].iloc[0]!r}"
+        )
+
+    as_of_ts_dates = pd.to_datetime(df["as_of_ts"], utc=True, errors="raise").dt.date
+    as_of_date_dates = pd.to_datetime(df["as_of_date"], errors="raise").dt.date
+    if not (as_of_ts_dates == as_of_date_dates).all():
+        raise ValueError("as_of_date does not match as_of_ts.date for all rows.")
+
+    for col_name in [
+        "trip_id",
+        "pickup_ts",
+        "as_of_ts",
+        "as_of_date",
+        "schema_version",
+        "feature_version",
+        "pickup_hour",
+        "pickup_dow",
+        "pickup_month",
+        "pickup_is_weekend",
+        "pickup_borough_id",
+        "pickup_zone_id",
+        "pickup_service_zone_id",
+        "dropoff_borough_id",
+        "dropoff_zone_id",
+        "dropoff_service_zone_id",
+        "route_pair_id",
+        LABEL_COLUMN,
+    ]:
+        if df[col_name].isna().any():
+            raise ValueError(f"{col_name} contains nulls but is required to be non-null.")
+
+    for col_name in [
+        "avg_duration_7d_zone_hour",
+        "avg_fare_30d_zone",
+    ]:
+        if col_name not in df.columns:
+            raise ValueError(f"{col_name} is missing from the dataset.")
+
+    if not pd.to_numeric(df["pickup_hour"], errors="coerce").between(0, 23).all():
+        raise ValueError("pickup_hour must be in [0, 23].")
+    if not pd.to_numeric(df["pickup_dow"], errors="coerce").between(1, 7).all():
+        raise ValueError("pickup_dow must be in [1, 7].")
+    if not pd.to_numeric(df["pickup_month"], errors="coerce").between(1, 12).all():
+        raise ValueError("pickup_month must be in [1, 12].")
+    if not pd.to_numeric(df["pickup_is_weekend"], errors="coerce").isin([0, 1]).all():
+        raise ValueError("pickup_is_weekend must be 0 or 1.")
+    if not (pd.to_numeric(df[LABEL_COLUMN], errors="coerce") > 0).all():
+        raise ValueError("label_trip_duration_seconds must be strictly positive.")
+
+    for col_name in [
+        "pickup_borough_id",
+        "pickup_zone_id",
+        "pickup_service_zone_id",
+        "dropoff_borough_id",
+        "dropoff_zone_id",
+        "dropoff_service_zone_id",
+        "route_pair_id",
+        "trip_count_90d_zone_hour",
+    ]:
+        if (pd.to_numeric(df[col_name], errors="coerce") < 0).any():
+            raise ValueError(f"{col_name} contains negative values.")
+
+    if (pd.to_numeric(df["avg_duration_7d_zone_hour"], errors="coerce") < 0).dropna().any():
+        raise ValueError("avg_duration_7d_zone_hour contains negative values.")
+    if (pd.to_numeric(df["avg_fare_30d_zone"], errors="coerce") < 0).dropna().any():
+        raise ValueError("avg_fare_30d_zone contains negative values.")
+
+
+def load_elt_contract_table(
+    catalog_name: str,
+    iceberg_rest_uri: str,
+    iceberg_warehouse: str,
+):
+    return load_iceberg_table(
+        catalog_name,
+        iceberg_rest_uri,
+        iceberg_warehouse,
+        CONTRACT_TABLE_IDENTIFIER_TUPLE,
+    )
+
+
+def split_train_test_by_date(
+    df: pd.DataFrame,
+    test_start_date: date = FIXED_TEST_START_DATE,
+) -> SplitFrames:
+    working = df.copy()
+    working["as_of_date"] = pd.to_datetime(working["as_of_date"], errors="raise").dt.date
+
+    train_eval_df = working.loc[working["as_of_date"] < test_start_date].copy()
+    test_df = working.loc[working["as_of_date"] >= test_start_date].copy()
+
+    if train_eval_df.empty:
+        raise ValueError("Training frame is empty after fixed date split.")
+    if test_df.empty:
+        raise ValueError("Test frame is empty after fixed date split.")
+
+    return SplitFrames(
+        train_eval=train_eval_df,
+        test=test_df,
+        train_eval_cutoff=str(train_eval_df["as_of_date"].max()),
+        test_start_date=str(test_start_date),
+    )
+
+
+def split_by_date_fraction(
+    df: pd.DataFrame,
+    keep_fraction: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    if not (0.0 < keep_fraction < 1.0):
+        raise ValueError("keep_fraction must be between 0 and 1.")
+
+    working = df.copy()
+    working["as_of_date"] = pd.to_datetime(working["as_of_date"], errors="raise").dt.date
+
+    date_counts = (
+        working.groupby("as_of_date", sort=True)
+        .size()
+        .reset_index(name="row_count")
+        .sort_values("as_of_date")
+        .reset_index(drop=True)
+    )
+    if len(date_counts) < 2:
+        raise ValueError("Not enough distinct dates to split the dataset.")
+
+    total_rows = int(date_counts["row_count"].sum())
+    cutoff_rows = max(1, min(total_rows - 1, round(total_rows * keep_fraction)))
+    cumulative = date_counts["row_count"].cumsum()
+    cutoff_idx = int(cumulative.searchsorted(cutoff_rows, side="left"))
+    cutoff_idx = max(0, min(cutoff_idx, len(date_counts) - 2))
+    cutoff_date = date_counts.loc[cutoff_idx, "as_of_date"]
+
+    left = working.loc[working["as_of_date"] <= cutoff_date].copy()
+    right = working.loc[working["as_of_date"] > cutoff_date].copy()
+
+    if left.empty or right.empty:
+        raise ValueError("Date split produced an empty side.")
+    return left, right, str(cutoff_date)
+
+
+def evenly_spaced_sample(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+    if len(df) <= max_rows:
+        return df.copy()
+    indices = np.linspace(0, len(df) - 1, num=max_rows, dtype=int)
+    return df.iloc[indices].copy()
+
+
+def build_category_levels(
+    df: pd.DataFrame,
+    columns: list[str] = CATEGORICAL_COLUMNS,
+) -> dict[str, list[int]]:
+    levels: dict[str, list[int]] = {}
+    for col_name in columns:
+        values = pd.to_numeric(df[col_name], errors="coerce").dropna().astype("int64").unique()
+        values = np.asarray(np.sort(values), dtype="int64")
+        levels[col_name] = [int(v) for v in values.tolist()]
+    return levels
+
+
+def encode_categorical_series(series: pd.Series, levels: list[int]) -> pd.Series:
+    mapping = {int(v): int(i + 1) for i, v in enumerate(levels)}
+    values = pd.to_numeric(series, errors="coerce").fillna(0).astype("int64")
+    encoded = values.map(mapping).fillna(0).astype("int32")
+    return encoded
+
+
+def prepare_model_features(
+    raw_df: pd.DataFrame,
+    category_levels: dict[str, list[int]] | None = None,
+) -> pd.DataFrame:
+    missing = [col for col in MATRIX_FEATURE_COLUMNS if col not in raw_df.columns]
+    if missing:
+        raise ValueError(f"Missing model input columns: {missing}")
+
+    out = raw_df[MATRIX_FEATURE_COLUMNS].copy()
+
+    for col_name in CATEGORICAL_COLUMNS:
+        values = pd.to_numeric(out[col_name], errors="raise")
+        if values.isna().any():
+            raise ValueError(f"{col_name} contains nulls")
+        out[col_name] = values.astype("int32")
+
+    for col_name in NUMERIC_FEATURE_COLUMNS:
+        values = pd.to_numeric(out[col_name], errors="raise").astype("float32")
+        if np.isinf(values.to_numpy(dtype="float32", copy=False)).any():
+            raise ValueError(f"{col_name} contains infinite values")
+        out[col_name] = values
+
+    return out[MATRIX_FEATURE_COLUMNS]
+
+
+def prepare_training_frame(
+    raw_df: pd.DataFrame,
+    category_levels: dict[str, list[int]] | None = None,
+) -> pd.DataFrame:
+    features = prepare_model_features(raw_df, category_levels=category_levels)
+    label = pd.to_numeric(raw_df[LABEL_COLUMN], errors="raise").astype("float32")
+    frame = features.copy()
+    frame[LABEL_COLUMN] = label.to_numpy(dtype="float32")
+    return frame[[*MATRIX_FEATURE_COLUMNS, LABEL_COLUMN]]
+
+
+def to_log_target(y_seconds: np.ndarray, cap_seconds: float) -> np.ndarray:
+    clipped = np.clip(np.asarray(y_seconds, dtype="float32"), 0.0, cap_seconds)
+    return np.log1p(clipped).astype("float32")
+
+
+def from_log_target(y_log: np.ndarray) -> np.ndarray:
+    return np.expm1(np.asarray(y_log, dtype="float32")).astype("float32")
+
+
+def clip_seconds(values: np.ndarray | pd.Series | list[float], cap_seconds: float) -> np.ndarray:
+    return np.clip(np.asarray(values, dtype="float32"), 0.0, cap_seconds).astype("float32")
+
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    y_true = np.asarray(y_true, dtype="float64")
+    y_pred = np.asarray(y_pred, dtype="float64")
+    return {
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "rmse": float(math.sqrt(mean_squared_error(y_true, y_pred))),
+        "medae": float(median_absolute_error(y_true, y_pred)),
+    }
+
+
+def prediction_digest(df: pd.DataFrame) -> str:
+    frame = df.copy()
+    if "trip_id" in frame.columns and "as_of_ts" in frame.columns:
+        frame = frame[["trip_id", "as_of_ts"]].copy()
+    payload = frame.astype(str).to_csv(index=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def feature_digest(df: pd.DataFrame, columns: list[str]) -> str:
+    payload = df[columns].astype(str).to_csv(index=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def make_base_params(num_threads: int) -> dict[str, object]:
+    params = dict(BASE_LGBM_PARAMS)
+    params["n_jobs"] = int(num_threads)
+    return params
+
+
+def predict_seconds_from_model(
+    model: lgb.LGBMRegressor,
+    raw_df: pd.DataFrame,
+    category_levels: dict[str, list[int]] | None,
+    num_iteration: int | None,
+) -> np.ndarray:
+    features = prepare_model_features(raw_df, category_levels=category_levels)
+    if num_iteration is None:
+        preds_log = model.predict(features)
+    else:
+        preds_log = model.predict(features, num_iteration=num_iteration)
+    preds_seconds = from_log_target(preds_log)
+    return clip_seconds(preds_seconds, MAX_PREDICTION_SECONDS)
+
+
+def fit_lgbm_candidate(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    candidate: CandidateConfig,
+    label_cap_seconds: float,
+    num_threads: int,
+    category_levels: dict[str, list[int]] | None,
+    max_boost_rounds: int,
+) -> tuple[lgb.LGBMRegressor, int, dict[str, float]]:
+    params = make_base_params(num_threads)
+    params.update(
+        {
+            "learning_rate": float(candidate.learning_rate),
+            "num_leaves": int(candidate.num_leaves),
+            "max_depth": int(candidate.max_depth),
+            "min_child_samples": int(candidate.min_child_samples),
+            "subsample": float(candidate.subsample),
+            "feature_fraction": float(candidate.feature_fraction),
+            "reg_alpha": float(candidate.reg_alpha),
+            "reg_lambda": float(candidate.reg_lambda),
+        }
+    )
+
+    train_prepared = prepare_training_frame(train_df, category_levels=category_levels)
+    val_prepared = prepare_training_frame(val_df, category_levels=category_levels)
+
+    train_X = train_prepared[MATRIX_FEATURE_COLUMNS]
+    val_X = val_prepared[MATRIX_FEATURE_COLUMNS]
+    y_train_raw = train_prepared[LABEL_COLUMN].to_numpy(dtype="float32")
+    y_val_raw = val_prepared[LABEL_COLUMN].to_numpy(dtype="float32")
+
+    y_train = to_log_target(y_train_raw, label_cap_seconds)
+    y_val = to_log_target(y_val_raw, label_cap_seconds)
+
+    model = lgb.LGBMRegressor(**params, n_estimators=int(max_boost_rounds))
+    model.fit(
+        train_X,
+        y_train,
+        eval_set=[(val_X, y_val)],
+        categorical_feature=CATEGORICAL_COLUMNS,
+        callbacks=[
+            lgb.early_stopping(
+                stopping_rounds=EARLY_STOPPING_ROUNDS,
+                first_metric_only=True,
+                verbose=False,
+            ),
+        ],
+    )
+
+    best_iteration = int(model.best_iteration_ or max_boost_rounds)
+    val_pred_seconds = predict_seconds_from_model(model, val_df, category_levels, best_iteration)
+    val_true_seconds = y_val_raw
+    val_true_capped = clip_seconds(y_val_raw, label_cap_seconds)
+
+    raw_metrics = compute_metrics(val_true_seconds, val_pred_seconds)
+    capped_metrics = compute_metrics(val_true_capped, val_pred_seconds)
+
+    metrics = {
+        "mae_seconds_raw": raw_metrics["mae"],
+        "rmse_seconds_raw": raw_metrics["rmse"],
+        "medae_seconds_raw": raw_metrics["medae"],
+        "mae_seconds_capped": capped_metrics["mae"],
+        "rmse_seconds_capped": capped_metrics["rmse"],
+        "medae_seconds_capped": capped_metrics["medae"],
+    }
+    return model, best_iteration, metrics
+
+
+def evaluate_model(
+    model: lgb.LGBMRegressor,
+    df: pd.DataFrame,
+    best_iteration: int,
+    label_cap_seconds: float,
+    category_levels: dict[str, list[int]] | None,
+) -> dict[str, float]:
+    if df.empty:
+        raise ValueError("Evaluation frame is empty.")
+
+    y_true_raw = pd.to_numeric(df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
+    y_true_capped = clip_seconds(y_true_raw, label_cap_seconds)
+    y_pred = predict_seconds_from_model(model, df, category_levels, best_iteration)
+
+    raw_metrics = compute_metrics(y_true_raw, y_pred)
+    capped_metrics = compute_metrics(y_true_capped, y_pred)
+
+    return {
+        "rows": float(len(df)),
+        "mae_seconds_raw": raw_metrics["mae"],
+        "rmse_seconds_raw": raw_metrics["rmse"],
+        "medae_seconds_raw": raw_metrics["medae"],
+        "mae_seconds_capped": capped_metrics["mae"],
+        "rmse_seconds_capped": capped_metrics["rmse"],
+        "medae_seconds_capped": capped_metrics["medae"],
+    }
+
+
+def compute_baseline_metrics(
+    holdout_df: pd.DataFrame,
+    train_eval_df: pd.DataFrame,
+    label_cap_seconds: float,
+) -> dict[str, float]:
+    train_eval_labels = pd.to_numeric(train_eval_df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
+    train_eval_median = float(np.median(np.clip(train_eval_labels, 0.0, label_cap_seconds)))
+
+    holdout_labels = pd.to_numeric(holdout_df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
+    holdout_capped = clip_seconds(holdout_labels, label_cap_seconds)
+    baseline_pred = np.full(shape=len(holdout_df), fill_value=train_eval_median, dtype="float32")
+
+    return compute_metrics(holdout_capped, baseline_pred)
+
+
+def export_onnx_model(final_model: lgb.LGBMRegressor, feature_count: int) -> object:
+    from onnxmltools import convert_lightgbm
+    from onnxmltools.convert.common.data_types import FloatTensorType
+
+    initial_types = [("input", FloatTensorType([None, feature_count]))]
+    onnx_model = convert_lightgbm(
+        final_model.booster_,
+        initial_types=initial_types,
+    )
+    return onnx_model
+
+
+def build_artifact_plan(
+    model_artifacts_s3_bucket: str,
+    feature_version: str,
+    lineage: SnapshotLineage,
+    train_eval_cutoff: str,
+) -> BundleArtifactPlan:
+    bucket = model_artifacts_s3_bucket.rstrip("/")
+    artifact_root = f"{bucket}/{feature_version}/{lineage.table_uuid}/{train_eval_cutoff}"
+    return BundleArtifactPlan(
+        artifact_root_s3_uri=artifact_root,
+        model_s3_uri=f"{artifact_root}/model.onnx",
+        schema_s3_uri=f"{artifact_root}/schema.json",
+        metadata_s3_uri=f"{artifact_root}/metadata.json",
+        manifest_s3_uri=f"{artifact_root}/manifest.json",
+    )
+
+
+def build_training_result(
+    *,
+    elt_contract: ELTContract,
+    lineage: SnapshotLineage,
+    category_levels: dict[str, list[int]],
+    selected_candidate: CandidateConfig,
+    candidate_reports: list[CandidateReport],
+    search_best_metrics: dict[str, float],
+    inner_metrics: dict[str, float],
+    holdout_metrics: dict[str, float],
+    holdout_baseline_metrics: dict[str, float],
+    label_cap_seconds: float,
+    train_label_p50_seconds: float,
+    best_iteration_inner: int,
+    final_num_boost_round: int,
+    train_rows: int,
+    test_rows: int,
+    artifact_plan: BundleArtifactPlan,
+    model_name: str,
+    model_version: str,
+    output_names: Sequence[str],
+) -> TrainingResult:
+    request_feature_columns = list(REQUEST_FEATURE_COLUMNS)
+    engineered_feature_columns = list(ENGINEERED_FEATURE_COLUMNS)
+    bundle_contract = build_bundle_contract(
+        output_names=output_names,
+        input_name="input",
+        feature_order=request_feature_columns,
+        request_feature_order=request_feature_columns,
+        engineered_feature_order=engineered_feature_columns,
+        schema_version=elt_contract.schema_version,
+        feature_version=elt_contract.feature_version,
+        preprocessing_version=PREPROCESSING_VERSION,
+        target_transform=TARGET_TRANSFORM,
+        allow_extra_features=False,
+    )
+    bundle_metadata = build_bundle_metadata(
+        elt_contract=elt_contract,
+        lineage=lineage,
+        artifact_plan=artifact_plan,
+        model_name=model_name,
+        model_version=model_version,
+        bundle_contract=bundle_contract,
+        category_levels=category_levels,
+        selected_candidate=selected_candidate,
+        candidate_reports=candidate_reports,
+        search_best_metrics=search_best_metrics,
+        inner_metrics=inner_metrics,
+        holdout_metrics=holdout_metrics,
+        holdout_baseline_metrics=holdout_baseline_metrics,
+        label_cap_seconds=label_cap_seconds,
+        train_label_p50_seconds=train_label_p50_seconds,
+        best_iteration_inner=best_iteration_inner,
+        final_num_boost_round=final_num_boost_round,
+        train_rows=train_rows,
+        test_rows=test_rows,
+    )
+
+    return TrainingResult(
+        table_identifier=TABLE_IDENTIFIER,
+        schema_version=elt_contract.schema_version,
+        feature_version=elt_contract.feature_version,
+        preprocessing_version=PREPROCESSING_VERSION,
+        elt_contract=elt_contract,
+        lineage=lineage,
+        category_levels=category_levels,
+        selected_candidate=selected_candidate,
+        candidate_reports=candidate_reports,
+        search_best_metrics=search_best_metrics,
+        inner_metrics=inner_metrics,
+        holdout_metrics=holdout_metrics,
+        holdout_baseline_metrics=holdout_baseline_metrics,
+        label_cap_seconds=float(label_cap_seconds),
+        train_label_p50_seconds=float(train_label_p50_seconds),
+        best_iteration_inner=int(best_iteration_inner),
+        final_num_boost_round=int(final_num_boost_round),
+        train_rows=int(train_rows),
+        test_rows=int(test_rows),
+        request_feature_columns=request_feature_columns,
+        engineered_feature_columns=engineered_feature_columns,
+        model_input_columns=request_feature_columns,
+        model_feature_columns=engineered_feature_columns,
+        model_name=model_name,
+        model_version=model_version,
+        bundle_contract=bundle_contract,
+        bundle_metadata=bundle_metadata,
+        artifact_plan=artifact_plan,
+    )
 
 
 BASE_LGBM_PARAMS: dict[str, object] = {
@@ -466,478 +1291,3 @@ CANDIDATE_CONFIGS: list[CandidateConfig] = [
         reg_lambda=2.0,
     ),
 ]
-
-
-def load_rest_catalog(catalog_name: str, iceberg_rest_uri: str, iceberg_warehouse: str):
-    return load_catalog(
-        catalog_name,
-        type="rest",
-        uri=iceberg_rest_uri,
-        warehouse=iceberg_warehouse,
-    )
-
-
-def load_iceberg_table(catalog_name: str, iceberg_rest_uri: str, iceberg_warehouse: str):
-    catalog = load_rest_catalog(catalog_name, iceberg_rest_uri, iceberg_warehouse)
-    return catalog.load_table(TABLE_IDENTIFIER_TUPLE)
-
-
-def table_snapshot_lineage(table) -> SnapshotLineage:
-    snapshot = table.current_snapshot()
-    metadata = table.metadata
-    return SnapshotLineage(
-        table_uuid=str(getattr(metadata, "table_uuid", "")),
-        table_location=str(getattr(metadata, "location", "")),
-        current_schema_id=int(getattr(metadata, "current_schema_id", -1)),
-        current_snapshot_id=int(snapshot.snapshot_id) if snapshot is not None else None,
-        metadata_location=str(getattr(metadata, "metadata_location", "")),
-        format_version=int(getattr(metadata, "format_version", -1)),
-    )
-
-
-def read_table_as_dataframe(table) -> pd.DataFrame:
-    lf = pl.scan_iceberg(table).select(EXPECTED_COLUMNS)
-    pdf = lf.collect(engine="streaming").to_pandas()
-    pdf = pdf.reindex(columns=EXPECTED_COLUMNS).copy()
-    pdf["as_of_ts"] = pd.to_datetime(pdf["as_of_ts"], utc=True, errors="raise")
-    pdf["as_of_date"] = pd.to_datetime(pdf["as_of_date"], errors="raise").dt.date
-    return pdf
-
-
-def validate_raw_dataframe(df: pd.DataFrame) -> None:
-    if df.empty:
-        raise ValueError("Gold dataset is empty.")
-
-    if list(df.columns) != EXPECTED_COLUMNS:
-        raise ValueError(
-            "Gold schema mismatch.\n"
-            f"Expected: {EXPECTED_COLUMNS}\n"
-            f"Actual:   {list(df.columns)}"
-        )
-
-    if df["schema_version"].nunique(dropna=False) != 1:
-        raise ValueError("schema_version is not single-valued.")
-    if df["feature_version"].nunique(dropna=False) != 1:
-        raise ValueError("feature_version is not single-valued.")
-    if not df["trip_id"].is_unique:
-        raise ValueError("trip_id contains duplicates.")
-
-    as_of_ts_dates = pd.to_datetime(df["as_of_ts"], utc=True, errors="raise").dt.date
-    as_of_date_dates = pd.to_datetime(df["as_of_date"], errors="raise").dt.date
-    if not (as_of_ts_dates == as_of_date_dates).all():
-        raise ValueError("as_of_date does not match as_of_ts.date for all rows.")
-
-    for col_name in REQUIRED_NON_NULL_COLUMNS:
-        if df[col_name].isna().any():
-            raise ValueError(f"{col_name} contains nulls but is required to be non-null.")
-
-    for col_name in EXPECTED_COLUMNS:
-        if col_name not in REQUIRED_NON_NULL_COLUMNS and col_name not in ALLOWED_NULL_COLUMNS:
-            if df[col_name].isna().any():
-                raise ValueError(f"{col_name} contains unexpected nulls.")
-
-    if not pd.to_numeric(df["pickup_hour"], errors="coerce").between(0, 23).all():
-        raise ValueError("pickup_hour must be in [0, 23].")
-    if not pd.to_numeric(df["pickup_dow"], errors="coerce").between(1, 7).all():
-        raise ValueError("pickup_dow must be in [1, 7].")
-    if not pd.to_numeric(df["pickup_month"], errors="coerce").between(1, 12).all():
-        raise ValueError("pickup_month must be in [1, 12].")
-    if not pd.to_numeric(df["pickup_is_weekend"], errors="coerce").isin([0, 1]).all():
-        raise ValueError("pickup_is_weekend must be 0 or 1.")
-    if not (pd.to_numeric(df[LABEL_COLUMN], errors="coerce") > 0).all():
-        raise ValueError("label_trip_duration_seconds must be strictly positive.")
-
-    for col_name in [
-        "pickup_borough_id",
-        "pickup_zone_id",
-        "pickup_service_zone_id",
-        "dropoff_borough_id",
-        "dropoff_zone_id",
-        "dropoff_service_zone_id",
-        "route_pair_id",
-        "trip_count_90d_zone_hour",
-    ]:
-        if (pd.to_numeric(df[col_name], errors="coerce") < 0).any():
-            raise ValueError(f"{col_name} contains negative values.")
-
-
-def split_train_test_by_date(
-    df: pd.DataFrame,
-    test_start_date: date = FIXED_TEST_START_DATE,
-) -> SplitFrames:
-    working = df.copy()
-    working["as_of_date"] = pd.to_datetime(working["as_of_date"], errors="raise").dt.date
-
-    train_eval_df = working.loc[working["as_of_date"] < test_start_date].copy()
-    test_df = working.loc[working["as_of_date"] >= test_start_date].copy()
-
-    if train_eval_df.empty:
-        raise ValueError("Training frame is empty after fixed date split.")
-    if test_df.empty:
-        raise ValueError("Test frame is empty after fixed date split.")
-
-    return SplitFrames(
-        train_eval=train_eval_df,
-        test=test_df,
-        train_eval_cutoff=str(train_eval_df["as_of_date"].max()),
-        test_start_date=str(test_start_date),
-    )
-
-
-def split_by_date_fraction(df: pd.DataFrame, keep_fraction: float) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    if not (0.0 < keep_fraction < 1.0):
-        raise ValueError("keep_fraction must be between 0 and 1.")
-
-    working = df.copy()
-    working["as_of_date"] = pd.to_datetime(working["as_of_date"], errors="raise").dt.date
-
-    date_counts = (
-        working.groupby("as_of_date", sort=True)
-        .size()
-        .reset_index(name="row_count")
-        .sort_values("as_of_date")
-        .reset_index(drop=True)
-    )
-    if len(date_counts) < 2:
-        raise ValueError("Not enough distinct dates to split the dataset.")
-
-    total_rows = int(date_counts["row_count"].sum())
-    cutoff_rows = max(1, min(total_rows - 1, round(total_rows * keep_fraction)))
-    cumulative = date_counts["row_count"].cumsum()
-    cutoff_idx = int(cumulative.searchsorted(cutoff_rows, side="left"))
-    cutoff_idx = max(0, min(cutoff_idx, len(date_counts) - 2))
-    cutoff_date = date_counts.loc[cutoff_idx, "as_of_date"]
-
-    left = working.loc[working["as_of_date"] <= cutoff_date].copy()
-    right = working.loc[working["as_of_date"] > cutoff_date].copy()
-
-    if left.empty or right.empty:
-        raise ValueError("Date split produced an empty side.")
-    return left, right, str(cutoff_date)
-
-
-def evenly_spaced_sample(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
-    if len(df) <= max_rows:
-        return df.copy()
-    indices = np.linspace(0, len(df) - 1, num=max_rows, dtype=int)
-    return df.iloc[indices].copy()
-
-
-def build_category_levels(df: pd.DataFrame, columns: list[str] = CATEGORICAL_COLUMNS) -> dict[str, list[int]]:
-    levels: dict[str, list[int]] = {}
-    for col_name in columns:
-        values = pd.to_numeric(df[col_name], errors="coerce").dropna().astype("int64").unique()
-        values = np.asarray(np.sort(values), dtype="int64")
-        levels[col_name] = [int(v) for v in values.tolist()]
-    return levels
-
-
-def encode_categorical_series(series: pd.Series, levels: list[int]) -> pd.Series:
-    mapping = {int(v): int(i + 1) for i, v in enumerate(levels)}
-    values = pd.to_numeric(series, errors="coerce").fillna(0).astype("int64")
-    encoded = values.map(mapping).fillna(0).astype("int32")
-    return encoded
-
-
-def _log1p_with_nan(series: pd.Series) -> pd.Series:
-    values = pd.to_numeric(series, errors="coerce").astype("float32")
-    arr = values.to_numpy(dtype="float32", copy=True)
-    out = np.log1p(np.clip(arr, 0.0, None))
-    out[np.isnan(arr)] = np.nan
-    return pd.Series(out, index=series.index, dtype="float32")
-
-
-def prepare_model_features(raw_df: pd.DataFrame, category_levels: dict[str, list[int]]) -> pd.DataFrame:
-    missing = [col for col in RAW_CATEGORICAL_COLUMNS + RAW_NUMERIC_COLUMNS if col not in raw_df.columns]
-    if missing:
-        raise ValueError(f"Missing model input columns: {missing}")
-
-    out = raw_df[RAW_CATEGORICAL_COLUMNS + RAW_NUMERIC_COLUMNS].copy()
-
-    for col_name in RAW_CATEGORICAL_COLUMNS:
-        out[col_name] = encode_categorical_series(out[col_name], category_levels[col_name])
-
-    for col_name in RAW_NUMERIC_COLUMNS:
-        out[col_name] = pd.to_numeric(out[col_name], errors="coerce").astype("float32")
-
-    hour = out["pickup_hour"].astype("float32")
-    dow0 = out["pickup_dow"].astype("float32") - 1.0
-
-    out["pickup_hour_sin"] = np.sin(2.0 * np.pi * hour / 24.0).astype("float32")
-    out["pickup_hour_cos"] = np.cos(2.0 * np.pi * hour / 24.0).astype("float32")
-    out["pickup_dow_sin"] = np.sin(2.0 * np.pi * dow0 / 7.0).astype("float32")
-    out["pickup_dow_cos"] = np.cos(2.0 * np.pi * dow0 / 7.0).astype("float32")
-
-    out["avg_duration_7d_zone_hour_is_missing"] = out["avg_duration_7d_zone_hour"].isna().astype("int8")
-    out["avg_fare_30d_zone_is_missing"] = out["avg_fare_30d_zone"].isna().astype("int8")
-
-    out["avg_duration_7d_zone_hour_log1p"] = _log1p_with_nan(out["avg_duration_7d_zone_hour"])
-    out["avg_fare_30d_zone_log1p"] = _log1p_with_nan(out["avg_fare_30d_zone"])
-    out["trip_count_90d_zone_hour_log1p"] = _log1p_with_nan(out["trip_count_90d_zone_hour"])
-
-    pickup_zone = out["pickup_zone_id"].astype("int32")
-    dropoff_zone = out["dropoff_zone_id"].astype("int32")
-    pickup_borough = out["pickup_borough_id"].astype("int32")
-    dropoff_borough = out["dropoff_borough_id"].astype("int32")
-    pickup_service_zone = out["pickup_service_zone_id"].astype("int32")
-    dropoff_service_zone = out["dropoff_service_zone_id"].astype("int32")
-    route_pair = out["route_pair_id"].astype("int32")
-
-    out["pickup_zone_hour_id"] = (pickup_zone * 24 + out["pickup_hour"].astype("int32")).astype("int32")
-    out["dropoff_zone_hour_id"] = (dropoff_zone * 24 + out["pickup_hour"].astype("int32")).astype("int32")
-    out["pickup_zone_dow_id"] = (pickup_zone * 7 + (out["pickup_dow"].astype("int32") - 1)).astype("int32")
-    out["dropoff_zone_dow_id"] = (dropoff_zone * 7 + (out["pickup_dow"].astype("int32") - 1)).astype("int32")
-    out["route_hour_id"] = (route_pair * 24 + out["pickup_hour"].astype("int32")).astype("int32")
-    out["route_dow_id"] = (route_pair * 7 + (out["pickup_dow"].astype("int32") - 1)).astype("int32")
-    out["zone_pair_id"] = (pickup_zone * 10000 + dropoff_zone).astype("int32")
-    out["borough_pair_id"] = (pickup_borough * 16 + dropoff_borough).astype("int32")
-    out["service_zone_pair_id"] = (pickup_service_zone * 16 + dropoff_service_zone).astype("int32")
-
-    return out[MODEL_FEATURE_COLUMNS]
-
-
-def prepare_training_frame(raw_df: pd.DataFrame, category_levels: dict[str, list[int]]) -> pd.DataFrame:
-    features = prepare_model_features(raw_df, category_levels=category_levels)
-    label = pd.to_numeric(raw_df[LABEL_COLUMN], errors="raise").astype("float32")
-    frame = features.copy()
-    frame[LABEL_COLUMN] = label.to_numpy(dtype="float32")
-    return frame[[*MODEL_FEATURE_COLUMNS, LABEL_COLUMN]]
-
-
-def to_log_target(y_seconds: np.ndarray, cap_seconds: float) -> np.ndarray:
-    clipped = np.clip(np.asarray(y_seconds, dtype="float32"), 0.0, cap_seconds)
-    return np.log1p(clipped).astype("float32")
-
-
-def from_log_target(y_log: np.ndarray) -> np.ndarray:
-    return np.expm1(np.asarray(y_log, dtype="float32")).astype("float32")
-
-
-def clip_seconds(values: np.ndarray | pd.Series | list[float], cap_seconds: float) -> np.ndarray:
-    return np.clip(np.asarray(values, dtype="float32"), 0.0, cap_seconds).astype("float32")
-
-
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    y_true = np.asarray(y_true, dtype="float64")
-    y_pred = np.asarray(y_pred, dtype="float64")
-    return {
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-        "rmse": float(math.sqrt(mean_squared_error(y_true, y_pred))),
-        "medae": float(median_absolute_error(y_true, y_pred)),
-    }
-
-
-def prediction_digest(df: pd.DataFrame) -> str:
-    frame = df.copy()
-    if "trip_id" in frame.columns and "as_of_ts" in frame.columns:
-        frame = frame[["trip_id", "as_of_ts"]].copy()
-    payload = frame.astype(str).to_csv(index=False).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def feature_digest(df: pd.DataFrame, columns: list[str]) -> str:
-    payload = df[columns].astype(str).to_csv(index=False).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def make_base_params(num_threads: int) -> dict[str, object]:
-    params = dict(BASE_LGBM_PARAMS)
-    params["n_jobs"] = int(num_threads)
-    return params
-
-
-def predict_seconds_from_model(
-    model: lgb.LGBMRegressor,
-    raw_df: pd.DataFrame,
-    category_levels: dict[str, list[int]],
-    num_iteration: int | None,
-) -> np.ndarray:
-    features = prepare_model_features(raw_df, category_levels=category_levels)
-    if num_iteration is None:
-        preds_log = model.predict(features)
-    else:
-        preds_log = model.predict(features, num_iteration=num_iteration)
-    preds_seconds = from_log_target(preds_log)
-    return clip_seconds(preds_seconds, MAX_PREDICTION_SECONDS)
-
-
-def fit_lgbm_candidate(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    candidate: CandidateConfig,
-    label_cap_seconds: float,
-    num_threads: int,
-    category_levels: dict[str, list[int]],
-    max_boost_rounds: int,
-) -> tuple[lgb.LGBMRegressor, int, dict[str, float]]:
-    params = make_base_params(num_threads)
-    params.update(
-        {
-            "learning_rate": float(candidate.learning_rate),
-            "num_leaves": int(candidate.num_leaves),
-            "max_depth": int(candidate.max_depth),
-            "min_child_samples": int(candidate.min_child_samples),
-            "subsample": float(candidate.subsample),
-            "feature_fraction": float(candidate.feature_fraction),
-            "reg_alpha": float(candidate.reg_alpha),
-            "reg_lambda": float(candidate.reg_lambda),
-        }
-    )
-
-    train_prepared = prepare_training_frame(train_df, category_levels)
-    val_prepared = prepare_training_frame(val_df, category_levels)
-
-    train_X = train_prepared[MODEL_FEATURE_COLUMNS]
-    val_X = val_prepared[MODEL_FEATURE_COLUMNS]
-    y_train_raw = train_prepared[LABEL_COLUMN].to_numpy(dtype="float32")
-    y_val_raw = val_prepared[LABEL_COLUMN].to_numpy(dtype="float32")
-
-    y_train = to_log_target(y_train_raw, label_cap_seconds)
-    y_val = to_log_target(y_val_raw, label_cap_seconds)
-
-    model = lgb.LGBMRegressor(**params, n_estimators=int(max_boost_rounds))
-    model.fit(
-        train_X,
-        y_train,
-        eval_set=[(val_X, y_val)],
-        categorical_feature=CATEGORICAL_COLUMNS,
-        callbacks=[
-            lgb.early_stopping(
-                stopping_rounds=EARLY_STOPPING_ROUNDS,
-                first_metric_only=True,
-                verbose=False,
-            ),
-        ],
-    )
-
-    best_iteration = int(model.best_iteration_ or max_boost_rounds)
-    val_pred_seconds = predict_seconds_from_model(model, val_df, category_levels, best_iteration)
-    val_true_seconds = y_val_raw
-    val_true_capped = clip_seconds(y_val_raw, label_cap_seconds)
-
-    raw_metrics = compute_metrics(val_true_seconds, val_pred_seconds)
-    capped_metrics = compute_metrics(val_true_capped, val_pred_seconds)
-
-    metrics = {
-        "mae_seconds_raw": raw_metrics["mae"],
-        "rmse_seconds_raw": raw_metrics["rmse"],
-        "medae_seconds_raw": raw_metrics["medae"],
-        "mae_seconds_capped": capped_metrics["mae"],
-        "rmse_seconds_capped": capped_metrics["rmse"],
-        "medae_seconds_capped": capped_metrics["medae"],
-    }
-    return model, best_iteration, metrics
-
-
-def evaluate_model(
-    model: lgb.LGBMRegressor,
-    df: pd.DataFrame,
-    best_iteration: int,
-    label_cap_seconds: float,
-    category_levels: dict[str, list[int]],
-) -> dict[str, float]:
-    if df.empty:
-        raise ValueError("Evaluation frame is empty.")
-
-    y_true_raw = pd.to_numeric(df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
-    y_true_capped = clip_seconds(y_true_raw, label_cap_seconds)
-    y_pred = predict_seconds_from_model(model, df, category_levels, best_iteration)
-
-    raw_metrics = compute_metrics(y_true_raw, y_pred)
-    capped_metrics = compute_metrics(y_true_capped, y_pred)
-
-    return {
-        "rows": float(len(df)),
-        "mae_seconds_raw": raw_metrics["mae"],
-        "rmse_seconds_raw": raw_metrics["rmse"],
-        "medae_seconds_raw": raw_metrics["medae"],
-        "mae_seconds_capped": capped_metrics["mae"],
-        "rmse_seconds_capped": capped_metrics["rmse"],
-        "medae_seconds_capped": capped_metrics["medae"],
-    }
-
-
-def compute_baseline_metrics(
-    holdout_df: pd.DataFrame,
-    train_eval_df: pd.DataFrame,
-    label_cap_seconds: float,
-) -> dict[str, float]:
-    train_eval_labels = pd.to_numeric(train_eval_df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
-    train_eval_median = float(np.median(np.clip(train_eval_labels, 0.0, label_cap_seconds)))
-
-    holdout_labels = pd.to_numeric(holdout_df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
-    holdout_capped = clip_seconds(holdout_labels, label_cap_seconds)
-    baseline_pred = np.full(shape=len(holdout_df), fill_value=train_eval_median, dtype="float32")
-
-    return compute_metrics(holdout_capped, baseline_pred)
-
-
-def export_onnx_model(final_model: lgb.LGBMRegressor, feature_count: int) -> object:
-    from onnxmltools import convert_lightgbm
-    from onnxmltools.convert.common.data_types import FloatTensorType
-
-    initial_types = [("input", FloatTensorType([None, feature_count]))]
-    onnx_model = convert_lightgbm(
-        final_model.booster_,
-        initial_types=initial_types,
-    )
-    return onnx_model
-
-
-def build_artifact_plan(
-    model_artifacts_s3_bucket: str,
-    feature_version: str,
-    lineage: SnapshotLineage,
-    train_eval_cutoff: str,
-) -> ModelArtifactPlan:
-    bucket = model_artifacts_s3_bucket.rstrip("/")
-    artifact_root = f"{bucket}/{feature_version}/{lineage.table_uuid}/{train_eval_cutoff}"
-    return ModelArtifactPlan(
-        artifact_root_s3_uri=artifact_root,
-        onnx_model_s3_uri=f"{artifact_root}/onnx_model",
-        mlflow_model_s3_uri=f"{artifact_root}/mlflow_model",
-        summary_s3_uri=f"{artifact_root}/training_summary.json",
-        manifest_s3_uri=f"{artifact_root}/manifest.json",
-    )
-
-
-def build_training_result(
-    *,
-    lineage: SnapshotLineage,
-    category_levels: dict[str, list[int]],
-    selected_candidate: CandidateConfig,
-    candidate_reports: list[CandidateReport],
-    search_best_metrics: dict[str, float],
-    inner_metrics: dict[str, float],
-    holdout_metrics: dict[str, float],
-    holdout_baseline_metrics: dict[str, float],
-    label_cap_seconds: float,
-    train_label_p50_seconds: float,
-    best_iteration_inner: int,
-    final_num_boost_round: int,
-    train_rows: int,
-    test_rows: int,
-    artifact_plan: ModelArtifactPlan,
-) -> TrainingResult:
-    return TrainingResult(
-        table_identifier=TABLE_IDENTIFIER,
-        schema_version=EXPECTED_SCHEMA_VERSION,
-        feature_version=EXPECTED_FEATURE_VERSION,
-        lineage=lineage,
-        category_levels=category_levels,
-        selected_candidate=selected_candidate,
-        candidate_reports=candidate_reports,
-        search_best_metrics=search_best_metrics,
-        inner_metrics=inner_metrics,
-        holdout_metrics=holdout_metrics,
-        holdout_baseline_metrics=holdout_baseline_metrics,
-        label_cap_seconds=float(label_cap_seconds),
-        train_label_p50_seconds=float(train_label_p50_seconds),
-        best_iteration_inner=int(best_iteration_inner),
-        final_num_boost_round=int(final_num_boost_round),
-        train_rows=int(train_rows),
-        test_rows=int(test_rows),
-        artifact_plan=artifact_plan,
-        model_input_columns=MODEL_INPUT_COLUMNS,
-        model_feature_columns=MODEL_FEATURE_COLUMNS,
-    )

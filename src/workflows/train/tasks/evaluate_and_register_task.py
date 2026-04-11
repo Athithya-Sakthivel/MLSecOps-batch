@@ -16,24 +16,24 @@ from flytekit import Resources, task
 from mlflow.models import infer_signature
 
 from workflows.train.shared_utils import (
-    EXPECTED_COLUMNS,
     LABEL_COLUMN,
+    MATRIX_FEATURE_COLUMNS,
     MODEL_FAMILY,
-    MODEL_FEATURE_COLUMNS,
     PREDICTION_COLUMN,
+    PREPROCESSING_VERSION,
     TARGET_TRANSFORM,
     TrainingResult,
     clip_seconds,
     download_file_from_s3,
     evenly_spaced_sample,
-    feature_digest,
     from_log_target,
     load_iceberg_table,
     log_step,
     logger,
-    numeric_metrics,
+    ordered_columns_hash,
     prepare_model_features,
     read_table_as_dataframe,
+    sha256_file,
     split_train_test_by_date,
     validate_raw_dataframe,
 )
@@ -55,28 +55,147 @@ USE_IAM = os.environ.get("USE_IAM", "0").strip().lower() in {"1", "true", "yes",
 
 PYFUNC_MODEL_NAME = "trip_eta_lgbm_pyfunc"
 RAW_ONNX_FILENAME = "model.onnx"
-SUMMARY_FILENAME = "training_summary.json"
+SCHEMA_FILENAME = "schema.json"
+METADATA_FILENAME = "metadata.json"
+MANIFEST_FILENAME = "manifest.json"
+
+FALLBACK_EVAL_SAMPLE_CAP = 250_000
+PARITY_SAMPLE_ROWS = 128
 
 
-class Log1pLightGBMPyFuncModel(mlflow.pyfunc.PythonModel):
+def _json_safe(value: Any) -> Any:
+    return json.loads(json.dumps(value, default=str))
+
+
+def _numeric_metrics(metrics: dict[str, object]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key, value in metrics.items():
+        if isinstance(value, (int, float, np.floating)) and not isinstance(value, bool):
+            out[key] = float(value)
+    return out
+
+
+def _load_json_file(path: Path) -> dict[str, Any]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"{path} must contain a JSON object")
+    return raw
+
+
+def _validate_bundle_contract(
+    *,
+    schema_payload: dict[str, Any],
+    metadata_payload: dict[str, Any],
+    manifest_payload: dict[str, Any],
+    artifact_plan_root: str,
+    model_version: str,
+) -> None:
+    if schema_payload.get("target_transform") != TARGET_TRANSFORM:
+        raise RuntimeError(
+            f"schema.json target_transform must be {TARGET_TRANSFORM!r}, got {schema_payload.get('target_transform')!r}"
+        )
+
+    feature_order = schema_payload.get("feature_order")
+    if not isinstance(feature_order, list) or feature_order != MATRIX_FEATURE_COLUMNS:
+        raise RuntimeError("schema.json feature_order does not match the frozen matrix contract")
+
+    if schema_payload.get("input_name") != "input":
+        raise RuntimeError(
+            f"schema.json input_name must be 'input', got {schema_payload.get('input_name')!r}"
+        )
+
+    output_names = schema_payload.get("output_names")
+    if not isinstance(output_names, list) or not output_names:
+        raise RuntimeError("schema.json output_names must be a non-empty list")
+
+    if schema_payload.get("allow_extra_features") is not False:
+        raise RuntimeError("schema.json allow_extra_features must be false")
+
+    if metadata_payload.get("request_feature_order") != MATRIX_FEATURE_COLUMNS:
+        raise RuntimeError("metadata.json request_feature_order does not match the frozen matrix contract")
+    if metadata_payload.get("engineered_feature_order") != MATRIX_FEATURE_COLUMNS:
+        raise RuntimeError("metadata.json engineered_feature_order does not match the frozen matrix contract")
+    if metadata_payload.get("preprocessing_version") != PREPROCESSING_VERSION:
+        raise RuntimeError(
+            f"metadata.json preprocessing_version must be {PREPROCESSING_VERSION!r}, got {metadata_payload.get('preprocessing_version')!r}"
+        )
+    if metadata_payload.get("model_version") != model_version:
+        raise RuntimeError(
+            f"metadata.json model_version must be {model_version!r}, got {metadata_payload.get('model_version')!r}"
+        )
+
+    artifact_plan = metadata_payload.get("artifact_plan")
+    if not isinstance(artifact_plan, dict):
+        raise RuntimeError("metadata.json artifact_plan must be an object")
+    if artifact_plan.get("artifact_root_s3_uri") != artifact_plan_root:
+        raise RuntimeError(
+            f"metadata.json artifact root mismatch: expected {artifact_plan_root!r}, got {artifact_plan.get('artifact_root_s3_uri')!r}"
+        )
+
+    if manifest_payload.get("source_uri") != artifact_plan_root:
+        raise RuntimeError(
+            f"manifest.json source_uri mismatch: expected {artifact_plan_root!r}, got {manifest_payload.get('source_uri')!r}"
+        )
+    if manifest_payload.get("format_version") != 1:
+        raise RuntimeError("manifest.json format_version must be 1")
+
+
+class Log1pFrozenMatrixPyFuncModel(mlflow.pyfunc.PythonModel):
     def load_context(self, context: Any) -> None:
-        summary_path = Path(context.artifacts["summary"])
+        schema_path = Path(context.artifacts["schema"])
+        metadata_path = Path(context.artifacts["metadata"])
+        manifest_path = Path(context.artifacts["manifest"])
         onnx_path = Path(context.artifacts["onnx_model"])
 
-        logger.info("loading pyfunc artifacts summary=%s onnx=%s", summary_path, onnx_path)
-
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        self._category_levels = {
-            key: [int(v) for v in values]
-            for key, values in summary["category_levels"].items()
-        }
-        self._prediction_cap_seconds = float(summary["label_cap_seconds"])
-
-        self._onnx_session = ort.InferenceSession(
-            path_or_bytes=str(onnx_path),
-            providers=ort.get_available_providers(),
+        logger.info(
+            "loading pyfunc artifacts schema=%s metadata=%s manifest=%s onnx=%s",
+            schema_path,
+            metadata_path,
+            manifest_path,
+            onnx_path,
         )
-        self._input_name = self._onnx_session.get_inputs()[0].name
+
+        schema_payload = _load_json_file(schema_path)
+        metadata_payload = _load_json_file(metadata_path)
+        manifest_payload = _load_json_file(manifest_path)
+
+        _validate_bundle_contract(
+            schema_payload=schema_payload,
+            metadata_payload=metadata_payload,
+            manifest_payload=manifest_payload,
+            artifact_plan_root=str(metadata_payload["artifact_plan"]["artifact_root_s3_uri"]),
+            model_version=str(metadata_payload["model_version"]),
+        )
+
+        if sha256_file(onnx_path) != manifest_payload.get("model_sha256"):
+            raise RuntimeError("Downloaded ONNX checksum does not match manifest.json")
+        if sha256_file(schema_path) != manifest_payload.get("schema_sha256"):
+            raise RuntimeError("Downloaded schema checksum does not match manifest.json")
+        if sha256_file(metadata_path) != manifest_payload.get("metadata_sha256"):
+            raise RuntimeError("Downloaded metadata checksum does not match manifest.json")
+
+        self._prediction_cap_seconds = float(metadata_payload["label_cap_seconds"])
+        self._feature_order = list(schema_payload["feature_order"])
+
+        self._session = ort.InferenceSession(
+            path_or_bytes=str(onnx_path),
+            providers=["CPUExecutionProvider"],
+        )
+        inputs = self._session.get_inputs()
+        if not inputs:
+            raise RuntimeError("ONNX session declares no inputs")
+        self._input_name = inputs[0].name
+
+        expected_input_name = str(schema_payload.get("input_name") or "input")
+        if self._input_name != expected_input_name:
+            raise RuntimeError(
+                f"ONNX input name mismatch: expected {expected_input_name!r}, got {self._input_name!r}"
+            )
+
+        logger.info(
+            "pyfunc artifacts loaded feature_order_hash=%s",
+            ordered_columns_hash(self._feature_order),
+        )
 
     def predict(self, context: Any, model_input: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(model_input, pd.DataFrame):
@@ -85,22 +204,38 @@ class Log1pLightGBMPyFuncModel(mlflow.pyfunc.PythonModel):
             else:
                 model_input = pd.DataFrame(model_input)
 
+        missing = [name for name in self._feature_order if name not in model_input.columns]
+        if missing:
+            raise ValueError(f"Missing model input columns: {missing}")
+
         features = prepare_model_features(
-            model_input,
-            category_levels=self._category_levels,
+            model_input[self._feature_order].copy(),
+            category_levels=None,
         )
-        x = features[MODEL_FEATURE_COLUMNS].to_numpy(dtype=np.float32, copy=False)
-        raw_pred = self._onnx_session.run(None, {self._input_name: x})[0]
+        x = features[MATRIX_FEATURE_COLUMNS].to_numpy(dtype=np.float32, copy=False)
+
+        outputs = self._session.run(None, {self._input_name: x})
+        if not outputs:
+            raise RuntimeError("ONNX session returned no outputs")
+
+        raw_pred = np.asarray(outputs[0], dtype=np.float32).reshape(-1)
         pred_seconds = from_log_target(raw_pred)
         pred_seconds = clip_seconds(pred_seconds, self._prediction_cap_seconds)
+
         return pd.DataFrame({PREDICTION_COLUMN: pred_seconds})
+
+
+def _downsample_for_evaluation(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+    if len(df) <= max_rows:
+        return df.copy()
+    return evenly_spaced_sample(df, max_rows)
 
 
 @task(
     cache=False,
     retries=1,
     requests=Resources(cpu="1", mem="2Gi"),
-    limits=Resources(cpu="2", mem="4Gi"),
+    limits=Resources(cpu="2", mem="3Gi"),
 )
 def evaluate_and_register_task(
     training_result: TrainingResult,
@@ -111,6 +246,8 @@ def evaluate_and_register_task(
         raise ValueError("max_eval_rows must be >= 1")
 
     artifact_plan = training_result.artifact_plan
+    bundle_contract = training_result.bundle_contract
+    bundle_metadata = training_result.bundle_metadata
 
     with log_step("reload_iceberg_table_for_evaluation"):
         table = load_iceberg_table(ICEBERG_CATALOG_NAME, ICEBERG_REST_URI, ICEBERG_WAREHOUSE)
@@ -122,10 +259,7 @@ def evaluate_and_register_task(
 
     with log_step("split_holdout_for_evaluation"):
         splits = split_train_test_by_date(raw_df)
-        test_df = splits.test if len(splits.test) <= max_eval_rows else evenly_spaced_sample(
-            splits.test,
-            max_eval_rows,
-        )
+        test_df = _downsample_for_evaluation(splits.test, max_eval_rows)
         if len(test_df) != len(splits.test):
             logger.info(
                 "downsampled evaluation set from %d to %d rows",
@@ -133,8 +267,11 @@ def evaluate_and_register_task(
                 len(test_df),
             )
 
-    input_example = test_df[EXPECTED_COLUMNS[:-1]].head(5).copy()
-    prediction_example = pd.DataFrame({PREDICTION_COLUMN: np.zeros(len(input_example), dtype=np.float32)})
+    eval_df = test_df[[*MATRIX_FEATURE_COLUMNS, LABEL_COLUMN]].copy()
+    input_example = eval_df[MATRIX_FEATURE_COLUMNS].head(5).copy()
+    prediction_example = pd.DataFrame(
+        {PREDICTION_COLUMN: np.zeros(len(input_example), dtype=np.float32)}
+    )
     signature = infer_signature(input_example, prediction_example)
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
@@ -146,31 +283,68 @@ def evaluate_and_register_task(
         mlflow_experiment_name,
     )
     logger.info(
-        "artifact_plan onnx=%s summary=%s manifest=%s mlflow_model=%s",
-        artifact_plan.onnx_model_s3_uri,
-        artifact_plan.summary_s3_uri,
+        "artifact_plan root=%s model=%s schema=%s metadata=%s manifest=%s",
+        artifact_plan.artifact_root_s3_uri,
+        artifact_plan.model_s3_uri,
+        artifact_plan.schema_s3_uri,
+        artifact_plan.metadata_s3_uri,
         artifact_plan.manifest_s3_uri,
-        artifact_plan.mlflow_model_s3_uri,
     )
 
     with tempfile.TemporaryDirectory(prefix="trip_eta_eval_") as tmp:
         tmpdir = Path(tmp)
         onnx_local = tmpdir / RAW_ONNX_FILENAME
-        summary_local = tmpdir / SUMMARY_FILENAME
+        schema_local = tmpdir / SCHEMA_FILENAME
+        metadata_local = tmpdir / METADATA_FILENAME
+        manifest_local = tmpdir / MANIFEST_FILENAME
 
-        with log_step("download_artifacts_from_s3"):
-            download_file_from_s3(artifact_plan.onnx_model_s3_uri, onnx_local, use_iam=USE_IAM)
-            download_file_from_s3(artifact_plan.summary_s3_uri, summary_local, use_iam=USE_IAM)
+        with log_step("download_bundle_from_s3"):
+            download_file_from_s3(artifact_plan.model_s3_uri, onnx_local, use_iam=USE_IAM)
+            download_file_from_s3(artifact_plan.schema_s3_uri, schema_local, use_iam=USE_IAM)
+            download_file_from_s3(artifact_plan.metadata_s3_uri, metadata_local, use_iam=USE_IAM)
+            download_file_from_s3(artifact_plan.manifest_s3_uri, manifest_local, use_iam=USE_IAM)
+
+        schema_payload = _load_json_file(schema_local)
+        metadata_payload = _load_json_file(metadata_local)
+        manifest_payload = _load_json_file(manifest_local)
+
+        _validate_bundle_contract(
+            schema_payload=schema_payload,
+            metadata_payload=metadata_payload,
+            manifest_payload=manifest_payload,
+            artifact_plan_root=artifact_plan.artifact_root_s3_uri,
+            model_version=training_result.model_version,
+        )
+
+        if sha256_file(onnx_local) != manifest_payload.get("model_sha256"):
+            raise RuntimeError("Downloaded ONNX checksum does not match manifest.json")
+        if sha256_file(schema_local) != manifest_payload.get("schema_sha256"):
+            raise RuntimeError("Downloaded schema checksum does not match manifest.json")
+        if sha256_file(metadata_local) != manifest_payload.get("metadata_sha256"):
+            raise RuntimeError("Downloaded metadata checksum does not match manifest.json")
 
         with log_step("mlflow_start_run_and_log"):
             with mlflow.start_run(run_name=training_result.feature_version) as run:
-                mlflow.log_params(
+                mlflow.set_tags(
                     {
                         "table_identifier": training_result.table_identifier,
                         "schema_version": training_result.schema_version,
                         "feature_version": training_result.feature_version,
                         "model_family": MODEL_FAMILY,
                         "target_transform": TARGET_TRANSFORM,
+                    }
+                )
+
+                mlflow.log_params(
+                    {
+                        "table_identifier": training_result.table_identifier,
+                        "schema_version": training_result.schema_version,
+                        "feature_version": training_result.feature_version,
+                        "preprocessing_version": training_result.preprocessing_version,
+                        "model_family": MODEL_FAMILY,
+                        "target_transform": TARGET_TRANSFORM,
+                        "model_name": training_result.model_name,
+                        "model_version": training_result.model_version,
                         "train_rows": training_result.train_rows,
                         "test_rows": training_result.test_rows,
                         "best_iteration_inner": training_result.best_iteration_inner,
@@ -178,16 +352,23 @@ def evaluate_and_register_task(
                         "label_cap_seconds": training_result.label_cap_seconds,
                         "train_label_p50_seconds": training_result.train_label_p50_seconds,
                         "artifact_root_s3_uri": artifact_plan.artifact_root_s3_uri,
-                        "onnx_model_s3_uri": artifact_plan.onnx_model_s3_uri,
-                        "summary_s3_uri": artifact_plan.summary_s3_uri,
+                        "onnx_model_s3_uri": artifact_plan.model_s3_uri,
+                        "schema_s3_uri": artifact_plan.schema_s3_uri,
+                        "metadata_s3_uri": artifact_plan.metadata_s3_uri,
                         "manifest_s3_uri": artifact_plan.manifest_s3_uri,
-                        "mlflow_model_s3_uri": artifact_plan.mlflow_model_s3_uri,
-                        "test_digest": feature_digest(test_df, ["trip_id", "as_of_ts"]),
+                        "request_feature_order_hash": ordered_columns_hash(
+                            training_result.request_feature_columns
+                        ),
+                        "engineered_feature_order_hash": ordered_columns_hash(
+                            training_result.engineered_feature_columns
+                        ),
+                        "schema_hash": training_result.elt_contract.schema_hash,
+                        "source_silver_snapshot_id": training_result.elt_contract.source_silver_snapshot_id,
                         "use_iam": str(USE_IAM).lower(),
                     }
                 )
 
-                mlflow.log_metrics(numeric_metrics(training_result.holdout_metrics))
+                mlflow.log_metrics(_numeric_metrics(training_result.holdout_metrics))
                 mlflow.log_metrics(
                     {
                         "holdout_baseline_mae_seconds_capped": float(
@@ -202,30 +383,39 @@ def evaluate_and_register_task(
                     }
                 )
 
-                mlflow.log_dict(training_result.as_dict(), "training_summary.json")
-                mlflow.log_dict(artifact_plan.as_dict(), "artifact_plan.json")
+                mlflow.log_dict(_json_safe(training_result.as_dict()), "training_summary.json")
+                mlflow.log_dict(_json_safe(bundle_contract), "bundle_contract.json")
+                mlflow.log_dict(_json_safe(bundle_metadata), "bundle_metadata.json")
+                mlflow.log_dict(_json_safe(artifact_plan.as_dict()), "artifact_plan.json")
+
+                mlflow.log_artifact(str(onnx_local), artifact_path="bundle")
+                mlflow.log_artifact(str(schema_local), artifact_path="bundle")
+                mlflow.log_artifact(str(metadata_local), artifact_path="bundle")
+                mlflow.log_artifact(str(manifest_local), artifact_path="bundle")
 
                 logger.info("logging pyfunc model %s", PYFUNC_MODEL_NAME)
                 model_info = mlflow.pyfunc.log_model(
                     name=PYFUNC_MODEL_NAME,
-                    python_model=Log1pLightGBMPyFuncModel(),
+                    python_model=Log1pFrozenMatrixPyFuncModel(),
                     artifacts={
                         "onnx_model": str(onnx_local),
-                        "summary": str(summary_local),
+                        "schema": str(schema_local),
+                        "metadata": str(metadata_local),
+                        "manifest": str(manifest_local),
                     },
                     signature=signature,
                     input_example=input_example,
                 )
 
-                logger.info("running mlflow.models.evaluate on %d rows", len(test_df))
+                logger.info("running mlflow.models.evaluate on %d rows", len(eval_df))
                 eval_result = mlflow.models.evaluate(
                     model=model_info.model_uri,
-                    data=test_df,
+                    data=eval_df,
                     targets=LABEL_COLUMN,
                     model_type="regressor",
                 )
 
-                mlflow.log_metrics(numeric_metrics(eval_result.metrics))
+                mlflow.log_metrics(_numeric_metrics(eval_result.metrics))
 
                 for artifact_name, artifact in eval_result.artifacts.items():
                     artifact_uri = getattr(artifact, "uri", None)
@@ -235,17 +425,16 @@ def evaluate_and_register_task(
                     elif artifact_content is not None:
                         mlflow.log_text(str(artifact_content), f"evaluation/{artifact_name}.txt")
 
-                run_id = run.info.run_id
                 result = {
-                    "run_id": run_id,
+                    "run_id": run.info.run_id,
                     "model_uri": model_info.model_uri,
                     "artifact_plan": artifact_plan.as_dict(),
-                    "evaluation_metrics": numeric_metrics(eval_result.metrics),
+                    "evaluation_metrics": _numeric_metrics(eval_result.metrics),
                 }
 
                 logger.info(
                     "mlflow run complete run_id=%s model_uri=%s",
-                    run_id,
+                    run.info.run_id,
                     model_info.model_uri,
                 )
-                return json.dumps(result, indent=2, default=str)
+                return json.dumps(_json_safe(result), indent=2, ensure_ascii=False)

@@ -2,20 +2,26 @@
 # CloudNativePG lifecycle script (idempotent, declarative, restore-safe)
 #
 # Manages PostgreSQL cluster lifecycle on Kubernetes using CloudNativePG.
-# Uses native Barman Cloud (barmanObjectStore) for backups and WAL archiving.
+# Uses Barman Cloud via barmanObjectStore for physical base backups and WAL archiving.
 #
 # Design rules:
-# - deploy is the only cluster creation entrypoint
-# - restore is a deploy mode, not a standalone command
-# - PG_SERVER_NAME is stable for one logical backup lineage
-# - restore uses a distinct target serverName by default to avoid archive collisions
-# - PG_CLUSTER_ID isolates S3 lineage/path
+# - deploy is the cluster creation entrypoint.
+# - deploy may also create an initial physical base backup when CREATE_INITIAL_BACKUP=true.
+# - backup creates a new physical base backup for the active lineage.
+# - restore is a deploy mode, not a standalone command.
+# - PG_SERVER_NAME identifies the source backup lineage for fresh deploys and manual backups.
+# - RESTORE_SOURCE_SERVER_NAME selects the source lineage for restore, defaulting to PG_SERVER_NAME.
+# - restore always uses a timestamp-suffixed target serverName to avoid archive collisions.
+# - PG_CLUSTER_ID scopes the S3 backup path for the environment or tenant.
 #
 # Backup layout:
-#   s3://$PG_BACKUPS_S3_BUCKET/postgres_backups/${PG_CLUSTER_ID}/
+#   s3://$PG_BACKUPS_S3_BUCKET/postgres_backups/${PG_CLUSTER_ID}/<serverName>/
 #
-# Example:
-#   s3://bucket/postgres_backups/local/base/<timestamp>/
+# Example source lineage:
+#   s3://bucket/postgres_backups/local/mlsecops/
+#
+# Example restore target lineage:
+#   s3://bucket/postgres_backups/local/mlsecops-restore-20260409T231543Z/
 #
 # PITR target time must be RFC3339:
 #   --target-time "2026-04-04T07:14:13Z"
@@ -32,12 +38,12 @@
 #   PG_BACKUPS_S3_BUCKET=<bucket-name>
 #
 # Recommended:
-#   PG_SERVER_NAME=<stable-lineage-name>   # source lineage, e.g. mlsecops
-#   PG_CLUSTER_ID=<environment-id>         # e.g. local, staging, prod
+#   PG_SERVER_NAME=<source-lineage-name>      # e.g. mlsecops
+#   PG_CLUSTER_ID=<environment-id>             # e.g. local, staging, prod
 #
 # Restore-specific overrides:
 #   RESTORE_SOURCE_SERVER_NAME=<existing-lineage-name>   # defaults to PG_SERVER_NAME
-#   RESTORE_SERVER_NAME=<new-target-lineage-name>        # defaults to <source>-restore
+#   RESTORE_SERVER_NAME=<restore-base-name>              # timestamp suffix is added automatically
 #
 # Optional:
 #   BACKUP_DESTINATION_PATH=s3://bucket/prefix/
@@ -45,6 +51,9 @@
 #   BACKUP_SCHEDULE=0 0 0 * * *
 #   BACKUP_RETENTION_POLICY=30d
 #   CREATE_INITIAL_BACKUP=true|false
+#
+# Generated artifacts:
+#   src/manifests/postgres/backup_and_restore_commands.sh
 #
 # Authentication:
 #   EKS:
@@ -54,258 +63,234 @@
 #     AWS_ACCESS_KEY_ID=<key>
 #     AWS_SECRET_ACCESS_KEY=<secret>
 
-set -euo pipefail
 IFS=$'\n\t'
-
 K8S_CLUSTER="${K8S_CLUSTER:-kind}"
 TARGET_NS="${TARGET_NS:-default}"
-
 ARCHIVE_DIR="${ARCHIVE_DIR:-src/scripts/archive}"
 MANIFEST_DIR="${MANIFEST_DIR:-src/manifests/postgres}"
+COMMANDS_FILE="${COMMANDS_FILE:-${MANIFEST_DIR}/backup_and_restore_commands.sh}"
 CLUSTER_FILE="${CLUSTER_FILE:-${MANIFEST_DIR}/postgres_cluster.yaml}"
 POOLER_FILE="${POOLER_FILE:-${MANIFEST_DIR}/postgres_pooler.yaml}"
 SCHEDULED_BACKUP_FILE="${SCHEDULED_BACKUP_FILE:-${MANIFEST_DIR}/postgres_scheduled_backup.yaml}"
 MANUAL_BACKUP_FILE="${MANUAL_BACKUP_FILE:-${MANIFEST_DIR}/postgres_backup.yaml}"
-
 CNPG_VERSION="${CNPG_VERSION:-1.28.2}"
 CNPG_NAMESPACE="${CNPG_NAMESPACE:-cnpg-system}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie}"
-
 CLUSTER_NAME="${CLUSTER_NAME:-postgres-cluster}"
 POOLER_NAME="${POOLER_NAME:-postgres-pooler}"
-
 PG_CLUSTER_ID="${PG_CLUSTER_ID:-local}"
 PG_SERVER_NAME="${PG_SERVER_NAME:-mlsecops}"
 RESTORE_SOURCE_SERVER_NAME="${RESTORE_SOURCE_SERVER_NAME:-${PG_SERVER_NAME}}"
 RESTORE_SERVER_NAME="${RESTORE_SERVER_NAME:-}"
-RESTORE_ACTIVE_SERVER_NAME=""
-BACKUP_ACTIVE_SERVER_NAME=""
-
+RESTORE_MODE="${RESTORE_MODE:-none}"
+RESTORE_TARGET_TIME="${RESTORE_TARGET_TIME:-}"
+FORCE_RECREATE="${FORCE_RECREATE:-false}"
+WAIT_FOR_BACKUP="${WAIT_FOR_BACKUP:-true}"
+CREATE_INITIAL_BACKUP="${CREATE_INITIAL_BACKUP:-true}"
 OPERATOR_TIMEOUT="${OPERATOR_TIMEOUT:-300}"
 POD_TIMEOUT="${POD_TIMEOUT:-900}"
 SECRET_TIMEOUT="${SECRET_TIMEOUT:-180}"
 BACKUP_TIMEOUT="${BACKUP_TIMEOUT:-1800}"
-
 STORAGE_CLASS_NAME="${STORAGE_CLASS_NAME:-default-storage-class}"
 INITDB_DB="${INITDB_DB:-flyte_admin}"
 ADDITIONAL_DBS_RAW="${ADDITIONAL_DBS_RAW:-datacatalog mlflow iceberg}"
-
 S3_BUCKET="${PG_BACKUPS_S3_BUCKET:-}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-postgres_backups/}"
 BACKUP_DESTINATION_PATH="${BACKUP_DESTINATION_PATH:-}"
 BACKUP_ENDPOINT_URL="${BACKUP_ENDPOINT_URL:-}"
 BACKUP_RETENTION_POLICY="${BACKUP_RETENTION_POLICY:-30d}"
 BACKUP_SCHEDULE="${BACKUP_SCHEDULE:-0 0 0 * * *}"
-
 IRSA_ROLE_ARN="${IRSA_ROLE_ARN:-}"
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
 AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}"
 AWS_CREDS_SECRET_NAME="${AWS_CREDS_SECRET_NAME:-aws-creds}"
-
-RESTORE_MODE="${RESTORE_MODE:-none}"   # none | latest | time
-RESTORE_TARGET_TIME="${RESTORE_TARGET_TIME:-}"
-FORCE_RECREATE="${FORCE_RECREATE:-false}"
-WAIT_FOR_BACKUP="${WAIT_FOR_BACKUP:-true}"
-CREATE_INITIAL_BACKUP="${CREATE_INITIAL_BACKUP:-true}"
+RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
+RESTORE_ACTIVE_SERVER_NAME=""
+BACKUP_ACTIVE_SERVER_NAME=""
 
 if [[ "${K8S_CLUSTER}" == "kind" ]]; then
   INSTANCES="${INSTANCES:-1}"
-  CPU_REQUEST="${CPU_REQUEST:-250m}"; CPU_LIMIT="${CPU_LIMIT:-1000m}"
-  MEM_REQUEST="${MEM_REQUEST:-512Mi}"; MEM_LIMIT="${MEM_LIMIT:-1Gi}"
-  STORAGE_SIZE="${STORAGE_SIZE:-5Gi}"; WAL_SIZE="${WAL_SIZE:-2Gi}"
+  CPU_REQUEST="${CPU_REQUEST:-250m}"
+  CPU_LIMIT="${CPU_LIMIT:-1000m}"
+  MEM_REQUEST="${MEM_REQUEST:-512Mi}"
+  MEM_LIMIT="${MEM_LIMIT:-1Gi}"
+  STORAGE_SIZE="${STORAGE_SIZE:-5Gi}"
+  WAL_SIZE="${WAL_SIZE:-2Gi}"
   POOLER_INSTANCES="${POOLER_INSTANCES:-1}"
-  POOLER_CPU_REQUEST="${POOLER_CPU_REQUEST:-50m}"; POOLER_MEM_REQUEST="${POOLER_MEM_REQUEST:-64Mi}"
-  POOLER_CPU_LIMIT="${POOLER_CPU_LIMIT:-200m}"; POOLER_MEM_LIMIT="${POOLER_MEM_LIMIT:-256Mi}"
+  POOLER_CPU_REQUEST="${POOLER_CPU_REQUEST:-50m}"
+  POOLER_MEM_REQUEST="${POOLER_MEM_REQUEST:-64Mi}"
+  POOLER_CPU_LIMIT="${POOLER_CPU_LIMIT:-200m}"
+  POOLER_MEM_LIMIT="${POOLER_MEM_LIMIT:-256Mi}"
 else
   INSTANCES="${INSTANCES:-3}"
-  CPU_REQUEST="${CPU_REQUEST:-500m}"; CPU_LIMIT="${CPU_LIMIT:-2000m}"
-  MEM_REQUEST="${MEM_REQUEST:-1Gi}"; MEM_LIMIT="${MEM_LIMIT:-4Gi}"
-  STORAGE_SIZE="${STORAGE_SIZE:-20Gi}"; WAL_SIZE="${WAL_SIZE:-10Gi}"
+  CPU_REQUEST="${CPU_REQUEST:-500m}"
+  CPU_LIMIT="${CPU_LIMIT:-2000m}"
+  MEM_REQUEST="${MEM_REQUEST:-1Gi}"
+  MEM_LIMIT="${MEM_LIMIT:-4Gi}"
+  STORAGE_SIZE="${STORAGE_SIZE:-20Gi}"
+  WAL_SIZE="${WAL_SIZE:-10Gi}"
   POOLER_INSTANCES="${POOLER_INSTANCES:-2}"
-  POOLER_CPU_REQUEST="${POOLER_CPU_REQUEST:-100m}"; POOLER_MEM_REQUEST="${POOLER_MEM_REQUEST:-128Mi}"
-  POOLER_CPU_LIMIT="${POOLER_CPU_LIMIT:-500m}"; POOLER_MEM_LIMIT="${POOLER_MEM_LIMIT:-512Mi}"
+  POOLER_CPU_REQUEST="${POOLER_CPU_REQUEST:-100m}"
+  POOLER_MEM_REQUEST="${POOLER_MEM_REQUEST:-128Mi}"
+  POOLER_CPU_LIMIT="${POOLER_CPU_LIMIT:-500m}"
+  POOLER_MEM_LIMIT="${POOLER_MEM_LIMIT:-512Mi}"
 fi
 
-ANNOTATION_CLUSTER_KEY="mlsecops.cnpg.cluster-checksum"
-ANNOTATION_POOLER_KEY="mlsecops.cnpg.pooler-checksum"
-ANNOTATION_BACKUP_KEY="mlsecops.cnpg.backup-checksum"
-ANNOTATION_SCHEDULED_BACKUP_KEY="mlsecops.cnpg.scheduled-backup-checksum"
+ANN_CLUSTER="mlsecops.cnpg.cluster-checksum"
+ANN_POOLER="mlsecops.cnpg.pooler-checksum"
+ANN_BACKUP="mlsecops.cnpg.backup-checksum"
+ANN_SCHED="mlsecops.cnpg.scheduled-backup-checksum"
 
-log(){ printf '[%s] [cnpg] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
-fatal(){ printf '[%s] [cnpg][FATAL] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
-require_bin(){ command -v "$1" >/dev/null 2>&1 || fatal "$1 required in PATH"; }
+log() { printf '[%s] [cnpg] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
+fatal() { printf '[%s] [cnpg][FATAL] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
+require_bin() { command -v "$1" >/dev/null 2>&1 || fatal "$1 required in PATH"; }
+shq() { printf '%q' "$1"; }
 
 trap 'rc=$?; echo; echo "[DIAG] exit_code=$rc"; echo "[DIAG] kubectl context: $(kubectl config current-context 2>/dev/null || true)"; echo "[DIAG] pods (ns ${TARGET_NS}):"; kubectl -n "${TARGET_NS}" get pods -o wide || true; echo "[DIAG] pvc (ns ${TARGET_NS}):"; kubectl -n "${TARGET_NS}" get pvc || true; exit $rc' ERR
 
-safe_dns_name(){
+safe_dns_name() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
 }
 
-mask_uri(){
+mask_uri() {
   echo "$1" | sed -E 's#(:)[^:@]+(@)#:\*\*\*\*@#'
 }
 
-set_cluster_id(){
+set_cluster_id() {
   PG_CLUSTER_ID="$(safe_dns_name "$1")"
   BACKUP_DESTINATION_PATH=""
 }
 
-manifest_hash(){ sha256sum "$1" | awk '{print $1}'; }
+manifest_hash() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+timestamp_utc() {
+  date -u +%Y%m%dT%H%M%SZ
+}
 
 parse_additional_dbs() {
   local raw="$1"
-  local old_ifs="$IFS"
   local -a items=()
-  IFS=' ' read -r -a items <<< "${raw}"
+  local old_ifs="$IFS"
+  IFS=' ' read -r -a items <<< "$raw"
   IFS="$old_ifs"
-
-  local item
-  for item in "${items[@]}"; do
-    [[ -n "${item}" ]] || continue
-    printf '%s\n' "${item}"
+  for i in "${items[@]}"; do
+    [[ -n "$i" ]] && printf '%s\n' "$i"
   done
 }
 
-mapfile -t ADDITIONAL_DBS < <(parse_additional_dbs "${ADDITIONAL_DBS_RAW}")
-ALL_DBS=("${INITDB_DB}" "${ADDITIONAL_DBS[@]}")
+mapfile -t ADDITIONAL_DBS < <(parse_additional_dbs "$ADDITIONAL_DBS_RAW")
+ALL_DBS=("$INITDB_DB" "${ADDITIONAL_DBS[@]}")
 
-cluster_exists(){
-  kubectl -n "${TARGET_NS}" get cluster "${CLUSTER_NAME}" >/dev/null 2>&1
+cluster_exists() {
+  kubectl -n "$TARGET_NS" get cluster "$CLUSTER_NAME" >/dev/null 2>&1
 }
 
-cluster_backup_server_name(){
-  kubectl -n "${TARGET_NS}" get cluster "${CLUSTER_NAME}"     -o jsonpath='{.spec.backup.barmanObjectStore.serverName}' 2>/dev/null || true
-}
-
-cluster_backup_destination_path(){
-  kubectl -n "${TARGET_NS}" get cluster "${CLUSTER_NAME}"     -o jsonpath='{.spec.backup.barmanObjectStore.destinationPath}' 2>/dev/null || true
-}
-
-resolve_live_backup_lineage(){
-  if cluster_exists; then
-    local live_server live_dest
-    live_server="$(cluster_backup_server_name)"
-    live_dest="$(cluster_backup_destination_path)"
-    BACKUP_ACTIVE_SERVER_NAME="$(safe_dns_name "${live_server:-${PG_SERVER_NAME}}")"
-    if [[ -n "${live_dest}" ]]; then
-      BACKUP_DESTINATION_PATH="${live_dest%/}/"
-    else
-      compose_backup_destination_path
-    fi
-    [[ -n "${BACKUP_ACTIVE_SERVER_NAME}" ]] || BACKUP_ACTIVE_SERVER_NAME="$(safe_dns_name "${PG_SERVER_NAME}")"
-    log "live lineage discovered from cluster spec: serverName=${BACKUP_ACTIVE_SERVER_NAME} prefix=$(lineage_prefix_for "${BACKUP_ACTIVE_SERVER_NAME}")"
-    return 0
-  fi
-
-  resolve_fresh_target_server_name
-  compose_backup_destination_path
-}
-
-compose_backup_destination_path(){
-  if [[ -n "${BACKUP_DESTINATION_PATH}" ]]; then
-    BACKUP_DESTINATION_PATH="${BACKUP_DESTINATION_PATH%/}/"
-    return 0
-  fi
-
-  [[ -n "${S3_BUCKET}" ]] || fatal "set PG_BACKUPS_S3_BUCKET or BACKUP_DESTINATION_PATH"
-  BACKUP_PREFIX="${BACKUP_PREFIX#/}"
-  BACKUP_PREFIX="${BACKUP_PREFIX%/}/"
-  BACKUP_DESTINATION_PATH="s3://${S3_BUCKET%/}/${BACKUP_PREFIX}${PG_CLUSTER_ID}/"
-}
-
-lineage_prefix_for(){
-  local server_name="$1"
-  printf '%s%s/' "${BACKUP_DESTINATION_PATH%/}/" "$(safe_dns_name "${server_name}")"
-}
-
-source_lineage_server_name(){
-  safe_dns_name "${RESTORE_SOURCE_SERVER_NAME:-${PG_SERVER_NAME}}"
-}
-
-resolve_restore_target_server_name(){
-  local src target
-  src="$(source_lineage_server_name)"
-  if [[ -n "${RESTORE_SERVER_NAME}" ]]; then
-    target="$(safe_dns_name "${RESTORE_SERVER_NAME}")"
-  else
-    target="$(safe_dns_name "${src}-restore")"
-  fi
-
-  if [[ -z "${target}" ]]; then
-    fatal "resolved restore target serverName is empty"
-  fi
-
-  if [[ "${target}" == "${src}" ]]; then
-    target="${target}-$(date -u +%Y%m%d%H%M%S)"
-    log "restore target serverName matched source lineage; auto-renamed to ${target}"
-  fi
-
-  RESTORE_ACTIVE_SERVER_NAME="${target}"
-}
-
-resolve_fresh_target_server_name(){
-  BACKUP_ACTIVE_SERVER_NAME="$(safe_dns_name "${PG_SERVER_NAME}")"
-}
-
-validate_backup_inputs(){
-  compose_backup_destination_path
-
-  if [[ -n "${IRSA_ROLE_ARN}" && -n "${AWS_ACCESS_KEY_ID}" ]]; then
-    fatal "use either IRSA_ROLE_ARN or AWS access keys, not both"
-  fi
-
-  if [[ -z "${IRSA_ROLE_ARN}" ]]; then
-    [[ -n "${AWS_ACCESS_KEY_ID}" && -n "${AWS_SECRET_ACCESS_KEY}" ]] || fatal "for non-EKS clusters set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
-  fi
-}
-
-validate_restore_inputs(){
-  case "${RESTORE_MODE}" in
-    latest)
-      ;;
-    time)
-      [[ -n "${RESTORE_TARGET_TIME}" ]] || fatal "--restore time requires --target-time <RFC3339>"
-      ;;
-    none)
-      fatal "restore mode not selected"
-      ;;
-    *)
-      fatal "invalid restore mode: ${RESTORE_MODE}"
-      ;;
-  esac
-}
-
-require_prereqs(){
+require_prereqs() {
   require_bin kubectl
   require_bin curl
   require_bin sha256sum
   require_bin awk
   require_bin sed
   kubectl version --client >/dev/null 2>&1 || fatal "kubectl client unavailable"
-  mkdir -p "${ARCHIVE_DIR}" "${MANIFEST_DIR}"
+  mkdir -p "$ARCHIVE_DIR" "$MANIFEST_DIR"
 }
 
-require_aws_cli(){
+require_aws_cli() {
   require_bin aws
 }
 
-ensure_namespace(){
-  kubectl get ns "${TARGET_NS}" >/dev/null 2>&1 || kubectl create ns "${TARGET_NS}" >/dev/null
+ensure_namespace() {
+  kubectl get ns "$TARGET_NS" >/dev/null 2>&1 || kubectl create ns "$TARGET_NS" >/dev/null
 }
 
-install_cnpg_operator(){
-  log "installing CloudNativePG operator ${CNPG_VERSION}"
-  kubectl get ns "${CNPG_NAMESPACE}" >/dev/null 2>&1 || kubectl create ns "${CNPG_NAMESPACE}" >/dev/null
+compose_backup_destination_path() {
+  if [[ -n "$BACKUP_DESTINATION_PATH" ]]; then
+    BACKUP_DESTINATION_PATH="${BACKUP_DESTINATION_PATH%/}/"
+    return 0
+  fi
 
-  local url archive_file
+  [[ -n "$S3_BUCKET" ]] || fatal "set PG_BACKUPS_S3_BUCKET or BACKUP_DESTINATION_PATH"
+  BACKUP_PREFIX="${BACKUP_PREFIX#/}"
+  BACKUP_PREFIX="${BACKUP_PREFIX%/}/"
+  BACKUP_DESTINATION_PATH="s3://${S3_BUCKET%/}/${BACKUP_PREFIX}${PG_CLUSTER_ID}/"
+}
+
+lineage_prefix_for() {
+  printf '%s%s/' "${BACKUP_DESTINATION_PATH%/}/" "$(safe_dns_name "$1")"
+}
+
+source_lineage_server_name() {
+  safe_dns_name "${RESTORE_SOURCE_SERVER_NAME:-${PG_SERVER_NAME}}"
+}
+
+live_cluster_backup_server_name() {
+  kubectl -n "$TARGET_NS" get cluster "$CLUSTER_NAME" -o jsonpath='{.spec.backup.barmanObjectStore.serverName}' 2>/dev/null || true
+}
+
+live_cluster_backup_destination_path() {
+  kubectl -n "$TARGET_NS" get cluster "$CLUSTER_NAME" -o jsonpath='{.spec.backup.barmanObjectStore.destinationPath}' 2>/dev/null || true
+}
+
+resolve_fresh_target_server_name() {
+  BACKUP_ACTIVE_SERVER_NAME="$(safe_dns_name "$PG_SERVER_NAME")"
+}
+
+resolve_restore_target_server_name() {
+  local src="${1:-$(source_lineage_server_name)}" base
+  if [[ -n "$RESTORE_SERVER_NAME" ]]; then
+    base="$(safe_dns_name "$RESTORE_SERVER_NAME")"
+  else
+    base="$(safe_dns_name "${src}-restore")"
+  fi
+  RESTORE_ACTIVE_SERVER_NAME="$(safe_dns_name "${base}-${RUN_TIMESTAMP}")"
+  [[ -n "$RESTORE_ACTIVE_SERVER_NAME" ]] || fatal "resolved restore target serverName is empty"
+}
+
+resolve_live_backup_lineage() {
+  compose_backup_destination_path
+  if cluster_exists; then
+    local ls ld
+    ls="$(live_cluster_backup_server_name)"
+    ld="$(live_cluster_backup_destination_path)"
+    BACKUP_ACTIVE_SERVER_NAME="$(safe_dns_name "${ls:-$PG_SERVER_NAME}")"
+    [[ -n "$ld" ]] && BACKUP_DESTINATION_PATH="${ld%/}/"
+    log "live lineage discovered from cluster spec: serverName=${BACKUP_ACTIVE_SERVER_NAME} prefix=$(lineage_prefix_for "$BACKUP_ACTIVE_SERVER_NAME")"
+  else
+    resolve_fresh_target_server_name
+  fi
+}
+
+validate_backup_inputs() {
+  compose_backup_destination_path
+  if [[ -n "$IRSA_ROLE_ARN" && -n "$AWS_ACCESS_KEY_ID" ]]; then
+    fatal "use either IRSA_ROLE_ARN or AWS access keys, not both"
+  fi
+  if [[ -z "$IRSA_ROLE_ARN" ]]; then
+    [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" ]] || fatal "for non-EKS clusters set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+  fi
+}
+
+validate_restore_inputs() {
+  case "$RESTORE_MODE" in
+    latest) ;;
+    time) [[ -n "$RESTORE_TARGET_TIME" ]] || fatal "restore time requires --target-time <RFC3339>" ;;
+    none) fatal "restore mode not selected" ;;
+    *) fatal "invalid restore mode: $RESTORE_MODE" ;;
+  esac
+}
+
+install_cnpg_operator() {
+  log "installing CloudNativePG operator $CNPG_VERSION"
+  kubectl get ns "$CNPG_NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$CNPG_NAMESPACE" >/dev/null
+  local url archive
   url="https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.28/releases/cnpg-${CNPG_VERSION}.yaml"
-  archive_file="${ARCHIVE_DIR}/cnpg-${CNPG_VERSION}.yaml"
-
-  curl -fsSL -o "${archive_file}" "${url}" || fatal "failed to download operator manifest"
-  kubectl apply --server-side --force-conflicts -f "${archive_file}" >/dev/null || fatal "failed to apply operator manifest"
-  kubectl -n "${CNPG_NAMESPACE}" rollout status deployment/cnpg-controller-manager --timeout="${OPERATOR_TIMEOUT}s" >/dev/null || fatal "operator rollout failed"
-
+  archive="$ARCHIVE_DIR/cnpg-${CNPG_VERSION}.yaml"
+  curl -fsSL -o "$archive" "$url" || fatal "failed to download operator manifest"
+  kubectl apply --server-side --force-conflicts -f "$archive" >/dev/null || fatal "failed to apply operator manifest"
+  kubectl -n "$CNPG_NAMESPACE" rollout status deployment/cnpg-controller-manager --timeout="${OPERATOR_TIMEOUT}s" >/dev/null || fatal "operator rollout failed"
   kubectl get crd clusters.postgresql.cnpg.io >/dev/null 2>&1 || fatal "operator CRD not ready"
   kubectl get crd poolers.postgresql.cnpg.io >/dev/null 2>&1 || fatal "pooler CRD not ready"
   kubectl get crd backups.postgresql.cnpg.io >/dev/null 2>&1 || fatal "backup CRD not ready"
@@ -313,118 +298,72 @@ install_cnpg_operator(){
   log "operator ready"
 }
 
-ensure_cnpg_operator(){
-  if kubectl get crd clusters.postgresql.cnpg.io >/dev/null 2>&1 && \
-     kubectl get crd poolers.postgresql.cnpg.io >/dev/null 2>&1 && \
-     kubectl get crd backups.postgresql.cnpg.io >/dev/null 2>&1 && \
-     kubectl get crd scheduledbackups.postgresql.cnpg.io >/dev/null 2>&1; then
+ensure_cnpg_operator() {
+  if kubectl get crd clusters.postgresql.cnpg.io >/dev/null 2>&1 &&
+    kubectl get crd poolers.postgresql.cnpg.io >/dev/null 2>&1 &&
+    kubectl get crd backups.postgresql.cnpg.io >/dev/null 2>&1 &&
+    kubectl get crd scheduledbackups.postgresql.cnpg.io >/dev/null 2>&1; then
     log "CloudNativePG CRDs already present"
     return 0
   fi
   install_cnpg_operator
 }
 
-ensure_aws_secret(){
-  if [[ -n "${IRSA_ROLE_ARN}" ]]; then
-    return 0
-  fi
-
-  log "creating/updating AWS credentials secret ${AWS_CREDS_SECRET_NAME}"
-  kubectl -n "${TARGET_NS}" create secret generic "${AWS_CREDS_SECRET_NAME}" \
-    --from-literal=ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
-    --from-literal=ACCESS_SECRET_KEY="${AWS_SECRET_ACCESS_KEY}" \
-    ${AWS_SESSION_TOKEN:+--from-literal=ACCESS_SESSION_TOKEN="${AWS_SESSION_TOKEN}"} \
+ensure_aws_secret() {
+  [[ -n "$IRSA_ROLE_ARN" ]] && return 0
+  log "creating/updating AWS credentials secret $AWS_CREDS_SECRET_NAME"
+  kubectl -n "$TARGET_NS" create secret generic "$AWS_CREDS_SECRET_NAME" \
+    --from-literal=ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+    --from-literal=ACCESS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+    ${AWS_SESSION_TOKEN:+--from-literal=ACCESS_SESSION_TOKEN="$AWS_SESSION_TOKEN"} \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 }
 
-emit_irsa_block(){
-  if [[ -n "${IRSA_ROLE_ARN}" ]]; then
-    cat <<EOF
+emit_irsa_block() {
+  [[ -n "$IRSA_ROLE_ARN" ]] && cat <<EOF
   serviceAccountTemplate:
     metadata:
       annotations:
-        eks.amazonaws.com/role-arn: ${IRSA_ROLE_ARN}
+        eks.amazonaws.com/role-arn: $IRSA_ROLE_ARN
 EOF
-  fi
 }
 
-emit_credentials_block(){
+emit_credentials_block() {
   local indent="$1"
-  if [[ -z "${IRSA_ROLE_ARN}" ]]; then
-    printf '%ss3Credentials:\n' "${indent}"
-    printf '%s  accessKeyId:\n' "${indent}"
-    printf '%s    name: %s\n' "${indent}" "${AWS_CREDS_SECRET_NAME}"
-    printf '%s    key: ACCESS_KEY_ID\n' "${indent}"
-    printf '%s  secretAccessKey:\n' "${indent}"
-    printf '%s    name: %s\n' "${indent}" "${AWS_CREDS_SECRET_NAME}"
-    printf '%s    key: ACCESS_SECRET_KEY\n' "${indent}"
-    if [[ -n "${AWS_SESSION_TOKEN}" ]]; then
-      printf '%s  sessionToken:\n' "${indent}"
-      printf '%s    name: %s\n' "${indent}" "${AWS_CREDS_SECRET_NAME}"
-      printf '%s    key: ACCESS_SESSION_TOKEN\n' "${indent}"
-    fi
+  if [[ -z "$IRSA_ROLE_ARN" ]]; then
+    printf '%ss3Credentials:\n' "$indent"
+    printf '%s  accessKeyId:\n' "$indent"
+    printf '%s    name: %s\n' "$indent" "$AWS_CREDS_SECRET_NAME"
+    printf '%s    key: ACCESS_KEY_ID\n' "$indent"
+    printf '%s  secretAccessKey:\n' "$indent"
+    printf '%s    name: %s\n' "$indent" "$AWS_CREDS_SECRET_NAME"
+    printf '%s    key: ACCESS_SECRET_KEY\n' "$indent"
+    [[ -n "$AWS_SESSION_TOKEN" ]] && {
+      printf '%s  sessionToken:\n' "$indent"
+      printf '%s    name: %s\n' "$indent" "$AWS_CREDS_SECRET_NAME"
+      printf '%s    key: ACCESS_SESSION_TOKEN\n' "$indent"
+    }
   fi
 }
 
-emit_backup_store_block(){
+emit_backup_store_block() {
   local indent="$1" server_name="$2"
-  printf '%sbarmanObjectStore:\n' "${indent}"
-  printf '%s  destinationPath: %s\n' "${indent}" "${BACKUP_DESTINATION_PATH}"
-  printf '%s  serverName: %s\n' "${indent}" "${server_name}"
-  if [[ -n "${BACKUP_ENDPOINT_URL}" ]]; then
-    printf '%s  endpointURL: %s\n' "${indent}" "${BACKUP_ENDPOINT_URL}"
-  fi
+  printf '%sbarmanObjectStore:\n' "$indent"
+  printf '%s  destinationPath: %s\n' "$indent" "$BACKUP_DESTINATION_PATH"
+  printf '%s  serverName: %s\n' "$indent" "$server_name"
+  [[ -n "$BACKUP_ENDPOINT_URL" ]] && printf '%s  endpointURL: %s\n' "$indent" "$BACKUP_ENDPOINT_URL"
   emit_credentials_block "${indent}  "
-  printf '%s  wal:\n' "${indent}"
-  printf '%s    compression: gzip\n' "${indent}"
-  printf '%s  data:\n' "${indent}"
-  printf '%s    compression: gzip\n' "${indent}"
+  printf '%s  wal:\n' "$indent"
+  printf '%s    compression: gzip\n' "$indent"
+  printf '%s  data:\n' "$indent"
+  printf '%s    compression: gzip\n' "$indent"
 }
 
-print_runtime_context(){
-  local mode="$1"
-  log "runtime context:"
-  log "  mode=${mode}"
-  log "  k8s_cluster=${K8S_CLUSTER}"
-  log "  namespace=${TARGET_NS}"
-  log "  cnpg_namespace=${CNPG_NAMESPACE}"
-  log "  cluster_name=${CLUSTER_NAME}"
-  log "  pooler_name=${POOLER_NAME}"
-  log "  cluster_id=${PG_CLUSTER_ID}"
-  log "  source_server_name=$(source_lineage_server_name)"
-  log "  source_lineage_prefix=$(lineage_prefix_for "$(source_lineage_server_name)")"
-  log "  backup_destination_path=${BACKUP_DESTINATION_PATH:-<unresolved>}"
-  if [[ "${mode}" == "restore" ]]; then
-    log "  restore_source_server_name=$(source_lineage_server_name)"
-    log "  restore_target_server_name=${RESTORE_ACTIVE_SERVER_NAME}"
-    log "  restore_source_prefix=$(lineage_prefix_for "$(source_lineage_server_name)")"
-    log "  restore_target_prefix=$(lineage_prefix_for "${RESTORE_ACTIVE_SERVER_NAME}")"
-    log "  restore_target_time=${RESTORE_TARGET_TIME:-<none>}"
-  else
-    log "  active_server_name=${BACKUP_ACTIVE_SERVER_NAME}"
-    log "  active_lineage_prefix=$(lineage_prefix_for "${BACKUP_ACTIVE_SERVER_NAME}")"
-  fi
-  log "  create_initial_backup=${CREATE_INITIAL_BACKUP}"
-  log "  backup_retention_policy=${BACKUP_RETENTION_POLICY}"
-  log "  backup_schedule=${BACKUP_SCHEDULE}"
-  log "  credentials_mode=$([[ -n "${IRSA_ROLE_ARN}" ]] && echo irsa || echo static-secret)"
-}
-
-render_cluster_manifest(){
-  local file="$1"
-  local mode="$2"            # fresh | restore
-  local restore_target_time="${3:-}"
-  local source_server_name target_server_name
-
-  if [[ "${mode}" == "restore" ]]; then
-    source_server_name="$(source_lineage_server_name)"
-    target_server_name="${RESTORE_ACTIVE_SERVER_NAME}"
-  else
-    source_server_name="$(source_lineage_server_name)"
-    target_server_name="${BACKUP_ACTIVE_SERVER_NAME}"
-  fi
-
-  mkdir -p "$(dirname "${file}")"
+render_cluster_manifest() {
+  local file="$1" mode="$2" restore_target_time="${3:-}" src target
+  src="$(source_lineage_server_name)"
+  target="${BACKUP_ACTIVE_SERVER_NAME:-$RESTORE_ACTIVE_SERVER_NAME}"
+  mkdir -p "$(dirname "$file")"
 
   {
     cat <<EOF
@@ -437,16 +376,13 @@ spec:
   instances: ${INSTANCES}
   imageName: ${POSTGRES_IMAGE}
 EOF
-
     emit_irsa_block
-
     cat <<EOF
   backup:
     retentionPolicy: ${BACKUP_RETENTION_POLICY}
 EOF
-    emit_backup_store_block "    " "${target_server_name}"
-
-    if [[ "${mode}" == "fresh" ]]; then
+    emit_backup_store_block "    " "$target"
+    if [[ "$mode" == "fresh" ]]; then
       cat <<EOF
   bootstrap:
     initdb:
@@ -478,25 +414,21 @@ EOF
     recovery:
       source: origin
 EOF
-      if [[ -n "${restore_target_time}" ]]; then
-        cat <<EOF
+      [[ -n "$restore_target_time" ]] && cat <<EOF
       recoveryTarget:
         targetTime: ${restore_target_time}
 EOF
-      fi
       cat <<EOF
   externalClusters:
     - name: origin
       barmanObjectStore:
         destinationPath: ${BACKUP_DESTINATION_PATH}
-        serverName: ${source_server_name}
+        serverName: ${src}
 EOF
-      if [[ -n "${BACKUP_ENDPOINT_URL}" ]]; then
-        cat <<EOF
+      [[ -n "$BACKUP_ENDPOINT_URL" ]] && cat <<EOF
         endpointURL: ${BACKUP_ENDPOINT_URL}
 EOF
-      fi
-      if [[ -z "${IRSA_ROLE_ARN}" ]]; then
+      if [[ -z "$IRSA_ROLE_ARN" ]]; then
         cat <<EOF
         s3Credentials:
           accessKeyId:
@@ -506,13 +438,11 @@ EOF
             name: ${AWS_CREDS_SECRET_NAME}
             key: ACCESS_SECRET_KEY
 EOF
-        if [[ -n "${AWS_SESSION_TOKEN}" ]]; then
-          cat <<EOF
+        [[ -n "$AWS_SESSION_TOKEN" ]] && cat <<EOF
           sessionToken:
             name: ${AWS_CREDS_SECRET_NAME}
             key: ACCESS_SESSION_TOKEN
 EOF
-        fi
       fi
       cat <<EOF
         wal:
@@ -540,17 +470,15 @@ EOF
       memory: ${MEM_LIMIT}
 EOF
     fi
-  } > "${file}"
+  } > "$file"
 
-  log "wrote ${file}"
+  log "wrote $file"
 }
 
-render_pooler_manifest(){
+render_pooler_manifest() {
   local file="$1"
-
-  mkdir -p "$(dirname "${file}")"
-
-  cat > "${file}" <<EOF
+  mkdir -p "$(dirname "$file")"
+  cat > "$file" <<EOF
 apiVersion: postgresql.cnpg.io/v1
 kind: Pooler
 metadata:
@@ -586,15 +514,13 @@ spec:
               cpu: ${POOLER_CPU_LIMIT}
               memory: ${POOLER_MEM_LIMIT}
 EOF
-  log "wrote ${file}"
+  log "wrote $file"
 }
 
-render_scheduled_backup_manifest(){
+render_scheduled_backup_manifest() {
   local file="$1"
-
-  mkdir -p "$(dirname "${file}")"
-
-  cat > "${file}" <<EOF
+  mkdir -p "$(dirname "$file")"
+  cat > "$file" <<EOF
 apiVersion: postgresql.cnpg.io/v1
 kind: ScheduledBackup
 metadata:
@@ -607,464 +533,492 @@ spec:
   backupOwnerReference: self
   method: barmanObjectStore
 EOF
-  log "wrote ${file}"
+  log "wrote $file"
 }
 
-render_manual_backup_manifest(){
-  local file="$1"
-  local backup_name="$2"
-
-  mkdir -p "$(dirname "${file}")"
-
-  cat > "${file}" <<EOF
+render_manual_backup_manifest() {
+  local file="$1" name="$2"
+  mkdir -p "$(dirname "$file")"
+  cat > "$file" <<EOF
 apiVersion: postgresql.cnpg.io/v1
 kind: Backup
 metadata:
-  name: ${backup_name}
+  name: ${name}
   namespace: ${TARGET_NS}
 spec:
   method: barmanObjectStore
   cluster:
     name: ${CLUSTER_NAME}
 EOF
-  log "wrote ${file}"
+  log "wrote $file"
 }
 
-apply_if_changed(){
-  local file="$1" kind="$2" name="$3" ann_key="$4"
-  local h existing
-  h="$(manifest_hash "${file}")"
-  existing="$(kubectl -n "${TARGET_NS}" get "${kind}" "${name}" -o "jsonpath={.metadata.annotations['${ann_key}']}" 2>/dev/null || true)"
-  if [[ -n "${existing}" && "${existing}" == "${h}" ]]; then
-    log "${kind}/${name} unchanged; skipping"
+apply_if_changed() {
+  local file="$1" kind="$2" name="$3" ann_key="$4" h existing
+  h="$(manifest_hash "$file")"
+  existing="$(kubectl -n "$TARGET_NS" get "$kind" "$name" -o "jsonpath={.metadata.annotations['${ann_key}']}" 2>/dev/null || true)"
+  if [[ -n "$existing" && "$existing" == "$h" ]]; then
+    log "$kind/$name unchanged; skipping"
     return 0
   fi
-  kubectl apply --server-side --force-conflicts -f "${file}" >/dev/null
-  kubectl -n "${TARGET_NS}" patch "${kind}" "${name}" --type=merge -p "{\"metadata\":{\"annotations\":{\"${ann_key}\":\"${h}\"}}}" >/dev/null 2>&1 || true
-  log "applied ${kind}/${name}"
+  kubectl apply --server-side --force-conflicts -f "$file" >/dev/null
+  kubectl -n "$TARGET_NS" patch "$kind" "$name" --type=merge -p "{\"metadata\":{\"annotations\":{\"${ann_key}\":\"$h\"}}}" >/dev/null 2>&1 || true
+  log "applied $kind/$name"
 }
 
-jsonpath_condition(){
-  local cluster_name="$1"
-  local condition_type="$2"
-  kubectl -n "${TARGET_NS}" get cluster "${cluster_name}" \
-    -o jsonpath="{range .status.conditions[?(@.type==\"${condition_type}\")]}{.status}|{.reason}|{.message}{end}" 2>/dev/null || true
+jsonpath_condition() {
+  kubectl -n "$TARGET_NS" get cluster "$1" -o jsonpath="{range .status.conditions[?(@.type==\"$2\")]}{.status}|{.reason}|{.message}{end}" 2>/dev/null || true
 }
 
-wait_for_cluster_ready(){
-  local timeout="${1:-${POD_TIMEOUT}}"
+wait_for_cluster_ready() {
+  local timeout="${1:-$POD_TIMEOUT}"
   log "waiting for cluster readiness (${CLUSTER_NAME})"
-
   local start now elapsed ready expected
   start=$(date +%s)
-
   while true; do
     now=$(date +%s)
     elapsed=$((now - start))
-    if [[ "${elapsed}" -ge "${timeout}" ]]; then
-      fatal "timeout waiting for cluster readiness: ${CLUSTER_NAME}"
-    fi
-
-    ready=$(kubectl -n "${TARGET_NS}" get cluster "${CLUSTER_NAME}" -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo 0)
-    expected=$(kubectl -n "${TARGET_NS}" get cluster "${CLUSTER_NAME}" -o jsonpath='{.spec.instances}' 2>/dev/null || echo 1)
-
-    if [[ -n "${ready}" && -n "${expected}" && "${ready}" -ge "${expected}" ]]; then
+    [[ "$elapsed" -ge "$timeout" ]] && fatal "timeout waiting for cluster readiness: ${CLUSTER_NAME}"
+    ready=$(kubectl -n "$TARGET_NS" get cluster "$CLUSTER_NAME" -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo 0)
+    expected=$(kubectl -n "$TARGET_NS" get cluster "$CLUSTER_NAME" -o jsonpath='{.spec.instances}' 2>/dev/null || echo 1)
+    if [[ -n "$ready" && -n "$expected" && "$ready" -ge "$expected" ]]; then
       log "cluster ready ${ready}/${expected}: ${CLUSTER_NAME}"
       return 0
     fi
-
     sleep 3
   done
 }
 
-wait_for_continuous_archiving(){
-  local timeout="${1:-${POD_TIMEOUT}}"
+wait_for_continuous_archiving() {
+  local timeout="${1:-$POD_TIMEOUT}"
   log "waiting for ContinuousArchiving=True (${CLUSTER_NAME})"
-
   local start now elapsed cond status reason_message reason message
   start=$(date +%s)
-
   while true; do
     now=$(date +%s)
     elapsed=$((now - start))
-    if [[ "${elapsed}" -ge "${timeout}" ]]; then
-      cond="$(jsonpath_condition "${CLUSTER_NAME}" "ContinuousArchiving")"
+    if [[ "$elapsed" -ge "$timeout" ]]; then
+      cond="$(jsonpath_condition "$CLUSTER_NAME" "ContinuousArchiving")"
       fatal "timeout waiting for ContinuousArchiving; current=${cond}"
     fi
-
-    cond="$(jsonpath_condition "${CLUSTER_NAME}" "ContinuousArchiving")"
+    cond="$(jsonpath_condition "$CLUSTER_NAME" "ContinuousArchiving")"
     status="${cond%%|*}"
     reason_message="${cond#*|}"
     reason="${reason_message%%|*}"
     message="${reason_message#*|}"
-
-    if [[ "${status}" == "True" ]]; then
+    if [[ "$status" == "True" ]]; then
       log "ContinuousArchiving ready: ${CLUSTER_NAME}"
       return 0
     fi
-
-    if [[ -n "${status}" && "${status}" == "False" ]]; then
-      log "ContinuousArchiving still failing: ${reason} - ${message}"
-    fi
-
+    [[ -n "$status" && "$status" == "False" ]] && log "ContinuousArchiving still failing: ${reason} - ${message}"
     sleep 3
   done
 }
 
-wait_for_app_secret(){
+wait_for_app_secret() {
   log "waiting for app secret (${CLUSTER_NAME})"
-
   local start now elapsed secret
   start=$(date +%s)
-
   while true; do
     now=$(date +%s)
     elapsed=$((now - start))
-    secret=$(kubectl -n "${TARGET_NS}" get secret -l "cnpg.io/cluster=${CLUSTER_NAME},cnpg.io/userType=app" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-    if [[ -n "${secret}" ]]; then
+    secret=$(kubectl -n "$TARGET_NS" get secret -l "cnpg.io/cluster=${CLUSTER_NAME},cnpg.io/userType=app" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    [[ -n "$secret" ]] && {
       log "found app secret ${secret}"
       return 0
-    fi
-    if [[ "${elapsed}" -ge "${SECRET_TIMEOUT}" ]]; then
-      fatal "timeout waiting for app secret: ${CLUSTER_NAME}"
-    fi
+    }
+    [[ "$elapsed" -ge "$SECRET_TIMEOUT" ]] && fatal "timeout waiting for app secret: ${CLUSTER_NAME}"
     sleep 2
   done
 }
 
-wait_for_backup_completed(){
+wait_for_backup_completed() {
   local backup_name="$1"
   log "waiting for backup ${backup_name} to complete"
-
   local start now elapsed phase
   start=$(date +%s)
-
   while true; do
     now=$(date +%s)
     elapsed=$((now - start))
-    if [[ "${elapsed}" -ge "${BACKUP_TIMEOUT}" ]]; then
-      kubectl -n "${TARGET_NS}" describe backup "${backup_name}" || true
+    if [[ "$elapsed" -ge "$BACKUP_TIMEOUT" ]]; then
+      kubectl -n "$TARGET_NS" describe backup "$backup_name" || true
       fatal "timeout waiting for backup completion: ${backup_name}"
     fi
-
-    phase=$(kubectl -n "${TARGET_NS}" get backup "${backup_name}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-    case "${phase}" in
-      completed)
-        log "backup completed: ${backup_name}"
-        return 0
-        ;;
-      failed)
-        kubectl -n "${TARGET_NS}" describe backup "${backup_name}" || true
-        fatal "backup failed: ${backup_name}"
-        ;;
-      running|started|"")
-        sleep 5
-        ;;
-      *)
-        log "backup phase=${phase} for ${backup_name}"
-        sleep 5
-        ;;
+    phase=$(kubectl -n "$TARGET_NS" get backup "$backup_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    case "$phase" in
+      completed) log "backup completed: ${backup_name}"; return 0 ;;
+      failed) kubectl -n "$TARGET_NS" describe backup "$backup_name" || true; fatal "backup failed: ${backup_name}" ;;
+      running|started|"") sleep 5 ;;
+      *) log "backup phase=${phase} for ${backup_name}"; sleep 5 ;;
     esac
   done
 }
 
-latest_completed_backup_name(){
-  kubectl -n "${TARGET_NS}" get backup -l "cnpg.io/cluster=${CLUSTER_NAME}" \
-    -o jsonpath='{range .items[?(@.status.phase=="completed")]}{.status.stoppedAt}|{.metadata.name}{"\n"}{end}' 2>/dev/null \
-    | sort | tail -n 1 | cut -d'|' -f2- || true
+latest_completed_backup_name() {
+  kubectl -n "$TARGET_NS" get backup -l "cnpg.io/cluster=${CLUSTER_NAME}" -o jsonpath='{range .items[?(@.status.phase=="completed")]}{.status.stoppedAt}|{.metadata.name}{"\n"}{end}' 2>/dev/null | sort | tail -n 1 | cut -d'|' -f2- || true
 }
 
-ensure_database_exists(){
+ensure_database_exists() {
   local primary db exists
-  primary="$(kubectl -n "${TARGET_NS}" get pods -l 'cnpg.io/instanceRole=primary' -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  [[ -n "${primary}" ]] || fatal "primary pod not found"
-
+  primary=$(kubectl -n "$TARGET_NS" get pods -l 'cnpg.io/instanceRole=primary' -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  [[ -n "$primary" ]] || fatal "primary pod not found"
   for db in "${ALL_DBS[@]}"; do
-    exists=$(kubectl -n "${TARGET_NS}" exec "${primary}" -- psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db}';" 2>/dev/null || echo "")
-    if [[ "${exists}" =~ 1 ]]; then
+    exists=$(kubectl -n "$TARGET_NS" exec "$primary" -- psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db}';" 2>/dev/null || echo "")
+    if [[ "$exists" =~ 1 ]]; then
       log "database ${db} already exists"
     else
       log "creating database ${db}"
-      kubectl -n "${TARGET_NS}" exec "${primary}" -- psql -U postgres -c "CREATE DATABASE ${db} OWNER app;" >/dev/null
+      kubectl -n "$TARGET_NS" exec "$primary" -- psql -U postgres -c "CREATE DATABASE ${db} OWNER app;" >/dev/null
       log "created ${db}"
     fi
   done
 }
 
-fix_database_schema_ownership(){
+fix_database_schema_ownership() {
   log "ensuring schema ownership for target DBs"
   local primary db
-  primary="$(kubectl -n "${TARGET_NS}" get pods -l 'cnpg.io/instanceRole=primary' -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  [[ -n "${primary}" ]] || fatal "primary pod not found"
-
+  primary=$(kubectl -n "$TARGET_NS" get pods -l 'cnpg.io/instanceRole=primary' -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  [[ -n "$primary" ]] || fatal "primary pod not found"
   for db in "${ALL_DBS[@]}"; do
-    kubectl -n "${TARGET_NS}" exec "${primary}" -- psql -U postgres -d "${db}" -c "ALTER SCHEMA public OWNER TO app;" >/dev/null 2>&1 || true
+    kubectl -n "$TARGET_NS" exec "$primary" -- psql -U postgres -d "$db" -c "ALTER SCHEMA public OWNER TO app;" >/dev/null 2>&1 || true
   done
   log "schema ownership attempts complete"
 }
 
-deploy_pooler_and_wait(){
-  render_pooler_manifest "${POOLER_FILE}"
-  apply_if_changed "${POOLER_FILE}" pooler "${POOLER_NAME}" "${ANNOTATION_POOLER_KEY}"
-
-  log "waiting for pooler pods to be ready (${POOLER_NAME})"
-  local start now elapsed
-  start=$(date +%s)
-
-  while true; do
-    now=$(date +%s)
-    elapsed=$((now - start))
-    local pods ready need svc
-    pods=$(kubectl -n "${TARGET_NS}" get pods -l "cnpg.io/poolerName=${POOLER_NAME}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
-
-    if [[ -n "${pods}" ]]; then
-      ready=$(for p in ${pods}; do kubectl -n "${TARGET_NS}" get pod "$p" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo false; done | grep -c true || true)
-      need=$(kubectl -n "${TARGET_NS}" get pooler "${POOLER_NAME}" -o jsonpath='{.spec.instances}' 2>/dev/null || echo "${POOLER_INSTANCES}")
-
-      if [[ "${ready}" -ge "${need}" && "${need}" -gt 0 ]]; then
-        svc=$(kubectl -n "${TARGET_NS}" get svc "${POOLER_NAME}" -o jsonpath='{.metadata.name}' 2>/dev/null || true)
-        if [[ -n "${svc}" ]]; then
-          log "pooler ready: ${POOLER_NAME}"
-          return 0
-        fi
-      fi
-    fi
-
-    if [[ "${elapsed}" -ge "${OPERATOR_TIMEOUT}" ]]; then
-      fatal "timeout waiting for pooler readiness: ${POOLER_NAME}"
-    fi
-    sleep 3
-  done
+command_backup_line() {
+  local server_name="$1"
+  cat <<EOF
+K8S_CLUSTER=$(shq "$K8S_CLUSTER") CREATE_INITIAL_BACKUP=true PG_BACKUPS_S3_BUCKET=$(shq "$S3_BUCKET") PG_CLUSTER_ID=$(shq "$PG_CLUSTER_ID") PG_SERVER_NAME=$(shq "$server_name") bash src/infra/core/postgres_cluster.sh backup --wait
+EOF
 }
 
-print_connection_uris(){
-  log "printing masked pooler URIs (${CLUSTER_NAME})"
-
-  local secret user pw port host raw masked
-  secret=$(kubectl -n "${TARGET_NS}" get secret -l "cnpg.io/cluster=${CLUSTER_NAME},cnpg.io/userType=app" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-  [[ -n "${secret}" ]] || fatal "app secret not found for connection URI output: ${CLUSTER_NAME}"
-
-  user=$(kubectl -n "${TARGET_NS}" get secret "${secret}" -o jsonpath='{.data.username}' 2>/dev/null | base64 -d)
-  pw=$(kubectl -n "${TARGET_NS}" get secret "${secret}" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
-  port=$(kubectl -n "${TARGET_NS}" get secret "${secret}" -o jsonpath='{.data.port}' 2>/dev/null | base64 -d || echo 5432)
-  host="${POOLER_NAME}.${TARGET_NS}"
-
-  raw="postgresql://${user}:${pw}@${host}:${port}"
-  masked="$(mask_uri "${raw}")"
-
-  printf '\nConnection URIs (masked):\n\n'
-  for db in "${ALL_DBS[@]}"; do
-    printf '%s/%s\n' "${masked}" "${db}"
-  done
+command_restore_latest_line() {
+  local src="$1" target="$2"
+  cat <<EOF
+K8S_CLUSTER=$(shq "$K8S_CLUSTER") PG_BACKUPS_S3_BUCKET=$(shq "$S3_BUCKET") PG_CLUSTER_ID=$(shq "$PG_CLUSTER_ID") RESTORE_SOURCE_SERVER_NAME=$(shq "$src") RESTORE_SERVER_NAME=$(shq "$target") bash src/infra/core/postgres_cluster.sh deploy --restore latest --force-recreate
+EOF
 }
 
-wait_for_cluster_absent(){
-  local timeout="${1:-300}"
-  local start now elapsed
-  start=$(date +%s)
-
-  while cluster_exists; do
-    now=$(date +%s)
-    elapsed=$((now - start))
-    if [[ "${elapsed}" -ge "${timeout}" ]]; then
-      fatal "timeout waiting for cluster deletion: ${CLUSTER_NAME}"
-    fi
-    sleep 3
-  done
+command_restore_time_line() {
+  local src="$1" target="$2" target_time="$3"
+  cat <<EOF
+K8S_CLUSTER=$(shq "$K8S_CLUSTER") PG_BACKUPS_S3_BUCKET=$(shq "$S3_BUCKET") PG_CLUSTER_ID=$(shq "$PG_CLUSTER_ID") RESTORE_SOURCE_SERVER_NAME=$(shq "$src") RESTORE_SERVER_NAME=$(shq "$target") bash src/infra/core/postgres_cluster.sh deploy --restore time --target-time $(shq "$target_time") --force-recreate
+EOF
 }
 
-delete_cluster_resources(){
-  kubectl -n "${TARGET_NS}" delete scheduledbackup "${CLUSTER_NAME}-backup" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl -n "${TARGET_NS}" delete backup -l "cnpg.io/cluster=${CLUSTER_NAME}" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl -n "${TARGET_NS}" delete pooler "${POOLER_NAME}" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl -n "${TARGET_NS}" delete cluster "${CLUSTER_NAME}" --ignore-not-found >/dev/null 2>&1 || true
-  wait_for_cluster_absent "${POD_TIMEOUT}"
+
+write_command_file() {
+  local src="$1" target="$2" target_time="${3:-}"
+
+  mkdir -p "$(dirname "$COMMANDS_FILE")"
+
+  {
+    cat <<'EOF'
+#!/usr/bin/env bash
+EOF
+    printf 'export K8S_CLUSTER=%s\n' "$(shq "$K8S_CLUSTER")"
+    printf 'export TARGET_NS=%s\n' "$(shq "$TARGET_NS")"
+    printf 'export PG_BACKUPS_S3_BUCKET=%s\n' "$(shq "$S3_BUCKET")"
+    printf 'export PG_CLUSTER_ID=%s\n' "$(shq "$PG_CLUSTER_ID")"
+    printf 'export BACKUP_PREFIX=%s\n' "$(shq "$BACKUP_PREFIX")"
+    printf 'export BACKUP_DESTINATION_PATH=%s\n' "$(shq "$BACKUP_DESTINATION_PATH")"
+    printf 'export BACKUP_ENDPOINT_URL=%s\n' "$(shq "$BACKUP_ENDPOINT_URL")"
+    printf 'export BACKUP_RETENTION_POLICY=%s\n' "$(shq "$BACKUP_RETENTION_POLICY")"
+    printf 'export BACKUP_SCHEDULE=%s\n' "$(shq "$BACKUP_SCHEDULE")"
+    printf 'export PG_SERVER_NAME=%s\n' "$(shq "$src")"
+    printf 'export RESTORE_SOURCE_SERVER_NAME=%s\n' "$(shq "$src")"
+    printf 'export RESTORE_SERVER_NAME=%s\n' "$(shq "$target")"
+    printf 'export CREATE_INITIAL_BACKUP=%s\n' "$(shq "$CREATE_INITIAL_BACKUP")"
+    printf 'export IRSA_ROLE_ARN=%s\n' "$(shq "$IRSA_ROLE_ARN")"
+    printf 'export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID\n'
+    printf 'export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY\n'
+    printf 'export AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN\n'
+    printf '\n'
+    printf 'MODE="${MODE:-backup}"\n'
+    printf 'TARGET_TIME="${TARGET_TIME:-%s}"\n' "$(shq "${target_time:-}")"
+    printf '\n'
+    printf 'case "$MODE" in\n'
+    printf '  backup)\n'
+    printf '    echo "Backup current lineage"\n'
+    command_backup_line "$src"
+    printf '    ;;\n\n'
+
+    printf '  restore|restore-latest)\n'
+    printf '    echo "Restore latest into a new unique lineage"\n'
+    command_restore_latest_line "$src" "$target"
+    printf '    ;;\n\n'
+
+    printf '  restore-time)\n'
+    printf '    if [[ -z "$TARGET_TIME" ]]; then\n'
+    printf '      echo "ERROR: TARGET_TIME must be set for MODE=restore-time"\n'
+    printf '      exit 1\n'
+    printf '    fi\n'
+    printf '    echo "Restore point-in-time into a new unique lineage"\n'
+    command_restore_time_line "$src" "$target" "${target_time:-<RFC3339>}"
+    printf '    ;;\n\n'
+
+    printf '  *)\n'
+    printf '    echo "ERROR: invalid MODE=$MODE"\n'
+    printf '    echo "Valid values: backup | restore | restore-latest | restore-time"\n'
+    printf '    exit 1\n'
+    printf '    ;;\n'
+    printf 'esac\n'
+  } > "$COMMANDS_FILE"
+
+  chmod 0755 "$COMMANDS_FILE" || true
+  log "persisted command file ${COMMANDS_FILE}"
 }
 
-persist_artifacts(){
-  cp "${CLUSTER_FILE}" "${MANIFEST_DIR}/postgres_cluster.yaml" 2>/dev/null || true
-  cp "${POOLER_FILE}" "${MANIFEST_DIR}/postgres_pooler.yaml" 2>/dev/null || true
-  cp "${SCHEDULED_BACKUP_FILE}" "${MANIFEST_DIR}/postgres_scheduled_backup.yaml" 2>/dev/null || true
-  cp "${MANUAL_BACKUP_FILE}" "${MANIFEST_DIR}/postgres_backup.yaml" 2>/dev/null || true
+
+print_command_summary() {
+  local src="$1" target="$2" target_time="${3:-}"
+  log "backup command:"
+  printf '%s\n' "$(command_backup_line "$src")" >&2
+  log "restore latest command:"
+  printf '%s\n' "$(command_restore_latest_line "$src" "$target")" >&2
+  log "restore time command:"
+  printf '%s\n' "$(command_restore_time_line "$src" "$target" "${target_time:-<RFC3339>}")" >&2
+}
+
+persist_artifacts() {
+  cp "$CLUSTER_FILE" "${MANIFEST_DIR}/postgres_cluster.yaml" 2>/dev/null || true
+  cp "$POOLER_FILE" "${MANIFEST_DIR}/postgres_pooler.yaml" 2>/dev/null || true
+  cp "$SCHEDULED_BACKUP_FILE" "${MANIFEST_DIR}/postgres_scheduled_backup.yaml" 2>/dev/null || true
+  cp "$MANUAL_BACKUP_FILE" "${MANIFEST_DIR}/postgres_backup.yaml" 2>/dev/null || true
   log "artifacts persisted to ${MANIFEST_DIR}"
 }
 
-s3_lineage_has_any_objects(){
+print_connection_uris() {
+  log "printing masked pooler URIs (${CLUSTER_NAME})"
+  local secret user pw port host raw masked
+  secret=$(kubectl -n "$TARGET_NS" get secret -l "cnpg.io/cluster=${CLUSTER_NAME},cnpg.io/userType=app" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  [[ -n "$secret" ]] || fatal "app secret not found for connection URI output: ${CLUSTER_NAME}"
+  user=$(kubectl -n "$TARGET_NS" get secret "$secret" -o jsonpath='{.data.username}' 2>/dev/null | base64 -d)
+  pw=$(kubectl -n "$TARGET_NS" get secret "$secret" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
+  port=$(kubectl -n "$TARGET_NS" get secret "$secret" -o jsonpath='{.data.port}' 2>/dev/null | base64 -d || echo 5432)
+  host="${POOLER_NAME}.${TARGET_NS}"
+  raw="postgresql://${user}:${pw}@${host}:${port}"
+  masked="$(mask_uri "$raw")"
+  printf '\nConnection URIs (masked):\n\n'
+  for db in "${ALL_DBS[@]}"; do
+    printf '%s/%s\n' "$masked" "$db"
+  done
+}
+
+wait_for_cluster_absent() {
+  local timeout="${1:-300}" start now elapsed
+  start=$(date +%s)
+  while cluster_exists; do
+    now=$(date +%s)
+    elapsed=$((now - start))
+    [[ "$elapsed" -ge "$timeout" ]] && fatal "timeout waiting for cluster deletion: ${CLUSTER_NAME}"
+    sleep 3
+  done
+}
+
+delete_cluster_resources() {
+  kubectl -n "$TARGET_NS" delete scheduledbackup "${CLUSTER_NAME}-backup" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "$TARGET_NS" delete backup -l "cnpg.io/cluster=${CLUSTER_NAME}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "$TARGET_NS" delete pooler "$POOLER_NAME" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "$TARGET_NS" delete cluster "$CLUSTER_NAME" --ignore-not-found >/dev/null 2>&1 || true
+  wait_for_cluster_absent "$POD_TIMEOUT"
+}
+
+s3_lineage_has_any_objects() {
   local server_name="$1" prefix
-  prefix="$(lineage_prefix_for "${server_name}")"
-  aws s3 ls "${prefix}" --recursive 2>/dev/null | grep -q .
+  prefix="$(lineage_prefix_for "$server_name")"
+  aws s3 ls "$prefix" --recursive 2>/dev/null | grep -q .
 }
 
-s3_lineage_has_base_backup(){
+s3_lineage_has_base_backup() {
   local server_name="$1" prefix
-  prefix="$(lineage_prefix_for "${server_name}")"
-  aws s3 ls "${prefix}base/" --recursive 2>/dev/null | grep -q 'backup.info'
+  prefix="$(lineage_prefix_for "$server_name")"
+  aws s3 ls "$prefix/base/" --recursive 2>/dev/null | grep -q 'backup.info'
 }
 
-check_fresh_archive_empty(){
-  local server_name prefix
-  server_name="${BACKUP_ACTIVE_SERVER_NAME}"
-  prefix="$(lineage_prefix_for "${server_name}")"
-  if s3_lineage_has_any_objects "${server_name}"; then
-    fatal "S3 lineage is not empty for fresh deploy: ${prefix} (choose a new PG_CLUSTER_ID or purge that lineage if this is intentional)"
-  fi
+check_fresh_archive_empty() {
+  local prefix
+  prefix="$(lineage_prefix_for "$BACKUP_ACTIVE_SERVER_NAME")"
+  s3_lineage_has_any_objects "$BACKUP_ACTIVE_SERVER_NAME" && fatal "S3 lineage is not empty for fresh deploy: ${prefix} (choose a new PG_CLUSTER_ID or purge that lineage if this is intentional)"
 }
 
-check_restore_source_present(){
-  local server_name prefix
-  server_name="$(source_lineage_server_name)"
-  prefix="$(lineage_prefix_for "${server_name}")"
-  if ! s3_lineage_has_base_backup "${server_name}"; then
-    fatal "no completed base backup found for restore in ${prefix}"
-  fi
+check_restore_source_present() {
+  local prefix
+  prefix="$(lineage_prefix_for "$(source_lineage_server_name)")"
+  s3_lineage_has_base_backup "$(source_lineage_server_name)" || fatal "no completed base backup found for restore in ${prefix}"
 }
 
-check_restore_target_empty(){
-  local server_name prefix
-  server_name="${RESTORE_ACTIVE_SERVER_NAME}"
-  prefix="$(lineage_prefix_for "${server_name}")"
-  if s3_lineage_has_any_objects "${server_name}"; then
-    fatal "restore target lineage is not empty: ${prefix} (set RESTORE_SERVER_NAME to a new unique lineage or purge that target lineage if this is intentional)"
-  fi
+check_restore_target_empty() {
+  local prefix
+  prefix="$(lineage_prefix_for "$RESTORE_ACTIVE_SERVER_NAME")"
+  s3_lineage_has_any_objects "$RESTORE_ACTIVE_SERVER_NAME" && fatal "restore target lineage is not empty: ${prefix} (choose a new restore target or purge that target lineage if intentional)"
 }
 
-ensure_restore_lineage(){
+ensure_restore_lineage() {
   resolve_restore_target_server_name
   check_restore_source_present
   check_restore_target_empty
 }
 
-ensure_fresh_lineage(){
+ensure_fresh_lineage() {
   resolve_fresh_target_server_name
   check_fresh_archive_empty
 }
 
-create_initial_backup(){
+create_initial_backup() {
   local backup_name
-  if [[ "${CREATE_INITIAL_BACKUP}" != "true" ]]; then
-    log "initial backup skipped"
-    return 0
-  fi
-
-  if [[ -n "$(latest_completed_backup_name)" ]]; then
-    log "completed backup already exists; skipping initial backup"
-    return 0
-  fi
-
+  [[ "$CREATE_INITIAL_BACKUP" != "true" ]] && { log "initial backup skipped"; return 0; }
+  [[ -n "$(latest_completed_backup_name)" ]] && { log "completed backup already exists; skipping initial backup"; return 0; }
   backup_name="${CLUSTER_NAME}-manual-$(date -u +%Y%m%d%H%M%S)-$$"
-  render_manual_backup_manifest "${MANUAL_BACKUP_FILE}" "${backup_name}"
-  apply_if_changed "${MANUAL_BACKUP_FILE}" backup "${backup_name}" "${ANNOTATION_BACKUP_KEY}"
-  wait_for_backup_completed "${backup_name}"
+  render_manual_backup_manifest "$MANUAL_BACKUP_FILE" "$backup_name"
+  apply_if_changed "$MANUAL_BACKUP_FILE" backup "$backup_name" "$ANN_BACKUP"
+  wait_for_backup_completed "$backup_name"
 }
 
-deploy_fresh(){
+show_runtime_context() {
+  local mode="$1"
+  log "runtime context:"
+  log "  mode=${mode}"
+  log "  k8s_cluster=${K8S_CLUSTER}"
+  log "  namespace=${TARGET_NS}"
+  log "  cnpg_namespace=${CNPG_NAMESPACE}"
+  log "  cluster_name=${CLUSTER_NAME}"
+  log "  pooler_name=${POOLER_NAME}"
+  log "  cluster_id=${PG_CLUSTER_ID}"
+  log "  source_server_name=$(source_lineage_server_name)"
+  log "  source_prefix=$(lineage_prefix_for "$(source_lineage_server_name)")"
+  log "  backup_destination_path=${BACKUP_DESTINATION_PATH:-<unresolved>}"
+  if [[ "$mode" == "restore" ]]; then
+    log "  restore_source_server_name=$(source_lineage_server_name)"
+    log "  restore_target_server_name=${RESTORE_ACTIVE_SERVER_NAME}"
+    log "  restore_source_prefix=$(lineage_prefix_for "$(source_lineage_server_name)")"
+    log "  restore_target_prefix=$(lineage_prefix_for "$RESTORE_ACTIVE_SERVER_NAME")"
+    log "  restore_target_time=${RESTORE_TARGET_TIME:-<none>}"
+  else
+    log "  active_server_name=${BACKUP_ACTIVE_SERVER_NAME}"
+    log "  active_lineage_prefix=$(lineage_prefix_for "$BACKUP_ACTIVE_SERVER_NAME")"
+  fi
+  log "  create_initial_backup=${CREATE_INITIAL_BACKUP}"
+  log "  backup_retention_policy=${BACKUP_RETENTION_POLICY}"
+  log "  backup_schedule=${BACKUP_SCHEDULE}"
+  log "  credentials_mode=$([[ -n "$IRSA_ROLE_ARN" ]] && echo irsa || echo static-secret)"
+  log "  commands_file=${COMMANDS_FILE}"
+}
+
+deploy_pooler_and_wait() {
+  render_pooler_manifest "$POOLER_FILE"
+  apply_if_changed "$POOLER_FILE" pooler "$POOLER_NAME" "$ANN_POOLER"
+  log "waiting for pooler pods to be ready (${POOLER_NAME})"
+  local start now elapsed
+  start=$(date +%s)
+  while true; do
+    now=$(date +%s)
+    elapsed=$((now - start))
+    local pods ready need svc
+    pods=$(kubectl -n "$TARGET_NS" get pods -l "cnpg.io/poolerName=${POOLER_NAME}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+    if [[ -n "$pods" ]]; then
+      ready=$(for p in $pods; do kubectl -n "$TARGET_NS" get pod "$p" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo false; done | grep -c true || true)
+      need=$(kubectl -n "$TARGET_NS" get pooler "$POOLER_NAME" -o jsonpath='{.spec.instances}' 2>/dev/null || echo "$POOLER_INSTANCES")
+      if [[ "$ready" -ge "$need" && "$need" -gt 0 ]]; then
+        svc=$(kubectl -n "$TARGET_NS" get svc "$POOLER_NAME" -o jsonpath='{.metadata.name}' 2>/dev/null || true)
+        [[ -n "$svc" ]] && { log "pooler ready: ${POOLER_NAME}"; return 0; }
+      fi
+    fi
+    [[ "$elapsed" -ge "$OPERATOR_TIMEOUT" ]] && fatal "timeout waiting for pooler readiness: ${POOLER_NAME}"
+    sleep 3
+  done
+}
+
+deploy_fresh() {
   ensure_cnpg_operator
   require_aws_cli
   validate_backup_inputs
   ensure_aws_secret
+  resolve_fresh_target_server_name
+  compose_backup_destination_path
   ensure_fresh_lineage
-  print_runtime_context "deploy"
-
-  render_cluster_manifest "${CLUSTER_FILE}" "fresh"
-  apply_if_changed "${CLUSTER_FILE}" cluster "${CLUSTER_NAME}" "${ANNOTATION_CLUSTER_KEY}"
-
+  show_runtime_context "deploy"
+  print_command_summary "$(safe_dns_name "$PG_SERVER_NAME")" "$BACKUP_ACTIVE_SERVER_NAME"
+  render_cluster_manifest "$CLUSTER_FILE" "fresh"
+  apply_if_changed "$CLUSTER_FILE" cluster "$CLUSTER_NAME" "$ANN_CLUSTER"
   wait_for_cluster_ready
   wait_for_continuous_archiving
   wait_for_app_secret
-
   ensure_database_exists
   fix_database_schema_ownership
   create_initial_backup
-
-  render_scheduled_backup_manifest "${SCHEDULED_BACKUP_FILE}"
-  apply_if_changed "${SCHEDULED_BACKUP_FILE}" scheduledbackup "${CLUSTER_NAME}-backup" "${ANNOTATION_SCHEDULED_BACKUP_KEY}"
-
+  render_scheduled_backup_manifest "$SCHEDULED_BACKUP_FILE"
+  apply_if_changed "$SCHEDULED_BACKUP_FILE" scheduledbackup "${CLUSTER_NAME}-backup" "$ANN_SCHED"
   deploy_pooler_and_wait
   persist_artifacts
+  write_command_file "deploy" "$(safe_dns_name "$PG_SERVER_NAME")" "$BACKUP_ACTIVE_SERVER_NAME"
   print_connection_uris
-
-  printf '\n[SUCCESS] deployed CNPG cluster %s\n' "${CLUSTER_NAME}"
-  printf '[SUCCESS] source lineage: serverName=%s prefix=%s\n' "$(source_lineage_server_name)" "$(lineage_prefix_for "$(source_lineage_server_name)")"
-  printf '[SUCCESS] target lineage: serverName=%s prefix=%s\n' "${BACKUP_ACTIVE_SERVER_NAME}" "$(lineage_prefix_for "${BACKUP_ACTIVE_SERVER_NAME}")"
+  printf '\n[SUCCESS] deployed CNPG cluster %s\n' "$CLUSTER_NAME"
+  printf '[SUCCESS] source lineage: serverName=%s prefix=%s\n' "$(safe_dns_name "$PG_SERVER_NAME")" "$(lineage_prefix_for "$(safe_dns_name "$PG_SERVER_NAME")")"
+  printf '[SUCCESS] target lineage: serverName=%s prefix=%s\n' "$BACKUP_ACTIVE_SERVER_NAME" "$(lineage_prefix_for "$BACKUP_ACTIVE_SERVER_NAME")"
 }
 
-deploy_restore(){
+deploy_restore() {
   ensure_cnpg_operator
   require_aws_cli
   validate_backup_inputs
   ensure_aws_secret
   validate_restore_inputs
+  compose_backup_destination_path
+  resolve_restore_target_server_name
   ensure_restore_lineage
-  print_runtime_context "restore"
-
+  show_runtime_context "restore"
+  print_command_summary "$(source_lineage_server_name)" "$RESTORE_ACTIVE_SERVER_NAME" "$RESTORE_TARGET_TIME"
   if cluster_exists; then
-    if [[ "${FORCE_RECREATE}" == "true" ]]; then
-      delete_cluster_resources
-    else
-      fatal "cluster ${CLUSTER_NAME} already exists; use --force-recreate to replace it"
-    fi
+    [[ "$FORCE_RECREATE" == "true" ]] && delete_cluster_resources || fatal "cluster ${CLUSTER_NAME} already exists; use --force-recreate to replace it"
   fi
-
-  if [[ "${RESTORE_MODE}" == "time" ]]; then
-    render_cluster_manifest "${CLUSTER_FILE}" "restore" "${RESTORE_TARGET_TIME}"
-  else
-    render_cluster_manifest "${CLUSTER_FILE}" "restore"
-  fi
-
-  apply_if_changed "${CLUSTER_FILE}" cluster "${CLUSTER_NAME}" "${ANNOTATION_CLUSTER_KEY}"
-
+  [[ "$RESTORE_MODE" == "time" ]] && render_cluster_manifest "$CLUSTER_FILE" "restore" "$RESTORE_TARGET_TIME" || render_cluster_manifest "$CLUSTER_FILE" "restore"
+  apply_if_changed "$CLUSTER_FILE" cluster "$CLUSTER_NAME" "$ANN_CLUSTER"
   wait_for_cluster_ready
   wait_for_continuous_archiving
   wait_for_app_secret
-
   create_initial_backup
-
-  render_scheduled_backup_manifest "${SCHEDULED_BACKUP_FILE}"
-  apply_if_changed "${SCHEDULED_BACKUP_FILE}" scheduledbackup "${CLUSTER_NAME}-backup" "${ANNOTATION_SCHEDULED_BACKUP_KEY}"
-
+  render_scheduled_backup_manifest "$SCHEDULED_BACKUP_FILE"
+  apply_if_changed "$SCHEDULED_BACKUP_FILE" scheduledbackup "${CLUSTER_NAME}-backup" "$ANN_SCHED"
   deploy_pooler_and_wait
   persist_artifacts
+  write_command_file "restore" "$(source_lineage_server_name)" "$RESTORE_ACTIVE_SERVER_NAME" "$RESTORE_TARGET_TIME"
   print_connection_uris
-
-  printf '\n[SUCCESS] restored CNPG cluster %s\n' "${CLUSTER_NAME}"
+  printf '\n[SUCCESS] restored CNPG cluster %s\n' "$CLUSTER_NAME"
   printf '[SUCCESS] restore source lineage: serverName=%s prefix=%s\n' "$(source_lineage_server_name)" "$(lineage_prefix_for "$(source_lineage_server_name)")"
-  printf '[SUCCESS] restore target lineage: serverName=%s prefix=%s\n' "${RESTORE_ACTIVE_SERVER_NAME}" "$(lineage_prefix_for "${RESTORE_ACTIVE_SERVER_NAME}")"
+  printf '[SUCCESS] restore target lineage: serverName=%s prefix=%s\n' "$RESTORE_ACTIVE_SERVER_NAME" "$(lineage_prefix_for "$RESTORE_ACTIVE_SERVER_NAME")"
 }
 
-cmd_backup(){
+cmd_backup() {
   ensure_cnpg_operator
   require_aws_cli
   validate_backup_inputs
   ensure_aws_secret
   resolve_live_backup_lineage
-  print_runtime_context "backup"
-
-  local backup_name
+  show_runtime_context "backup"
+  print_command_summary "$BACKUP_ACTIVE_SERVER_NAME" "$BACKUP_ACTIVE_SERVER_NAME"
   cluster_exists || fatal "cluster not found: ${CLUSTER_NAME}"
-
   wait_for_cluster_ready
   wait_for_continuous_archiving
-
+  local backup_name
   backup_name="${CLUSTER_NAME}-manual-$(date -u +%Y%m%d%H%M%S)-$$"
-  render_manual_backup_manifest "${MANUAL_BACKUP_FILE}" "${backup_name}"
-  apply_if_changed "${MANUAL_BACKUP_FILE}" backup "${backup_name}" "${ANNOTATION_BACKUP_KEY}"
-
-  if [[ "${WAIT_FOR_BACKUP}" == "true" ]]; then
-    wait_for_backup_completed "${backup_name}"
-  fi
-
-  printf '\n[SUCCESS] backup started for cluster %s: %s\n' "${CLUSTER_NAME}" "${backup_name}"
-  printf '[SUCCESS] active lineage: serverName=%s prefix=%s\n' "${BACKUP_ACTIVE_SERVER_NAME}" "$(lineage_prefix_for "${BACKUP_ACTIVE_SERVER_NAME}")"
+  render_manual_backup_manifest "$MANUAL_BACKUP_FILE" "$backup_name"
+  apply_if_changed "$MANUAL_BACKUP_FILE" backup "$backup_name" "$ANN_BACKUP"
+  [[ "$WAIT_FOR_BACKUP" == "true" ]] && wait_for_backup_completed "$backup_name"
+  persist_artifacts
+  write_command_file "backup" "$BACKUP_ACTIVE_SERVER_NAME" "$BACKUP_ACTIVE_SERVER_NAME"
+  printf '\n[SUCCESS] backup started for cluster %s: %s\n' "$CLUSTER_NAME" "$backup_name"
+  printf '[SUCCESS] active lineage: serverName=%s prefix=%s\n' "$BACKUP_ACTIVE_SERVER_NAME" "$(lineage_prefix_for "$BACKUP_ACTIVE_SERVER_NAME")"
 }
 
-cmd_destroy(){
+cmd_destroy() {
   log "destroy requested for cluster=${CLUSTER_NAME} namespace=${TARGET_NS}"
   delete_cluster_resources
   log "deleted CNPG resources for ${CLUSTER_NAME}"
   log "preserved PV data and S3 backups"
 }
 
-status_cluster(){
+status_cluster() {
   if cluster_exists; then
     resolve_live_backup_lineage
   else
@@ -1074,49 +1028,49 @@ status_cluster(){
 
   echo
   echo "=== ${CLUSTER_NAME} ==="
+
   if ! cluster_exists; then
     echo "not found"
     echo "lineage:"
-    echo "  cluster-id: $(safe_dns_name "${PG_CLUSTER_ID}")"
+    echo "  cluster-id: $(safe_dns_name "$PG_CLUSTER_ID")"
     echo "  source-serverName: $(source_lineage_server_name)"
     echo "  source-prefix: $(lineage_prefix_for "$(source_lineage_server_name)")"
+    echo "  commands-file: ${COMMANDS_FILE}"
     return 0
   fi
 
-  kubectl -n "${TARGET_NS}" get cluster "${CLUSTER_NAME}" -o wide || true
+  kubectl -n "$TARGET_NS" get cluster "$CLUSTER_NAME" -o wide || true
   echo
   echo "conditions:"
-  kubectl -n "${TARGET_NS}" get cluster "${CLUSTER_NAME}" -o jsonpath='{range .status.conditions[*]}{.type}={" "}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}' 2>/dev/null || true
+  kubectl -n "$TARGET_NS" get cluster "$CLUSTER_NAME" -o jsonpath='{range .status.conditions[*]}{.type}={" "}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}' 2>/dev/null || true
   echo
   echo "ContinuousArchiving:"
-  jsonpath_condition "${CLUSTER_NAME}" "ContinuousArchiving" || true
+  jsonpath_condition "$CLUSTER_NAME" "ContinuousArchiving" || true
   echo
-  echo "backups:"
-  kubectl -n "${TARGET_NS}" get backup -l "cnpg.io/cluster=${CLUSTER_NAME}" -o wide 2>/dev/null || true
-  echo
-  echo "scheduled backups:"
-  kubectl -n "${TARGET_NS}" get scheduledbackup -l "cnpg.io/cluster=${CLUSTER_NAME}" -o wide 2>/dev/null || true
+  echo "LastBackupSucceeded:"
+  jsonpath_condition "$CLUSTER_NAME" "LastBackupSucceeded" || true
   echo
   echo "pooler:"
-  kubectl -n "${TARGET_NS}" get pooler "${POOLER_NAME}" -o wide 2>/dev/null || true
+  kubectl -n "$TARGET_NS" get pooler "$POOLER_NAME" -o wide 2>/dev/null || true
   echo
   echo "pods:"
-  kubectl -n "${TARGET_NS}" get pods -l "cnpg.io/cluster=${CLUSTER_NAME}" -o wide 2>/dev/null || true
+  kubectl -n "$TARGET_NS" get pods -l "cnpg.io/cluster=${CLUSTER_NAME}" -o wide 2>/dev/null || true
   echo
   echo "lineage:"
-  echo "  cluster-id: $(safe_dns_name "${PG_CLUSTER_ID}")"
+  echo "  cluster-id: $(safe_dns_name "$PG_CLUSTER_ID")"
   echo "  source-serverName: $(source_lineage_server_name)"
   echo "  source-prefix: $(lineage_prefix_for "$(source_lineage_server_name)")"
   echo "  destination-serverName: ${BACKUP_ACTIVE_SERVER_NAME}"
-  echo "  destination-prefix: $(lineage_prefix_for "${BACKUP_ACTIVE_SERVER_NAME}")"
+  echo "  destination-prefix: $(lineage_prefix_for "$BACKUP_ACTIVE_SERVER_NAME")"
   echo "  backup-destination-path: ${BACKUP_DESTINATION_PATH}"
+  echo "  commands-file: ${COMMANDS_FILE}"
 }
 
-cmd_status(){
+cmd_status() {
   status_cluster
 }
 
-show_help(){
+show_help() {
   cat <<EOF
 Usage:
   $0 deploy [--cluster-id <id>] [--restore latest|time] [--target-time <RFC3339>] [--force-recreate]
@@ -1126,17 +1080,17 @@ Usage:
   $0 help
 
 Lineage rules:
-  - PG_SERVER_NAME is the source lineage used for fresh deploys and backups.
-  - restore uses a distinct target serverName by default: <source>-restore.
-  - RESTORE_SOURCE_SERVER_NAME can point at the source lineage to restore from.
-  - RESTORE_SERVER_NAME can override the target lineage name used for the restored cluster.
+  PG_SERVER_NAME is the source lineage used for deploys and backups.
+  restore uses a timestamp-suffixed target serverName: <source-or-override>-<timestamp>.
+  RESTORE_SOURCE_SERVER_NAME can point at a different existing source lineage.
+  RESTORE_SERVER_NAME acts as the base target lineage name; a timestamp suffix is always appended.
 
 Required:
   PG_BACKUPS_S3_BUCKET=<bucket-name>
 
 Recommended:
-  PG_SERVER_NAME=<stable-lineage-name>   # default: mlsecops
-  PG_CLUSTER_ID=<environment-id>         # default: local
+  PG_SERVER_NAME=<stable-lineage-name>
+  PG_CLUSTER_ID=<environment-id>
 
 Restore-specific overrides:
   RESTORE_SOURCE_SERVER_NAME=<existing-lineage-name>
@@ -1151,17 +1105,19 @@ Optional:
   IRSA_ROLE_ARN=<iam-role>
   AWS_ACCESS_KEY_ID=<key>
   AWS_SECRET_ACCESS_KEY=<secret>
+
+Artifacts:
+  ${COMMANDS_FILE} contains the current backup and restore commands.
 EOF
 }
 
-main(){
+main() {
   require_prereqs
   ensure_namespace
-
   local action="${1:-help}"
   shift || true
 
-  case "${action}" in
+  case "$action" in
     deploy)
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1215,12 +1171,13 @@ main(){
         shift
       done
 
-      case "${RESTORE_MODE}" in
+      case "$RESTORE_MODE" in
         none) deploy_fresh ;;
         latest|time) deploy_restore ;;
         *) fatal "restore requires --restore latest|time" ;;
       esac
       ;;
+
     backup)
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1241,9 +1198,9 @@ main(){
         esac
         shift
       done
-
       cmd_backup
       ;;
+
     destroy)
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1263,6 +1220,7 @@ main(){
       done
       cmd_destroy
       ;;
+
     status)
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1282,9 +1240,11 @@ main(){
       done
       cmd_status
       ;;
+
     help|-h|--help)
       show_help
       ;;
+
     *)
       fatal "unknown command: ${action}"
       ;;

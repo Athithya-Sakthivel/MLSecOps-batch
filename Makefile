@@ -1,15 +1,27 @@
 core:
 	kind delete cluster --name local-cluster || true && kind create cluster --name local-cluster && \
-	K8S_CLUSTER=kind bash src/infra/core/default_storage_class.sh && \
-	K8S_CLUSTER=kind bash src/infra/core/postgres_cluster.sh deploy
+	K8S_CLUSTER=kind bash src/infra/core/default_storage_class.sh
+	make pg
+
+pg:
+	K8S_CLUSTER=kind CREATE_INITIAL_BACKUP=false PG_CLUSTER_ID=cnpg-cluster-kind PG_SERVER_NAME=mlsecops \
+	bash src/infra/core/postgres_cluster.sh deploy
+
+
+pg-backup:
+	MODE=backup src/manifests/postgres/backup_and_restore_commands.sh
+
+pg-restore-latest:
+	MODE=restore src/manifests/postgres/backup_and_restore_commands.sh
+	
+pg-restore-time:
+	@test -n "$$TARGET_TIME" || (echo "ERROR: TARGET_TIME must be set (RFC3339)" && exit 1)
+	MODE=restore-time TARGET_TIME=$$TARGET_TIME src/manifests/postgres/backup_and_restore_commands.sh
+
 
 elt:
-	make core
 	bash src/infra/elt/iceberg.sh --rollout && bash src/infra/elt/spark_operator.sh --rollout && \
-	python3 src/infra/core/flyte_setup.py --rollout && bash src/workflows/ELT/run.sh && sleep 1800
-
-backup-pg:
-	bash src/infra/core/postgres_cluster.sh backup && aws s3 ls $$PG_BACKUPS_S3_BUCKET/postgres_backups/ --recursive
+	python3 src/infra/core/flyte_setup.py --rollout && bash src/workflows/ELT/run.sh && echo "sleep 1800" && sleep 1800 && kubectl get pods -A
 
 prune-elt:
 	bash src/infra/elt/spark_operator.sh --cleanup
@@ -21,8 +33,6 @@ train:
 prune-train:
 	python3 src/infra/train/mlflow_server.py --delete
 
-set-sa:
-	bash src/core/default_storage_class.sh
 
 tree:
 	tree -a -I '.git|.venv|archive|__pycache__|.venv_deploy|.venv_elt|.venv_train|.ruff_cache'

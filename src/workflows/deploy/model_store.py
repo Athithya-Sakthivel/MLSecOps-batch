@@ -11,12 +11,13 @@ import shutil
 import tempfile
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from string import hexdigits
 from typing import Any
 
 import fsspec
+import numpy as np
 import onnxruntime as ort
 from config import Settings
 
@@ -30,44 +31,22 @@ _MAX_SCHEMA_BYTES = 1_048_576
 _MAX_METADATA_BYTES = 1_048_576
 _LOCK_TIMEOUT_SECONDS = 300
 
+TARGET_TRANSFORM = "log1p"
+MAX_PREDICTION_SECONDS = 24.0 * 3600.0
+
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
-class ModelSchema:
-    feature_order: tuple[str, ...]
-    input_name: str | None = None
-    output_names: tuple[str, ...] = ()
-    allow_extra_features: bool = False
+def _stable_json_text(obj: dict[str, Any]) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
-@dataclass(frozen=True, slots=True)
-class ModelMetadata:
-    model_name: str | None = None
-    model_version: str | None = None
-    sha256: str | None = None
-    raw: dict[str, Any] | None = None
+def _canonical_json_text(obj: dict[str, Any]) -> str:
+    return _stable_json_text(obj)
 
 
-@dataclass(frozen=True, slots=True)
-class ModelBundleManifest:
-    format_version: int
-    source_uri: str
-    model_version: str | None
-    model_sha256: str
-    schema_sha256: str
-    metadata_sha256: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class LoadedModel:
-    model_path: Path
-    cache_dir: Path
-    schema: ModelSchema
-    metadata: ModelMetadata
-    session: ort.InferenceSession
-    input_name: str
-    output_names: tuple[str, ...]
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _normalize_sha256(value: Any, field_name: str) -> str:
@@ -80,6 +59,12 @@ def _normalize_sha256(value: Any, field_name: str) -> str:
     return normalized
 
 
+def _require_str(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
 def _optional_str(value: Any, field_name: str) -> str | None:
     if value is None:
         return None
@@ -88,48 +73,34 @@ def _optional_str(value: Any, field_name: str) -> str | None:
     return value.strip()
 
 
-def _canonical_json_text(obj: dict[str, Any]) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def _require_bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise RuntimeError(f"{field_name} must be a boolean")
+    return value
 
 
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _require_float(value: Any, field_name: str) -> float:
+    try:
+        return float(value)
+    except Exception as exc:
+        raise RuntimeError(f"{field_name} must be numeric") from exc
 
 
-def _cache_key(model_sha256: str, schema_sha256: str, model_version: str | None) -> str:
-    h = hashlib.sha256()
-    h.update(model_sha256.encode("utf-8"))
-    h.update(b"\0")
-    h.update(schema_sha256.encode("utf-8"))
-    h.update(b"\0")
-    h.update((model_version or "").encode("utf-8"))
-    return h.hexdigest()[:16]
+def _require_nonempty_str_list(values: Any, field_name: str) -> tuple[str, ...]:
+    if not isinstance(values, list) or not values:
+        raise RuntimeError(f"{field_name} must be a non-empty list")
 
-
-def _cache_dir(
-    settings: Settings,
-    model_sha256: str,
-    schema_sha256: str,
-    model_version: str | None,
-) -> Path:
-    cache_dir = Path(settings.model_cache_dir) / _cache_key(
-        model_sha256, schema_sha256, model_version
-    )
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
-
-
-def _bundle_source_paths(fs: fsspec.AbstractFileSystem, path: str) -> tuple[str, str, str]:
-    if path.endswith(".onnx") or fs.isfile(path):
-        model_src = path
-        root = posixpath.dirname(path)
-    else:
-        root = path.rstrip("/")
-        model_src = posixpath.join(root, _BUNDLE_MODEL_NAME)
-
-    schema_src = posixpath.join(root, _BUNDLE_SCHEMA_NAME)
-    metadata_src = posixpath.join(root, _BUNDLE_METADATA_NAME)
-    return model_src, schema_src, metadata_src
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(values):
+        if not isinstance(item, str) or not item.strip():
+            raise RuntimeError(f"{field_name}[{idx}] must be a non-empty string")
+        value = item.strip()
+        if value in seen:
+            raise RuntimeError(f"{field_name} contains duplicate value: {value}")
+        seen.add(value)
+        cleaned.append(value)
+    return tuple(cleaned)
 
 
 def _read_limited_text(src_fs: fsspec.AbstractFileSystem, src_path: str, max_bytes: int) -> str:
@@ -234,114 +205,344 @@ def _acquire_lock(lock_dir: Path, timeout_seconds: int = _LOCK_TIMEOUT_SECONDS) 
         shutil.rmtree(lock_dir, ignore_errors=True)
 
 
+def _bundle_source_paths(root_uri: str) -> tuple[str, str, str, str]:
+    root = root_uri.rstrip("/")
+    if root.endswith(".onnx"):
+        raise RuntimeError(
+            "MODEL_URI must point to the bundle root directory, not directly to model.onnx"
+        )
+
+    model_src = posixpath.join(root, _BUNDLE_MODEL_NAME)
+    schema_src = posixpath.join(root, _BUNDLE_SCHEMA_NAME)
+    metadata_src = posixpath.join(root, _BUNDLE_METADATA_NAME)
+    manifest_src = posixpath.join(root, _BUNDLE_MANIFEST_NAME)
+    return model_src, schema_src, metadata_src, manifest_src
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSchema:
+    schema_version: str
+    feature_version: str
+    target_transform: str
+    feature_order: tuple[str, ...]
+    input_name: str
+    output_names: tuple[str, ...]
+    allow_extra_features: bool
+    request_feature_order: tuple[str, ...]
+    engineered_feature_order: tuple[str, ...]
+    feature_order_hash: str
+    request_feature_order_hash: str
+    engineered_feature_order_hash: str
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "feature_version": self.feature_version,
+            "target_transform": self.target_transform,
+            "feature_order": list(self.feature_order),
+            "input_name": self.input_name,
+            "output_names": list(self.output_names),
+            "allow_extra_features": self.allow_extra_features,
+            "request_feature_order": list(self.request_feature_order),
+            "engineered_feature_order": list(self.engineered_feature_order),
+            "feature_order_hash": self.feature_order_hash,
+            "request_feature_order_hash": self.request_feature_order_hash,
+            "engineered_feature_order_hash": self.engineered_feature_order_hash,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ModelMetadata:
+    model_name: str
+    model_version: str
+    schema_version: str
+    feature_version: str
+    preprocessing_version: str
+    label_cap_seconds: float
+    category_levels: dict[str, list[int]]
+    request_feature_order: tuple[str, ...]
+    engineered_feature_order: tuple[str, ...]
+    bundle_contract: dict[str, Any] | None
+    artifact_plan: dict[str, Any] | None
+    raw: dict[str, Any]
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "model_version": self.model_version,
+            "schema_version": self.schema_version,
+            "feature_version": self.feature_version,
+            "preprocessing_version": self.preprocessing_version,
+            "label_cap_seconds": self.label_cap_seconds,
+            "category_levels": self.category_levels,
+            "request_feature_order": list(self.request_feature_order),
+            "engineered_feature_order": list(self.engineered_feature_order),
+            "bundle_contract": self.bundle_contract,
+            "artifact_plan": self.artifact_plan,
+            "raw": self.raw,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ModelBundleManifest:
+    format_version: int
+    source_uri: str
+    model_version: str
+    model_sha256: str
+    schema_sha256: str
+    metadata_sha256: str
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedModel:
+    model_path: Path
+    cache_dir: Path
+    schema: ModelSchema
+    metadata: ModelMetadata
+    manifest: ModelBundleManifest
+    session: PredictionTransformingSession
+    input_name: str
+    output_names: tuple[str, ...]
+
+
+def _cache_key(model_sha256: str, schema_sha256: str, model_version: str) -> str:
+    h = hashlib.sha256()
+    h.update(model_sha256.encode("utf-8"))
+    h.update(b"\0")
+    h.update(schema_sha256.encode("utf-8"))
+    h.update(b"\0")
+    h.update(model_version.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _cache_dir(
+    settings: Settings,
+    model_sha256: str,
+    schema_sha256: str,
+    model_version: str,
+) -> Path:
+    cache_dir = Path(settings.model_cache_dir) / _cache_key(model_sha256, schema_sha256, model_version)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
 def _parse_schema(raw: dict[str, Any]) -> ModelSchema:
-    feature_order_raw = raw.get("feature_order")
-    if not isinstance(feature_order_raw, list) or not feature_order_raw:
-        raise RuntimeError("schema.json must define a non-empty feature_order array")
+    schema_version = _require_str(raw.get("schema_version"), "schema_version")
+    feature_version = _require_str(raw.get("feature_version"), "feature_version")
+    target_transform = _require_str(raw.get("target_transform"), "target_transform")
+    if target_transform != TARGET_TRANSFORM:
+        raise RuntimeError(
+            f"schema.json target_transform must be {TARGET_TRANSFORM!r}, got {target_transform!r}"
+        )
 
-    feature_order: list[str] = []
-    seen: set[str] = set()
-    for idx, item in enumerate(feature_order_raw):
-        if not isinstance(item, str) or not item.strip():
-            raise RuntimeError(f"feature_order[{idx}] must be a non-empty string")
-        name = item.strip()
-        if name in seen:
-            raise RuntimeError(f"feature_order contains duplicate feature name: {name}")
-        seen.add(name)
-        feature_order.append(name)
+    feature_order = _require_nonempty_str_list(raw.get("feature_order"), "feature_order")
+    request_feature_order_raw = raw.get("request_feature_order", list(feature_order))
+    engineered_feature_order_raw = raw.get("engineered_feature_order", list(feature_order))
+    request_feature_order = _require_nonempty_str_list(
+        request_feature_order_raw, "request_feature_order"
+    )
+    engineered_feature_order = _require_nonempty_str_list(
+        engineered_feature_order_raw, "engineered_feature_order"
+    )
 
-    input_name = _optional_str(raw.get("input_name"), "input_name")
+    if feature_order != request_feature_order:
+        raise RuntimeError("schema.json feature_order and request_feature_order must match exactly")
+    if feature_order != engineered_feature_order:
+        raise RuntimeError("schema.json feature_order and engineered_feature_order must match exactly")
 
-    output_names_raw = raw.get("output_names")
-    if output_names_raw is None:
-        output_names: tuple[str, ...] = ()
-    elif not isinstance(output_names_raw, list):
-        raise RuntimeError("output_names must be a list when provided")
-    else:
-        outs: list[str] = []
-        out_seen: set[str] = set()
-        for idx, item in enumerate(output_names_raw):
-            if not isinstance(item, str) or not item.strip():
-                raise RuntimeError(f"output_names[{idx}] must be a non-empty string")
-            name = item.strip()
-            if name in out_seen:
-                raise RuntimeError(f"output_names contains duplicate output name: {name}")
-            out_seen.add(name)
-            outs.append(name)
-        output_names = tuple(outs)
+    input_name = _require_str(raw.get("input_name"), "input_name")
+    if input_name != "input":
+        raise RuntimeError(f"schema.json input_name must be 'input', got {input_name!r}")
 
-    allow_extra_features = raw.get("allow_extra_features", False)
-    if not isinstance(allow_extra_features, bool):
-        raise RuntimeError("allow_extra_features must be a boolean")
+    output_names = _require_nonempty_str_list(raw.get("output_names"), "output_names")
+
+    allow_extra_features = _require_bool(raw.get("allow_extra_features"), "allow_extra_features")
+    if allow_extra_features is not False:
+        raise RuntimeError("schema.json allow_extra_features must be false")
+
+    feature_order_hash = _require_str(raw.get("feature_order_hash"), "feature_order_hash")
+    request_feature_order_hash = _require_str(
+        raw.get("request_feature_order_hash"), "request_feature_order_hash"
+    )
+    engineered_feature_order_hash = _require_str(
+        raw.get("engineered_feature_order_hash"), "engineered_feature_order_hash"
+    )
+
+    if feature_order_hash != _sha256_text("\n".join(feature_order)):
+        raise RuntimeError("schema.json feature_order_hash mismatch")
+    if request_feature_order_hash != _sha256_text("\n".join(request_feature_order)):
+        raise RuntimeError("schema.json request_feature_order_hash mismatch")
+    if engineered_feature_order_hash != _sha256_text("\n".join(engineered_feature_order)):
+        raise RuntimeError("schema.json engineered_feature_order_hash mismatch")
 
     return ModelSchema(
+        schema_version=schema_version,
+        feature_version=feature_version,
+        target_transform=target_transform,
         feature_order=tuple(feature_order),
         input_name=input_name,
-        output_names=output_names,
+        output_names=tuple(output_names),
         allow_extra_features=allow_extra_features,
+        request_feature_order=tuple(request_feature_order),
+        engineered_feature_order=tuple(engineered_feature_order),
+        feature_order_hash=feature_order_hash,
+        request_feature_order_hash=request_feature_order_hash,
+        engineered_feature_order_hash=engineered_feature_order_hash,
     )
 
 
-def _parse_metadata(raw: dict[str, Any] | None) -> ModelMetadata:
-    if not raw:
-        return ModelMetadata(raw={})
+def _parse_metadata(raw: dict[str, Any]) -> ModelMetadata:
+    model_name = _require_str(raw.get("model_name"), "model_name")
+    model_version = _require_str(raw.get("model_version"), "model_version")
+    schema_version = _require_str(raw.get("schema_version"), "schema_version")
+    feature_version = _require_str(raw.get("feature_version"), "feature_version")
+    preprocessing_version = _require_str(raw.get("preprocessing_version"), "preprocessing_version")
+    label_cap_seconds = _require_float(raw.get("label_cap_seconds"), "label_cap_seconds")
+    if label_cap_seconds <= 0:
+        raise RuntimeError("label_cap_seconds must be > 0")
 
-    model_name = raw.get("model_name")
-    model_version = raw.get("model_version")
-    sha256 = raw.get("sha256")
+    request_feature_order = _require_nonempty_str_list(
+        raw.get("request_feature_order"), "request_feature_order"
+    )
+    engineered_feature_order = _require_nonempty_str_list(
+        raw.get("engineered_feature_order"), "engineered_feature_order"
+    )
+
+    category_levels_raw = raw.get("category_levels", {})
+    if not isinstance(category_levels_raw, dict):
+        raise RuntimeError("category_levels must be a JSON object")
+    category_levels: dict[str, list[int]] = {}
+    for key, values in category_levels_raw.items():
+        if not isinstance(key, str) or not key.strip():
+            raise RuntimeError("category_levels contains an invalid key")
+        if not isinstance(values, list):
+            raise RuntimeError(f"category_levels[{key!r}] must be a list")
+        cleaned: list[int] = []
+        for idx, item in enumerate(values):
+            if isinstance(item, bool):
+                raise RuntimeError(f"category_levels[{key!r}][{idx}] must be an integer")
+            try:
+                cleaned.append(int(item))
+            except Exception as exc:
+                raise RuntimeError(f"category_levels[{key!r}][{idx}] must be an integer") from exc
+        category_levels[key] = cleaned
+
+    bundle_contract_raw = raw.get("bundle_contract")
+    bundle_contract = bundle_contract_raw if isinstance(bundle_contract_raw, dict) else None
+
+    artifact_plan_raw = raw.get("artifact_plan")
+    artifact_plan = artifact_plan_raw if isinstance(artifact_plan_raw, dict) else None
+
+    if request_feature_order != engineered_feature_order:
+        raise RuntimeError("metadata request_feature_order and engineered_feature_order must match")
+    if schema_version != raw.get("schema_version"):
+        raise RuntimeError("metadata schema_version mismatch")
+    if feature_version != raw.get("feature_version"):
+        raise RuntimeError("metadata feature_version mismatch")
+    if preprocessing_version != raw.get("preprocessing_version"):
+        raise RuntimeError("metadata preprocessing_version mismatch")
 
     return ModelMetadata(
-        model_name=model_name if isinstance(model_name, str) else None,
-        model_version=model_version if isinstance(model_version, str) else None,
-        sha256=sha256 if isinstance(sha256, str) else None,
+        model_name=model_name,
+        model_version=model_version,
+        schema_version=schema_version,
+        feature_version=feature_version,
+        preprocessing_version=preprocessing_version,
+        label_cap_seconds=label_cap_seconds,
+        category_levels=category_levels,
+        request_feature_order=tuple(request_feature_order),
+        engineered_feature_order=tuple(engineered_feature_order),
+        bundle_contract=bundle_contract,
+        artifact_plan=artifact_plan,
         raw=raw,
     )
 
 
-def _manifest_dict(
-    *,
-    settings: Settings,
-    model_sha256: str,
-    schema_sha256: str,
-    metadata_sha256: str | None,
-) -> dict[str, Any]:
-    return {
-        "format_version": _BUNDLE_FORMAT_VERSION,
-        "source_uri": str(settings.model_uri),
-        "model_version": str(settings.model_version)
-        if settings.model_version is not None
-        else None,
-        "model_sha256": model_sha256,
-        "schema_sha256": schema_sha256,
-        "metadata_sha256": metadata_sha256,
-    }
+def _parse_manifest(raw: dict[str, Any]) -> ModelBundleManifest:
+    format_version = raw.get("format_version")
+    if format_version != _BUNDLE_FORMAT_VERSION:
+        raise RuntimeError(f"Unsupported bundle format version: {format_version!r}")
 
-
-def _load_manifest(path: Path) -> ModelBundleManifest:
-    raw = _read_json_object_from_path(path)
-    if raw.get("format_version") != _BUNDLE_FORMAT_VERSION:
-        raise RuntimeError(f"Unsupported bundle format version: {raw.get('format_version')}")
+    source_uri = _require_str(raw.get("source_uri"), "source_uri")
+    model_version = _require_str(raw.get("model_version"), "model_version")
+    model_sha256 = _normalize_sha256(raw.get("model_sha256"), "model_sha256")
+    schema_sha256 = _normalize_sha256(raw.get("schema_sha256"), "schema_sha256")
+    metadata_sha256 = _normalize_sha256(raw.get("metadata_sha256"), "metadata_sha256")
 
     return ModelBundleManifest(
-        format_version=int(raw["format_version"]),
-        source_uri=str(raw["source_uri"]),
-        model_version=raw.get("model_version")
-        if raw.get("model_version") is not None
-        else None,
-        model_sha256=_normalize_sha256(raw["model_sha256"], "manifest.model_sha256"),
-        schema_sha256=_normalize_sha256(raw["schema_sha256"], "manifest.schema_sha256"),
-        metadata_sha256=(
-            _normalize_sha256(raw["metadata_sha256"], "manifest.metadata_sha256")
-            if raw.get("metadata_sha256")
-            else None
-        ),
+        format_version=int(format_version),
+        source_uri=source_uri,
+        model_version=model_version,
+        model_sha256=model_sha256,
+        schema_sha256=schema_sha256,
+        metadata_sha256=metadata_sha256,
     )
+
+
+def _validate_bundle_consistency(
+    *,
+    schema: ModelSchema,
+    metadata: ModelMetadata,
+    manifest: ModelBundleManifest,
+    settings: Settings,
+) -> None:
+    expected_source_uri = str(settings.model_uri).rstrip("/")
+    if manifest.source_uri.rstrip("/") != expected_source_uri:
+        raise RuntimeError(
+            f"Manifest source_uri mismatch: expected {expected_source_uri!r}, got {manifest.source_uri!r}"
+        )
+
+    expected_model_version = _require_str(settings.model_version, "settings.model_version")
+    if manifest.model_version != expected_model_version:
+        raise RuntimeError(
+            f"Manifest model_version mismatch: expected {expected_model_version!r}, got {manifest.model_version!r}"
+        )
+    if metadata.model_version != expected_model_version:
+        raise RuntimeError(
+            f"Metadata model_version mismatch: expected {expected_model_version!r}, got {metadata.model_version!r}"
+        )
+
+    if schema.schema_version != metadata.schema_version:
+        raise RuntimeError("Schema and metadata schema_version mismatch")
+    if schema.feature_version != metadata.feature_version:
+        raise RuntimeError("Schema and metadata feature_version mismatch")
+    if schema.target_transform != TARGET_TRANSFORM:
+        raise RuntimeError(f"Schema target_transform must be {TARGET_TRANSFORM!r}")
+    if schema.feature_order != metadata.request_feature_order:
+        raise RuntimeError("Schema feature_order and metadata request_feature_order mismatch")
+    if schema.feature_order != metadata.engineered_feature_order:
+        raise RuntimeError("Schema feature_order and metadata engineered_feature_order mismatch")
+
+    if metadata.preprocessing_version != "matrix_identity_v1":
+        raise RuntimeError(
+            f"Metadata preprocessing_version must be 'matrix_identity_v1', got {metadata.preprocessing_version!r}"
+        )
+
+    if settings.model_sha256:
+        expected_model_sha256 = _normalize_sha256(settings.model_sha256, "settings.model_sha256")
+        if manifest.model_sha256 != expected_model_sha256:
+            raise RuntimeError(
+                f"Manifest model_sha256 mismatch: expected {expected_model_sha256!r}, got {manifest.model_sha256!r}"
+            )
 
 
 def _validate_bundle_files(cache_dir: Path) -> None:
     required = (
         cache_dir / _BUNDLE_MODEL_NAME,
         cache_dir / _BUNDLE_SCHEMA_NAME,
+        cache_dir / _BUNDLE_METADATA_NAME,
         cache_dir / _BUNDLE_MANIFEST_NAME,
     )
     missing = [str(path) for path in required if not path.is_file()]
@@ -349,101 +550,123 @@ def _validate_bundle_files(cache_dir: Path) -> None:
         raise FileNotFoundError(f"Incomplete cached bundle: {missing}")
 
 
-def _validate_manifest(
-    manifest: ModelBundleManifest,
-    *,
-    settings: Settings,
-    model_sha256: str,
-    schema_sha256: str,
-) -> None:
-    expected_source_uri = str(settings.model_uri)
-    expected_model_version = (
-        str(settings.model_version) if settings.model_version is not None else None
-    )
-
-    if manifest.source_uri != expected_source_uri:
-        raise RuntimeError(
-            f"Cached manifest source_uri mismatch: expected {expected_source_uri}, got {manifest.source_uri}"
-        )
-    if manifest.model_version != expected_model_version:
-        raise RuntimeError(
-            f"Cached manifest model_version mismatch: expected {expected_model_version}, got {manifest.model_version}"
-        )
-    if manifest.model_sha256 != model_sha256:
-        raise RuntimeError(
-            f"Cached manifest model_sha256 mismatch: expected {model_sha256}, got {manifest.model_sha256}"
-        )
-    if manifest.schema_sha256 != schema_sha256:
-        raise RuntimeError(
-            f"Cached manifest schema_sha256 mismatch: expected {schema_sha256}, got {manifest.schema_sha256}"
-        )
-
-
 def _cleanup_bundle(cache_dir: Path) -> None:
     shutil.rmtree(cache_dir, ignore_errors=True)
 
 
-def load_model_bundle(settings: Settings) -> tuple[Path, ModelSchema, ModelMetadata]:
+def _manifest_cache_key(manifest: ModelBundleManifest) -> str:
+    return _cache_key(manifest.model_sha256, manifest.schema_sha256, manifest.model_version)
+
+
+def _transform_prediction_outputs(
+    outputs: list[Any],
+    *,
+    prediction_cap_seconds: float,
+) -> list[Any]:
+    transformed: list[Any] = []
+
+    for output in outputs:
+        arr = np.asarray(output)
+
+        if arr.dtype.kind not in {"f", "i", "u"}:
+            transformed.append(output)
+            continue
+
+        if arr.ndim == 2 and arr.shape[1] == 1:
+            arr = arr.reshape(-1)
+
+        arr = arr.astype(np.float32, copy=False)
+        arr = np.expm1(arr)
+        arr = np.clip(arr, 0.0, prediction_cap_seconds).astype(np.float32, copy=False)
+        transformed.append(arr)
+
+    return transformed
+
+
+class PredictionTransformingSession:
+    def __init__(
+        self,
+        raw_session: ort.InferenceSession,
+        *,
+        target_transform: str,
+        prediction_cap_seconds: float,
+    ) -> None:
+        self._raw_session = raw_session
+        self._target_transform = target_transform
+        self._prediction_cap_seconds = prediction_cap_seconds
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw_session, name)
+
+    def get_inputs(self):
+        return self._raw_session.get_inputs()
+
+    def get_outputs(self):
+        return self._raw_session.get_outputs()
+
+    def run(self, output_names, input_feed, run_options=None):
+        outputs = self._raw_session.run(output_names, input_feed, run_options)
+        if self._target_transform == TARGET_TRANSFORM:
+            return _transform_prediction_outputs(
+                outputs,
+                prediction_cap_seconds=self._prediction_cap_seconds,
+            )
+        return outputs
+
+
+def load_model_bundle(settings: Settings) -> tuple[Path, ModelSchema, ModelMetadata, ModelBundleManifest]:
     """
     Materialize an immutable local bundle:
       bundle/
         model.onnx
         schema.json
-        metadata.json   (optional)
+        metadata.json
         manifest.json
     """
-    model_sha256 = _normalize_sha256(settings.model_sha256, "model_sha256")
+    root_uri = _require_str(settings.model_uri, "settings.model_uri")
+    model_src, schema_src, metadata_src, manifest_src = _bundle_source_paths(root_uri)
 
-    src_fs, src_path = fsspec.core.url_to_fs(settings.model_uri)
-    model_src, schema_src, metadata_src = _bundle_source_paths(src_fs, src_path)
-
-    logger.info(
-        "bundle.load.start",
-        extra={
-            "event": "bundle.load.start",
-            "model_uri": str(settings.model_uri),
-            "model_version": str(settings.model_version)
-            if settings.model_version is not None
-            else None,
-            "source_model_path": model_src,
-            "source_schema_path": schema_src,
-        },
-    )
-
+    src_fs, _ = fsspec.core.url_to_fs(root_uri)
     if not src_fs.exists(model_src):
-        logger.error(
-            "bundle.source_missing_model",
-            extra={
-                "event": "bundle.source_missing_model",
-                "model_uri": str(settings.model_uri),
-                "source_model_path": model_src,
-            },
-        )
-        raise FileNotFoundError(f"Model artifact not found: {settings.model_uri}")
-
+        raise FileNotFoundError(f"Model artifact not found: {model_src}")
     if not src_fs.exists(schema_src):
-        logger.error(
-            "bundle.source_missing_schema",
-            extra={
-                "event": "bundle.source_missing_schema",
-                "model_uri": str(settings.model_uri),
-                "source_schema_path": schema_src,
-            },
-        )
         raise FileNotFoundError(f"schema.json is required next to the model artifact: {schema_src}")
+    if not src_fs.exists(metadata_src):
+        raise FileNotFoundError(f"metadata.json is required next to the model artifact: {metadata_src}")
+    if not src_fs.exists(manifest_src):
+        raise FileNotFoundError(f"manifest.json is required next to the model artifact: {manifest_src}")
+
+    manifest_raw = _read_json_object_from_fs(src_fs, manifest_src, max_bytes=_MAX_SCHEMA_BYTES)
+    manifest = _parse_manifest(manifest_raw)
 
     schema_raw = _read_json_object_from_fs(src_fs, schema_src, max_bytes=_MAX_SCHEMA_BYTES)
-    schema = _parse_schema(schema_raw)
+    metadata_raw = _read_json_object_from_fs(src_fs, metadata_src, max_bytes=_MAX_METADATA_BYTES)
+
     schema_canonical = _canonical_json_text(schema_raw)
+    metadata_canonical = _canonical_json_text(metadata_raw)
+
     schema_sha256 = _sha256_text(schema_canonical)
+    metadata_sha256 = _sha256_text(metadata_canonical)
 
-    metadata_raw: dict[str, Any] | None = None
-    metadata_canonical_sha256: str | None = None
-    if src_fs.exists(metadata_src):
-        metadata_raw = _read_json_object_from_fs(src_fs, metadata_src, max_bytes=_MAX_METADATA_BYTES)
-        metadata_canonical_sha256 = _sha256_text(_canonical_json_text(metadata_raw))
+    if schema_sha256 != manifest.schema_sha256:
+        raise RuntimeError(
+            f"schema.json checksum mismatch for {root_uri}: expected {manifest.schema_sha256}, got {schema_sha256}"
+        )
+    if metadata_sha256 != manifest.metadata_sha256:
+        raise RuntimeError(
+            f"metadata.json checksum mismatch for {root_uri}: expected {manifest.metadata_sha256}, got {metadata_sha256}"
+        )
 
-    cache_dir = _cache_dir(settings, model_sha256, schema_sha256, settings.model_version)
+    schema = _parse_schema(schema_raw)
+    metadata = _parse_metadata(metadata_raw)
+    _validate_bundle_consistency(
+        schema=schema,
+        metadata=metadata,
+        manifest=manifest,
+        settings=settings,
+    )
+
+    cache_dir = _cache_dir(settings, manifest.model_sha256, schema_sha256, manifest.model_version)
     lock_dir = cache_dir.parent / f".{cache_dir.name}.lock"
     model_path = cache_dir / _BUNDLE_MODEL_NAME
     schema_path = cache_dir / _BUNDLE_SCHEMA_NAME
@@ -454,69 +677,59 @@ def load_model_bundle(settings: Settings) -> tuple[Path, ModelSchema, ModelMetad
         if cache_dir.exists():
             try:
                 _validate_bundle_files(cache_dir)
-                manifest = _load_manifest(manifest_path)
-                _validate_manifest(
-                    manifest,
-                    settings=settings,
-                    model_sha256=model_sha256,
-                    schema_sha256=schema_sha256,
-                )
-
+                cached_manifest = _parse_manifest(_read_json_object_from_path(manifest_path))
                 cached_schema_raw = _read_json_object_from_path(schema_path)
+                cached_metadata_raw = _read_json_object_from_path(metadata_path)
+
                 cached_schema_canonical = _canonical_json_text(cached_schema_raw)
+                cached_metadata_canonical = _canonical_json_text(cached_metadata_raw)
+
                 cached_schema_sha256 = _sha256_text(cached_schema_canonical)
-                if cached_schema_sha256 != schema_sha256:
-                    raise RuntimeError(
-                        f"Cached schema checksum mismatch for {settings.model_uri}: "
-                        f"expected {schema_sha256}, got {cached_schema_sha256}"
-                    )
-                cached_schema = _parse_schema(cached_schema_raw)
-
-                cached_metadata = _parse_metadata(None)
-                if metadata_path.is_file():
-                    cached_metadata_raw = _read_json_object_from_path(metadata_path)
-                    cached_metadata_canonical = _canonical_json_text(cached_metadata_raw)
-                    cached_metadata_sha256 = _sha256_text(cached_metadata_canonical)
-
-                    if manifest.metadata_sha256 is None:
-                        raise RuntimeError(
-                            f"Cached bundle unexpectedly contains metadata.json: {metadata_path}"
-                        )
-                    if cached_metadata_sha256 != manifest.metadata_sha256:
-                        raise RuntimeError(
-                            f"Cached metadata checksum mismatch for {settings.model_uri}: "
-                            f"expected {manifest.metadata_sha256}, got {cached_metadata_sha256}"
-                        )
-                    cached_metadata = _parse_metadata(cached_metadata_raw)
-                elif manifest.metadata_sha256 is not None:
-                    raise RuntimeError(
-                        f"Cached manifest expects metadata.json but file is missing: {metadata_path}"
-                    )
-
+                cached_metadata_sha256 = _sha256_text(cached_metadata_canonical)
                 cached_model_sha256 = _hash_file(model_path)
-                if cached_model_sha256 != model_sha256:
+
+                if cached_model_sha256 != cached_manifest.model_sha256:
                     raise RuntimeError(
-                        f"Cached model checksum mismatch for {settings.model_uri}: "
-                        f"expected {model_sha256}, got {cached_model_sha256}"
+                        f"Cached model checksum mismatch for {root_uri}: "
+                        f"expected {cached_manifest.model_sha256}, got {cached_model_sha256}"
                     )
+                if cached_schema_sha256 != cached_manifest.schema_sha256:
+                    raise RuntimeError(
+                        f"Cached schema checksum mismatch for {root_uri}: "
+                        f"expected {cached_manifest.schema_sha256}, got {cached_schema_sha256}"
+                    )
+                if cached_metadata_sha256 != cached_manifest.metadata_sha256:
+                    raise RuntimeError(
+                        f"Cached metadata checksum mismatch for {root_uri}: "
+                        f"expected {cached_manifest.metadata_sha256}, got {cached_metadata_sha256}"
+                    )
+
+                cached_schema = _parse_schema(cached_schema_raw)
+                cached_metadata = _parse_metadata(cached_metadata_raw)
+                _validate_bundle_consistency(
+                    schema=cached_schema,
+                    metadata=cached_metadata,
+                    manifest=cached_manifest,
+                    settings=settings,
+                )
 
                 logger.info(
                     "bundle.load.cache_hit",
                     extra={
                         "event": "bundle.load.cache_hit",
                         "cache_dir": str(cache_dir),
-                        "model_sha256": model_sha256,
-                        "schema_sha256": schema_sha256,
+                        "model_sha256": cached_manifest.model_sha256,
+                        "schema_sha256": cached_manifest.schema_sha256,
                     },
                 )
-                return model_path, cached_schema, cached_metadata
+                return model_path, cached_schema, cached_metadata, cached_manifest
             except Exception:
                 logger.exception(
                     "bundle.load.cache_invalid",
                     extra={
                         "event": "bundle.load.cache_invalid",
                         "cache_dir": str(cache_dir),
-                        "model_uri": str(settings.model_uri),
+                        "model_uri": root_uri,
                     },
                 )
                 _cleanup_bundle(cache_dir)
@@ -528,61 +741,52 @@ def load_model_bundle(settings: Settings) -> tuple[Path, ModelSchema, ModelMetad
             extra={
                 "event": "bundle.load.materialize_start",
                 "cache_dir": str(cache_dir),
-                "model_uri": str(settings.model_uri),
-                "model_sha256": model_sha256,
-                "schema_sha256": schema_sha256,
+                "model_uri": root_uri,
+                "model_sha256": manifest.model_sha256,
+                "schema_sha256": manifest.schema_sha256,
             },
         )
 
         try:
             actual_model_sha256 = _copy_with_hash(src_fs, model_src, model_path)
-            if actual_model_sha256 != model_sha256:
+            if actual_model_sha256 != manifest.model_sha256:
                 logger.error(
                     "bundle.load.checksum_mismatch",
                     extra={
                         "event": "bundle.load.checksum_mismatch",
                         "cache_dir": str(cache_dir),
-                        "model_uri": str(settings.model_uri),
-                        "expected_sha256": model_sha256,
+                        "model_uri": root_uri,
+                        "expected_sha256": manifest.model_sha256,
                         "actual_sha256": actual_model_sha256,
                     },
                 )
                 _cleanup_bundle(cache_dir)
                 raise RuntimeError(
-                    f"MODEL_SHA256 mismatch for {settings.model_uri}: "
-                    f"expected {model_sha256}, got {actual_model_sha256}"
+                    f"MODEL_SHA256 mismatch for {root_uri}: expected {manifest.model_sha256}, got {actual_model_sha256}"
                 )
 
-            _atomic_write_text(schema_path, schema_canonical)
-            if metadata_raw is not None:
-                _atomic_write_json(metadata_path, metadata_raw)
-
-            manifest = _manifest_dict(
-                settings=settings,
-                model_sha256=model_sha256,
-                schema_sha256=schema_sha256,
-                metadata_sha256=metadata_canonical_sha256,
-            )
-            _atomic_write_json(manifest_path, manifest)
+            _atomic_write_json(schema_path, schema_raw)
+            _atomic_write_json(metadata_path, metadata_raw)
+            _atomic_write_json(manifest_path, manifest.as_dict())
 
             logger.info(
                 "bundle.load.materialize_complete",
                 extra={
                     "event": "bundle.load.materialize_complete",
                     "cache_dir": str(cache_dir),
-                    "model_sha256": model_sha256,
-                    "schema_sha256": schema_sha256,
-                    "metadata_present": metadata_raw is not None,
+                    "model_sha256": manifest.model_sha256,
+                    "schema_sha256": manifest.schema_sha256,
+                    "metadata_present": True,
                 },
             )
-            return model_path, schema, _parse_metadata(metadata_raw)
+            return model_path, schema, metadata, manifest
         except Exception:
             logger.exception(
                 "bundle.load.materialize_failed",
                 extra={
                     "event": "bundle.load.materialize_failed",
                     "cache_dir": str(cache_dir),
-                    "model_uri": str(settings.model_uri),
+                    "model_uri": root_uri,
                 },
             )
             _cleanup_bundle(cache_dir)
@@ -686,7 +890,8 @@ def build_onnx_session(model_path: Path, settings: Settings) -> ort.InferenceSes
 
 
 def _resolve_session_io(
-    session: ort.InferenceSession, schema: ModelSchema
+    session: ort.InferenceSession,
+    schema: ModelSchema,
 ) -> tuple[str, tuple[str, ...]]:
     session_inputs = tuple(inp.name for inp in session.get_inputs())
     session_outputs = tuple(out.name for out in session.get_outputs())
@@ -699,69 +904,57 @@ def _resolve_session_io(
         logger.error("onnx.session.no_outputs", extra={"event": "onnx.session.no_outputs"})
         raise RuntimeError("The ONNX model declares no outputs")
 
-    if schema.input_name is not None:
-        if schema.input_name not in session_inputs:
-            logger.error(
-                "onnx.schema.input_missing",
-                extra={
-                    "event": "onnx.schema.input_missing",
-                    "schema_input_name": schema.input_name,
-                    "session_inputs": session_inputs,
-                },
-            )
-            raise RuntimeError(
-                f"Schema input_name '{schema.input_name}' not found in model inputs: {session_inputs}"
-            )
-        input_name = schema.input_name
-    elif len(session_inputs) == 1:
-        input_name = session_inputs[0]
-    else:
+    if schema.input_name not in session_inputs:
         logger.error(
-            "onnx.schema.input_ambiguous",
+            "onnx.schema.input_missing",
             extra={
-                "event": "onnx.schema.input_ambiguous",
+                "event": "onnx.schema.input_missing",
+                "schema_input_name": schema.input_name,
                 "session_inputs": session_inputs,
             },
         )
         raise RuntimeError(
-            f"The model has multiple inputs {session_inputs}, but schema.json does not define input_name"
+            f"Schema input_name '{schema.input_name}' not found in model inputs: {session_inputs}"
         )
 
-    if schema.output_names:
-        missing = [name for name in schema.output_names if name not in session_outputs]
-        if missing:
-            logger.error(
-                "onnx.schema.output_missing",
-                extra={
-                    "event": "onnx.schema.output_missing",
-                    "schema_output_names": schema.output_names,
-                    "missing_outputs": missing,
-                    "session_outputs": session_outputs,
-                },
-            )
-            raise RuntimeError(
-                f"Schema output_names not found in model outputs: {missing}. Available outputs: {session_outputs}"
-            )
-        output_names = schema.output_names
-    else:
-        output_names = session_outputs
+    missing = [name for name in schema.output_names if name not in session_outputs]
+    if missing:
+        logger.error(
+            "onnx.schema.output_missing",
+            extra={
+                "event": "onnx.schema.output_missing",
+                "schema_output_names": schema.output_names,
+                "missing_outputs": missing,
+                "session_outputs": session_outputs,
+            },
+        )
+        raise RuntimeError(
+            f"Schema output_names not found in model outputs: {missing}. Available outputs: {session_outputs}"
+        )
 
     logger.info(
         "onnx.session.io_resolved",
         extra={
             "event": "onnx.session.io_resolved",
-            "input_name": input_name,
-            "output_names": output_names,
+            "input_name": schema.input_name,
+            "output_names": schema.output_names,
         },
     )
-    return input_name, output_names
+    return schema.input_name, schema.output_names
 
 
 def load_loaded_model(settings: Settings) -> LoadedModel:
     start = time.perf_counter()
-    model_path, schema, metadata = load_model_bundle(settings)
-    session = build_onnx_session(model_path, settings)
-    input_name, output_names = _resolve_session_io(session, schema)
+    model_path, schema, metadata, manifest = load_model_bundle(settings)
+    raw_session = build_onnx_session(model_path, settings)
+    input_name, output_names = _resolve_session_io(raw_session, schema)
+
+    prediction_cap_seconds = min(float(metadata.label_cap_seconds), MAX_PREDICTION_SECONDS)
+    session = PredictionTransformingSession(
+        raw_session,
+        target_transform=schema.target_transform,
+        prediction_cap_seconds=prediction_cap_seconds,
+    )
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     logger.info(
@@ -772,9 +965,14 @@ def load_loaded_model(settings: Settings) -> LoadedModel:
             "cache_dir": str(model_path.parent),
             "model_name": metadata.model_name,
             "model_version": metadata.model_version,
+            "schema_version": schema.schema_version,
+            "feature_version": schema.feature_version,
             "elapsed_ms": elapsed_ms,
             "input_name": input_name,
             "output_names": output_names,
+            "label_cap_seconds": metadata.label_cap_seconds,
+            "prediction_cap_seconds": prediction_cap_seconds,
+            "manifest_model_sha256": manifest.model_sha256,
         },
     )
 
@@ -783,6 +981,7 @@ def load_loaded_model(settings: Settings) -> LoadedModel:
         cache_dir=model_path.parent,
         schema=schema,
         metadata=metadata,
+        manifest=manifest,
         session=session,
         input_name=input_name,
         output_names=output_names,

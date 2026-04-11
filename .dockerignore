@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+signoz.io
 # C extensions
 *.so
 .venv_train

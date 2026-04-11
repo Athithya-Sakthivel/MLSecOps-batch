@@ -159,6 +159,9 @@ celerybeat.pid
 *.sage.py
 tmp.md
 artifacts
+
+signoz.io
+
 # Environments
 .env
 .envrc

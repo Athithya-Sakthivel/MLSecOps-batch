@@ -9,4 +9,9 @@ python -m workflows.train.run register
 python -m workflows.train.run train
 
 # delete an execution by its id as input example afrr9jtjsj2fnnwnxm75
+
 # (lsof -i:30081 >/dev/null 2>&1 || (kubectl -n flyte port-forward svc/flyteadmin 30081:81 >/dev/null 2>&1 & sleep 2)) && read -p "Execution ID: " id && flytectl config init --host=127.0.0.1:30081 --insecure --force >/dev/null 2>&1 && flytectl delete execution "$id" -p flytesnacks -d development && kubectl delete pod -n flytesnacks-development -l execution-id="$id"
+
+# kubectl -n flyte port-forward svc/flyteadmin 30081:81
+
+# flytectl get execution a9qz7bx8ffkmf94nx5zw -p flytesnacks -d development --details
