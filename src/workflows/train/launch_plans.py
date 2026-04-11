@@ -11,7 +11,7 @@ DEFAULT_MAX_BOOST_ROUNDS = 5_000
 DEFAULT_MLFLOW_EXPERIMENT_NAME = "trip_eta_lgbm"
 DEFAULT_MAX_EVAL_ROWS = 100_000
 
-train_default_lp = LaunchPlan.get_or_create(
+TRAIN_WORKFLOW_LP_NAME = LaunchPlan.get_or_create(
     workflow=train,
     name="train_default",
     default_inputs={
@@ -22,3 +22,5 @@ train_default_lp = LaunchPlan.get_or_create(
         "max_eval_rows": DEFAULT_MAX_EVAL_ROWS,
     },
 )
+
+TRAIN_WORKFLOW_LP = TRAIN_WORKFLOW_LP_NAME

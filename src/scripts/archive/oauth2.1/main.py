@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 try:
@@ -163,7 +163,7 @@ async def consume_auth_transaction(pool: Pool, state: str) -> dict[str, Any]:
                 raise ValueError('invalid_state')
             if row['consumed_at'] is not None:
                 raise ValueError('state_consumed')
-            if row['expires_at'] < datetime.now(timezone.utc):
+            if row['expires_at'] < datetime.now(UTC):
                 raise ValueError('state_expired')
             await conn.execute('UPDATE auth_transactions SET consumed_at = now() WHERE state = $1', state)
             return dict(row)
@@ -245,7 +245,7 @@ async def find_or_create_user(pool: Pool, identity: dict[str, Any]) -> tuple[dic
 async def create_session(pool: Pool, *, user_id: str, ttl_seconds: int, ip_addr: str | None, user_agent: str | None) -> dict[str, Any]:
     session_id = str(uuid.uuid4())
     csrf_token = str(uuid.uuid4())
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    expires_at = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -281,7 +281,7 @@ async def get_session(pool: Pool, session_id: str) -> dict[str, Any] | None:
         )
         if not row:
             return None
-        if row['revoked_at'] is not None or row['expires_at'] < datetime.now(timezone.utc):
+        if row['revoked_at'] is not None or row['expires_at'] < datetime.now(UTC):
             return None
         return dict(row)
 

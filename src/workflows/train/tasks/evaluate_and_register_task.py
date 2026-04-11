@@ -5,7 +5,6 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
 
 import mlflow
 import mlflow.pyfunc
@@ -22,7 +21,6 @@ from workflows.train.shared_utils import (
     PREDICTION_COLUMN,
     PREPROCESSING_VERSION,
     TARGET_TRANSFORM,
-    TrainingResult,
     clip_seconds,
     download_file_from_s3,
     evenly_spaced_sample,
@@ -31,7 +29,6 @@ from workflows.train.shared_utils import (
     log_step,
     logger,
     ordered_columns_hash,
-    prepare_model_features,
     read_table_as_dataframe,
     sha256_file,
     split_train_test_by_date,
@@ -60,11 +57,23 @@ METADATA_FILENAME = "metadata.json"
 MANIFEST_FILENAME = "manifest.json"
 
 FALLBACK_EVAL_SAMPLE_CAP = 250_000
-PARITY_SAMPLE_ROWS = 128
 
 
-def _json_safe(value: Any) -> Any:
+def _json_safe(value: object) -> object:
     return json.loads(json.dumps(value, default=str))
+
+
+def _require_dict(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{name} must be an object")
+    return value
+
+
+def _load_json_file(path: Path) -> dict[str, object]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"{path} must contain a JSON object")
+    return raw
 
 
 def _numeric_metrics(metrics: dict[str, object]) -> dict[str, float]:
@@ -75,18 +84,11 @@ def _numeric_metrics(metrics: dict[str, object]) -> dict[str, float]:
     return out
 
 
-def _load_json_file(path: Path) -> dict[str, Any]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise RuntimeError(f"{path} must contain a JSON object")
-    return raw
-
-
 def _validate_bundle_contract(
     *,
-    schema_payload: dict[str, Any],
-    metadata_payload: dict[str, Any],
-    manifest_payload: dict[str, Any],
+    schema_payload: dict[str, object],
+    metadata_payload: dict[str, object],
+    manifest_payload: dict[str, object],
     artifact_plan_root: str,
     model_version: str,
 ) -> None:
@@ -124,9 +126,7 @@ def _validate_bundle_contract(
             f"metadata.json model_version must be {model_version!r}, got {metadata_payload.get('model_version')!r}"
         )
 
-    artifact_plan = metadata_payload.get("artifact_plan")
-    if not isinstance(artifact_plan, dict):
-        raise RuntimeError("metadata.json artifact_plan must be an object")
+    artifact_plan = _require_dict(metadata_payload.get("artifact_plan"), "metadata.json artifact_plan")
     if artifact_plan.get("artifact_root_s3_uri") != artifact_plan_root:
         raise RuntimeError(
             f"metadata.json artifact root mismatch: expected {artifact_plan_root!r}, got {artifact_plan.get('artifact_root_s3_uri')!r}"
@@ -140,8 +140,53 @@ def _validate_bundle_contract(
         raise RuntimeError("manifest.json format_version must be 1")
 
 
+def _coerce_eval_features(model_input: object, feature_order: list[str]) -> pd.DataFrame:
+    if isinstance(model_input, pd.DataFrame):
+        df = model_input.copy()
+    elif hasattr(model_input, "to_pandas"):
+        df = model_input.to_pandas()
+    else:
+        df = pd.DataFrame(model_input)
+
+    missing = [name for name in feature_order if name not in df.columns]
+    if missing:
+        raise ValueError(f"Missing model input columns: {missing}")
+
+    out = df[feature_order].copy()
+
+    for col_name in [
+        "pickup_hour",
+        "pickup_dow",
+        "pickup_month",
+        "pickup_is_weekend",
+        "pickup_borough_id",
+        "pickup_zone_id",
+        "pickup_service_zone_id",
+        "dropoff_borough_id",
+        "dropoff_zone_id",
+        "dropoff_service_zone_id",
+        "route_pair_id",
+    ]:
+        values = pd.to_numeric(out[col_name], errors="raise")
+        if values.isna().any():
+            raise ValueError(f"{col_name} contains nulls")
+        out[col_name] = values.astype("int32")
+
+    for col_name in [
+        "avg_duration_7d_zone_hour",
+        "avg_fare_30d_zone",
+        "trip_count_90d_zone_hour",
+    ]:
+        values = pd.to_numeric(out[col_name], errors="raise").astype("float32")
+        if np.isinf(values.to_numpy(dtype="float32", copy=False)).any():
+            raise ValueError(f"{col_name} contains infinite values")
+        out[col_name] = values
+
+    return out[feature_order]
+
+
 class Log1pFrozenMatrixPyFuncModel(mlflow.pyfunc.PythonModel):
-    def load_context(self, context: Any) -> None:
+    def load_context(self, context) -> None:
         schema_path = Path(context.artifacts["schema"])
         metadata_path = Path(context.artifacts["metadata"])
         manifest_path = Path(context.artifacts["manifest"])
@@ -159,11 +204,12 @@ class Log1pFrozenMatrixPyFuncModel(mlflow.pyfunc.PythonModel):
         metadata_payload = _load_json_file(metadata_path)
         manifest_payload = _load_json_file(manifest_path)
 
+        artifact_plan = _require_dict(metadata_payload.get("artifact_plan"), "metadata.json artifact_plan")
         _validate_bundle_contract(
             schema_payload=schema_payload,
             metadata_payload=metadata_payload,
             manifest_payload=manifest_payload,
-            artifact_plan_root=str(metadata_payload["artifact_plan"]["artifact_root_s3_uri"]),
+            artifact_plan_root=str(artifact_plan["artifact_root_s3_uri"]),
             model_version=str(metadata_payload["model_version"]),
         )
 
@@ -197,22 +243,9 @@ class Log1pFrozenMatrixPyFuncModel(mlflow.pyfunc.PythonModel):
             ordered_columns_hash(self._feature_order),
         )
 
-    def predict(self, context: Any, model_input: pd.DataFrame) -> pd.DataFrame:
-        if not isinstance(model_input, pd.DataFrame):
-            if hasattr(model_input, "to_pandas"):
-                model_input = model_input.to_pandas()
-            else:
-                model_input = pd.DataFrame(model_input)
-
-        missing = [name for name in self._feature_order if name not in model_input.columns]
-        if missing:
-            raise ValueError(f"Missing model input columns: {missing}")
-
-        features = prepare_model_features(
-            model_input[self._feature_order].copy(),
-            category_levels=None,
-        )
-        x = features[MATRIX_FEATURE_COLUMNS].to_numpy(dtype=np.float32, copy=False)
+    def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
+        features = _coerce_eval_features(model_input, self._feature_order)
+        x = features.to_numpy(dtype=np.float32, copy=False)
 
         outputs = self._session.run(None, {self._input_name: x})
         if not outputs:
@@ -238,16 +271,18 @@ def _downsample_for_evaluation(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     limits=Resources(cpu="2", mem="3Gi"),
 )
 def evaluate_and_register_task(
-    training_result: TrainingResult,
+    training_result_json: str,
     mlflow_experiment_name: str,
     max_eval_rows: int,
 ) -> str:
     if max_eval_rows < 1:
         raise ValueError("max_eval_rows must be >= 1")
 
-    artifact_plan = training_result.artifact_plan
-    bundle_contract = training_result.bundle_contract
-    bundle_metadata = training_result.bundle_metadata
+    training_result = _require_dict(json.loads(training_result_json), "training_result_json")
+    artifact_plan = _require_dict(training_result.get("artifact_plan"), "training_result_json.artifact_plan")
+    bundle_contract = _require_dict(training_result.get("bundle_contract"), "training_result_json.bundle_contract")
+    bundle_metadata = _require_dict(training_result.get("bundle_metadata"), "training_result_json.bundle_metadata")
+    elt_contract = _require_dict(training_result.get("elt_contract"), "training_result_json.elt_contract")
 
     with log_step("reload_iceberg_table_for_evaluation"):
         table = load_iceberg_table(ICEBERG_CATALOG_NAME, ICEBERG_REST_URI, ICEBERG_WAREHOUSE)
@@ -284,11 +319,11 @@ def evaluate_and_register_task(
     )
     logger.info(
         "artifact_plan root=%s model=%s schema=%s metadata=%s manifest=%s",
-        artifact_plan.artifact_root_s3_uri,
-        artifact_plan.model_s3_uri,
-        artifact_plan.schema_s3_uri,
-        artifact_plan.metadata_s3_uri,
-        artifact_plan.manifest_s3_uri,
+        artifact_plan["artifact_root_s3_uri"],
+        artifact_plan["model_s3_uri"],
+        artifact_plan["schema_s3_uri"],
+        artifact_plan["metadata_s3_uri"],
+        artifact_plan["manifest_s3_uri"],
     )
 
     with tempfile.TemporaryDirectory(prefix="trip_eta_eval_") as tmp:
@@ -299,10 +334,10 @@ def evaluate_and_register_task(
         manifest_local = tmpdir / MANIFEST_FILENAME
 
         with log_step("download_bundle_from_s3"):
-            download_file_from_s3(artifact_plan.model_s3_uri, onnx_local, use_iam=USE_IAM)
-            download_file_from_s3(artifact_plan.schema_s3_uri, schema_local, use_iam=USE_IAM)
-            download_file_from_s3(artifact_plan.metadata_s3_uri, metadata_local, use_iam=USE_IAM)
-            download_file_from_s3(artifact_plan.manifest_s3_uri, manifest_local, use_iam=USE_IAM)
+            download_file_from_s3(artifact_plan["model_s3_uri"], onnx_local, use_iam=USE_IAM)
+            download_file_from_s3(artifact_plan["schema_s3_uri"], schema_local, use_iam=USE_IAM)
+            download_file_from_s3(artifact_plan["metadata_s3_uri"], metadata_local, use_iam=USE_IAM)
+            download_file_from_s3(artifact_plan["manifest_s3_uri"], manifest_local, use_iam=USE_IAM)
 
         schema_payload = _load_json_file(schema_local)
         metadata_payload = _load_json_file(metadata_local)
@@ -312,8 +347,8 @@ def evaluate_and_register_task(
             schema_payload=schema_payload,
             metadata_payload=metadata_payload,
             manifest_payload=manifest_payload,
-            artifact_plan_root=artifact_plan.artifact_root_s3_uri,
-            model_version=training_result.model_version,
+            artifact_plan_root=str(artifact_plan["artifact_root_s3_uri"]),
+            model_version=str(training_result["model_version"]),
         )
 
         if sha256_file(onnx_local) != manifest_payload.get("model_sha256"):
@@ -324,12 +359,12 @@ def evaluate_and_register_task(
             raise RuntimeError("Downloaded metadata checksum does not match manifest.json")
 
         with log_step("mlflow_start_run_and_log"):
-            with mlflow.start_run(run_name=training_result.feature_version) as run:
+            with mlflow.start_run(run_name=str(training_result["feature_version"])) as run:
                 mlflow.set_tags(
                     {
-                        "table_identifier": training_result.table_identifier,
-                        "schema_version": training_result.schema_version,
-                        "feature_version": training_result.feature_version,
+                        "table_identifier": str(training_result["table_identifier"]),
+                        "schema_version": str(training_result["schema_version"]),
+                        "feature_version": str(training_result["feature_version"]),
                         "model_family": MODEL_FAMILY,
                         "target_transform": TARGET_TRANSFORM,
                     }
@@ -337,56 +372,56 @@ def evaluate_and_register_task(
 
                 mlflow.log_params(
                     {
-                        "table_identifier": training_result.table_identifier,
-                        "schema_version": training_result.schema_version,
-                        "feature_version": training_result.feature_version,
-                        "preprocessing_version": training_result.preprocessing_version,
+                        "table_identifier": str(training_result["table_identifier"]),
+                        "schema_version": str(training_result["schema_version"]),
+                        "feature_version": str(training_result["feature_version"]),
+                        "preprocessing_version": str(training_result["preprocessing_version"]),
                         "model_family": MODEL_FAMILY,
                         "target_transform": TARGET_TRANSFORM,
-                        "model_name": training_result.model_name,
-                        "model_version": training_result.model_version,
-                        "train_rows": training_result.train_rows,
-                        "test_rows": training_result.test_rows,
-                        "best_iteration_inner": training_result.best_iteration_inner,
-                        "final_num_boost_round": training_result.final_num_boost_round,
-                        "label_cap_seconds": training_result.label_cap_seconds,
-                        "train_label_p50_seconds": training_result.train_label_p50_seconds,
-                        "artifact_root_s3_uri": artifact_plan.artifact_root_s3_uri,
-                        "onnx_model_s3_uri": artifact_plan.model_s3_uri,
-                        "schema_s3_uri": artifact_plan.schema_s3_uri,
-                        "metadata_s3_uri": artifact_plan.metadata_s3_uri,
-                        "manifest_s3_uri": artifact_plan.manifest_s3_uri,
+                        "model_name": str(training_result["model_name"]),
+                        "model_version": str(training_result["model_version"]),
+                        "train_rows": int(training_result["train_rows"]),
+                        "test_rows": int(training_result["test_rows"]),
+                        "best_iteration_inner": int(training_result["best_iteration_inner"]),
+                        "final_num_boost_round": int(training_result["final_num_boost_round"]),
+                        "label_cap_seconds": float(training_result["label_cap_seconds"]),
+                        "train_label_p50_seconds": float(training_result["train_label_p50_seconds"]),
+                        "artifact_root_s3_uri": str(artifact_plan["artifact_root_s3_uri"]),
+                        "onnx_model_s3_uri": str(artifact_plan["model_s3_uri"]),
+                        "schema_s3_uri": str(artifact_plan["schema_s3_uri"]),
+                        "metadata_s3_uri": str(artifact_plan["metadata_s3_uri"]),
+                        "manifest_s3_uri": str(artifact_plan["manifest_s3_uri"]),
                         "request_feature_order_hash": ordered_columns_hash(
-                            training_result.request_feature_columns
+                            list(training_result["request_feature_columns"])
                         ),
                         "engineered_feature_order_hash": ordered_columns_hash(
-                            training_result.engineered_feature_columns
+                            list(training_result["engineered_feature_columns"])
                         ),
-                        "schema_hash": training_result.elt_contract.schema_hash,
-                        "source_silver_snapshot_id": training_result.elt_contract.source_silver_snapshot_id,
+                        "schema_hash": str(elt_contract["schema_hash"]),
+                        "source_silver_snapshot_id": str(elt_contract["source_silver_snapshot_id"]),
                         "use_iam": str(USE_IAM).lower(),
                     }
                 )
 
-                mlflow.log_metrics(_numeric_metrics(training_result.holdout_metrics))
+                mlflow.log_metrics(
+                    _numeric_metrics(_require_dict(training_result["holdout_metrics"], "training_result_json.holdout_metrics"))
+                )
+                holdout_baseline = _require_dict(
+                    training_result["holdout_baseline_metrics"],
+                    "training_result_json.holdout_baseline_metrics",
+                )
                 mlflow.log_metrics(
                     {
-                        "holdout_baseline_mae_seconds_capped": float(
-                            training_result.holdout_baseline_metrics["mae"]
-                        ),
-                        "holdout_baseline_rmse_seconds_capped": float(
-                            training_result.holdout_baseline_metrics["rmse"]
-                        ),
-                        "holdout_baseline_medae_seconds_capped": float(
-                            training_result.holdout_baseline_metrics["medae"]
-                        ),
+                        "holdout_baseline_mae_seconds_capped": float(holdout_baseline["mae"]),
+                        "holdout_baseline_rmse_seconds_capped": float(holdout_baseline["rmse"]),
+                        "holdout_baseline_medae_seconds_capped": float(holdout_baseline["medae"]),
                     }
                 )
 
-                mlflow.log_dict(_json_safe(training_result.as_dict()), "training_summary.json")
+                mlflow.log_text(training_result_json, "training_result.json")
                 mlflow.log_dict(_json_safe(bundle_contract), "bundle_contract.json")
                 mlflow.log_dict(_json_safe(bundle_metadata), "bundle_metadata.json")
-                mlflow.log_dict(_json_safe(artifact_plan.as_dict()), "artifact_plan.json")
+                mlflow.log_dict(_json_safe(artifact_plan), "artifact_plan.json")
 
                 mlflow.log_artifact(str(onnx_local), artifact_path="bundle")
                 mlflow.log_artifact(str(schema_local), artifact_path="bundle")
@@ -428,7 +463,7 @@ def evaluate_and_register_task(
                 result = {
                     "run_id": run.info.run_id,
                     "model_uri": model_info.model_uri,
-                    "artifact_plan": artifact_plan.as_dict(),
+                    "artifact_plan": artifact_plan,
                     "evaluation_metrics": _numeric_metrics(eval_result.metrics),
                 }
 

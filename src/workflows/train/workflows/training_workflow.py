@@ -16,19 +16,20 @@ def train(
     max_eval_rows: int = 100_000,
 ) -> str:
     """
-    Train, evaluate, and register the frozen-matrix model bundle.
+    Orchestrates training, evaluation, and registration.
 
-    The workflow is orchestration only:
-    1. train_model_task() fits the model and publishes the bundle
-    2. evaluate_and_register_task() evaluates the published bundle and logs registration metadata
+    The train task returns a JSON string. The evaluation task consumes that JSON
+    string directly, which keeps the Flyte boundary simple and avoids schema
+    extraction issues from nested dynamic types.
     """
-    training_result = train_model_task(
+    training_result_json = train_model_task(
         train_num_threads=train_num_threads,
         tuning_sample_rows=tuning_sample_rows,
         max_boost_rounds=max_boost_rounds,
     )
+
     return evaluate_and_register_task(
-        training_result=training_result,
+        training_result_json=training_result_json,
         mlflow_experiment_name=mlflow_experiment_name,
         max_eval_rows=max_eval_rows,
     )

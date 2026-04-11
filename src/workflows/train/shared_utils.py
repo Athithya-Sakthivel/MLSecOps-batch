@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +7,8 @@ import math
 import os
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -21,6 +21,9 @@ import pandas as pd
 import polars as pl
 from pyiceberg.catalog import load_catalog
 from sklearn.metrics import mean_absolute_error, mean_squared_error, median_absolute_error
+
+type JsonPrimitive = str | int | float | bool | None
+type JsonValue = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
 
@@ -39,6 +42,22 @@ def configure_logging() -> None:
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def log_step(step_name: str) -> Iterator[None]:
+    started = time.perf_counter()
+    logger.info("%s started", step_name)
+    try:
+        yield
+    except Exception:
+        elapsed = time.perf_counter() - started
+        logger.exception("%s failed after %.2fs", step_name, elapsed)
+        raise
+    else:
+        elapsed = time.perf_counter() - started
+        logger.info("%s completed in %.2fs", step_name, elapsed)
+
 
 # ---------------------------------------------------------------------
 # Core ELT / training contract
@@ -69,7 +88,7 @@ MAX_BOOST_ROUNDS = 20_000
 EARLY_STOPPING_ROUNDS = 150
 DEFAULT_TARGET_OPSET = 17
 
-# The frozen matrix contract from ELT.
+# Frozen matrix contract from ELT.
 MATRIX_FEATURE_COLUMNS = [
     "pickup_hour",
     "pickup_dow",
@@ -174,9 +193,13 @@ def ordered_columns_hash(columns: Sequence[str]) -> str:
     return sha256_text("\n".join(columns))
 
 
-def write_json(path: Path, payload: object) -> None:
+def write_json(path: Path, payload: JsonValue) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_stable_json_dumps(payload), encoding="utf-8")
+    if isinstance(payload, str):
+        text = payload
+    else:
+        text = _stable_json_dumps(payload)
+    path.write_text(text, encoding="utf-8")
 
 
 def _validate_sha256_hex(value: object, field_name: str) -> str:
@@ -191,15 +214,6 @@ def _validate_sha256_hex(value: object, field_name: str) -> str:
         raise RuntimeError(f"{field_name} must contain only lowercase hex characters")
 
     return normalized
-
-
-def _validate_json_text(value: object, field_name: str) -> object:
-    if not isinstance(value, str) or not value.strip():
-        raise RuntimeError(f"{field_name} must be a non-empty JSON string")
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"{field_name} must contain valid JSON") from exc
 
 
 def _require_nonempty_str(value: object, field_name: str) -> str:
@@ -217,13 +231,6 @@ def _require_int(value: object, field_name: str) -> int:
         raise RuntimeError(f"{field_name} must be an integer") from exc
 
 
-def _require_float(value: object, field_name: str) -> float:
-    try:
-        return float(value)
-    except Exception as exc:
-        raise RuntimeError(f"{field_name} must be numeric") from exc
-
-
 def _require_sequence_of_str(values: Sequence[str], field_name: str) -> tuple[str, ...]:
     cleaned: list[str] = []
     seen: set[str] = set()
@@ -238,6 +245,17 @@ def _require_sequence_of_str(values: Sequence[str], field_name: str) -> tuple[st
     if not cleaned:
         raise RuntimeError(f"{field_name} must not be empty")
     return tuple(cleaned)
+
+
+def _timestamp_to_iso8601(value: object) -> str:
+    ts = pd.Timestamp(value)
+    if pd.isna(ts):
+        raise RuntimeError("created_ts must be a valid timestamp")
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts.isoformat()
 
 
 def _read_iceberg_table_as_dataframe(
@@ -297,7 +315,7 @@ def download_file_from_s3(s3_uri: str, local_path: Path, *, use_iam: bool) -> Pa
     return local_path
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class ELTContract:
     run_id: str
     feature_version: str
@@ -314,7 +332,7 @@ class ELTContract:
     encoding_spec_json: str
     aggregate_spec_json: str
     label_spec_json: str
-    created_ts: object
+    created_ts: str
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.run_id, "run_id")
@@ -329,23 +347,23 @@ class ELTContract:
         if self.training_row_count <= 0:
             raise RuntimeError("training_row_count must be > 0")
 
-        output_columns = _validate_json_text(self.output_columns_json, "output_columns_json")
+        output_columns = json.loads(self.output_columns_json)
         if not isinstance(output_columns, list) or not output_columns:
             raise RuntimeError("output_columns_json must be a non-empty JSON array")
 
-        _validate_json_text(self.feature_spec_json, "feature_spec_json")
-        _validate_json_text(self.encoding_spec_json, "encoding_spec_json")
-        _validate_json_text(self.aggregate_spec_json, "aggregate_spec_json")
-        _validate_json_text(self.label_spec_json, "label_spec_json")
+        json.loads(self.feature_spec_json)
+        json.loads(self.encoding_spec_json)
+        json.loads(self.aggregate_spec_json)
+        json.loads(self.label_spec_json)
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self) -> dict[str, JsonValue]:
         return asdict(self)
 
     def to_json(self) -> str:
         return _stable_json_dumps(asdict(self))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SnapshotLineage:
     table_uuid: str
     table_location: str
@@ -354,14 +372,11 @@ class SnapshotLineage:
     metadata_location: str
     format_version: int
 
-    def __getitem__(self, key: str):
-        return getattr(self, key)
-
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self) -> dict[str, JsonValue]:
         return asdict(self)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class CandidateConfig:
     name: str
     learning_rate: float
@@ -373,14 +388,11 @@ class CandidateConfig:
     reg_alpha: float
     reg_lambda: float
 
-    def __getitem__(self, key: str):
-        return getattr(self, key)
-
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self) -> dict[str, JsonValue]:
         return asdict(self)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class CandidateReport:
     name: str
     params: CandidateConfig
@@ -388,14 +400,11 @@ class CandidateReport:
     metrics: dict[str, float]
     score: float
 
-    def __getitem__(self, key: str):
-        return getattr(self, key)
-
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self) -> dict[str, JsonValue]:
         return asdict(self)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class BundleArtifactPlan:
     artifact_root_s3_uri: str
     model_s3_uri: str
@@ -403,14 +412,11 @@ class BundleArtifactPlan:
     metadata_s3_uri: str
     manifest_s3_uri: str
 
-    def __getitem__(self, key: str):
-        return getattr(self, key)
-
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self) -> dict[str, JsonValue]:
         return asdict(self)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SplitFrames:
     train_eval: pd.DataFrame
     test: pd.DataFrame
@@ -418,7 +424,7 @@ class SplitFrames:
     test_start_date: str
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class TrainingResult:
     table_identifier: str
     schema_version: str
@@ -445,15 +451,14 @@ class TrainingResult:
     model_feature_columns: list[str]
     model_name: str
     model_version: str
-    bundle_contract: dict[str, object]
-    bundle_metadata: dict[str, object]
+    bundle_contract: str
+    bundle_metadata: str
     artifact_plan: BundleArtifactPlan
 
     def to_json(self) -> str:
-        payload = asdict(self)
-        return _stable_json_dumps(payload)
+        return _stable_json_dumps(asdict(self))
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self) -> dict[str, JsonValue]:
         return asdict(self)
 
 
@@ -475,23 +480,20 @@ def validate_contract_dataframe(df: pd.DataFrame) -> None:
             f"Actual:   {list(df.columns)}"
         )
 
-    required_non_null = CONTRACT_COLUMNS
-    for col_name in required_non_null:
+    for col_name in CONTRACT_COLUMNS:
         if df[col_name].isna().any():
             raise ValueError(f"{col_name} contains nulls but is required to be non-null.")
 
     _validate_sha256_hex(df["schema_hash"].iloc[0], "schema_hash")
 
-    output_columns = _validate_json_text(df["output_columns_json"].iloc[0], "output_columns_json")
+    output_columns = json.loads(df["output_columns_json"].iloc[0])
     if not isinstance(output_columns, list) or output_columns != EXPECTED_COLUMNS:
-        raise ValueError(
-            "output_columns_json does not match the expected frozen matrix columns."
-        )
+        raise ValueError("output_columns_json does not match the expected frozen matrix columns.")
 
-    _validate_json_text(df["feature_spec_json"].iloc[0], "feature_spec_json")
-    _validate_json_text(df["encoding_spec_json"].iloc[0], "encoding_spec_json")
-    _validate_json_text(df["aggregate_spec_json"].iloc[0], "aggregate_spec_json")
-    _validate_json_text(df["label_spec_json"].iloc[0], "label_spec_json")
+    json.loads(df["feature_spec_json"].iloc[0])
+    json.loads(df["encoding_spec_json"].iloc[0])
+    json.loads(df["aggregate_spec_json"].iloc[0])
+    json.loads(df["label_spec_json"].iloc[0])
 
     if int(df["training_row_count"].iloc[0]) <= 0:
         raise ValueError("training_row_count must be > 0")
@@ -516,7 +518,7 @@ def _contract_row_to_dataclass(row: pd.Series) -> ELTContract:
         encoding_spec_json=_require_nonempty_str(row["encoding_spec_json"], "encoding_spec_json"),
         aggregate_spec_json=_require_nonempty_str(row["aggregate_spec_json"], "aggregate_spec_json"),
         label_spec_json=_require_nonempty_str(row["label_spec_json"], "label_spec_json"),
-        created_ts=row["created_ts"],
+        created_ts=_timestamp_to_iso8601(row["created_ts"]),
     )
 
 
@@ -553,7 +555,7 @@ def build_bundle_contract(
     preprocessing_version: str = PREPROCESSING_VERSION,
     target_transform: str = TARGET_TRANSFORM,
     allow_extra_features: bool = False,
-) -> dict[str, object]:
+) -> str:
     feature_order_tuple = _require_sequence_of_str(feature_order, "feature_order")
     request_feature_order_tuple = _require_sequence_of_str(
         request_feature_order, "request_feature_order"
@@ -568,7 +570,7 @@ def build_bundle_contract(
     if feature_order_tuple != engineered_feature_order_tuple:
         raise ValueError("feature_order and engineered_feature_order must match exactly")
 
-    return {
+    payload = {
         "schema_version": schema_version,
         "feature_version": feature_version,
         "preprocessing_version": preprocessing_version,
@@ -583,6 +585,7 @@ def build_bundle_contract(
         "request_feature_order_hash": ordered_columns_hash(request_feature_order_tuple),
         "engineered_feature_order_hash": ordered_columns_hash(engineered_feature_order_tuple),
     }
+    return _stable_json_dumps(payload)
 
 
 def build_bundle_metadata(
@@ -592,7 +595,7 @@ def build_bundle_metadata(
     artifact_plan: BundleArtifactPlan,
     model_name: str,
     model_version: str,
-    bundle_contract: dict[str, object],
+    bundle_contract_json: str,
     category_levels: dict[str, list[int]],
     selected_candidate: CandidateConfig,
     candidate_reports: Sequence[CandidateReport],
@@ -606,8 +609,10 @@ def build_bundle_metadata(
     final_num_boost_round: int,
     train_rows: int,
     test_rows: int,
-) -> dict[str, object]:
-    return {
+) -> str:
+    bundle_contract = json.loads(bundle_contract_json)
+
+    payload = {
         "run_id": elt_contract.run_id,
         "feature_version": elt_contract.feature_version,
         "schema_version": elt_contract.schema_version,
@@ -647,6 +652,7 @@ def build_bundle_metadata(
         "train_rows": int(train_rows),
         "test_rows": int(test_rows),
     }
+    return _stable_json_dumps(payload)
 
 
 def load_iceberg_table(
@@ -874,6 +880,7 @@ def prepare_model_features(
     raw_df: pd.DataFrame,
     category_levels: dict[str, list[int]] | None = None,
 ) -> pd.DataFrame:
+    _ = category_levels
     missing = [col for col in MATRIX_FEATURE_COLUMNS if col not in raw_df.columns]
     if missing:
         raise ValueError(f"Missing model input columns: {missing}")
@@ -986,8 +993,8 @@ def fit_lgbm_candidate(
         }
     )
 
-    train_prepared = prepare_training_frame(train_df, category_levels=category_levels)
-    val_prepared = prepare_training_frame(val_df, category_levels=category_levels)
+    train_prepared = prepare_training_frame(train_df, category_levels)
+    val_prepared = prepare_training_frame(val_df, category_levels)
 
     train_X = train_prepared[MATRIX_FEATURE_COLUMNS]
     val_X = val_prepared[MATRIX_FEATURE_COLUMNS]
@@ -1145,7 +1152,7 @@ def build_training_result(
         artifact_plan=artifact_plan,
         model_name=model_name,
         model_version=model_version,
-        bundle_contract=bundle_contract,
+        bundle_contract_json=bundle_contract,
         category_levels=category_levels,
         selected_candidate=selected_candidate,
         candidate_reports=candidate_reports,

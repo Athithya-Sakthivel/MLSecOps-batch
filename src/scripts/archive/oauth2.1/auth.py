@@ -4,7 +4,7 @@ import base64
 import hashlib
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
 
@@ -77,7 +77,7 @@ def _provider_scope(settings: Settings, provider: str) -> str:
 
 
 async def _fetch_json(url: str) -> dict[str, Any]:
-    now = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(UTC).timestamp()
     cached = _DISCOVERY_CACHE.get(url)
     if cached and cached[0] > now:
         return cached[1]

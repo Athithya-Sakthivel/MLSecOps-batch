@@ -14,7 +14,6 @@ from flytekit import Resources, task
 
 from workflows.train.shared_utils import (
     CANDIDATE_CONFIGS,
-    EXPECTED_COLUMNS,
     EXPECTED_FEATURE_VERSION,
     EXPECTED_SCHEMA_VERSION,
     INNER_VALIDATION_FRACTION,
@@ -74,17 +73,27 @@ MANIFEST_FILENAME = "manifest.json"
 
 FALLBACK_EVAL_SAMPLE_CAP = 250_000
 PARITY_SAMPLE_ROWS = 128
-ALLOWED_NULL_COLUMNS = {"avg_duration_7d_zone_hour", "avg_fare_30d_zone"}
 
 
 def _validate_training_dataframe(df: pd.DataFrame, elt_contract: ELTContract) -> None:
+    expected_columns = [
+        "trip_id",
+        "pickup_ts",
+        "as_of_ts",
+        "as_of_date",
+        "schema_version",
+        "feature_version",
+        *MATRIX_FEATURE_COLUMNS,
+        LABEL_COLUMN,
+    ]
+
     if df.empty:
         raise ValueError("Gold dataset is empty.")
 
-    if list(df.columns) != EXPECTED_COLUMNS:
+    if list(df.columns) != expected_columns:
         raise ValueError(
             "Gold schema mismatch.\n"
-            f"Expected: {EXPECTED_COLUMNS}\n"
+            f"Expected: {expected_columns}\n"
             f"Actual:   {list(df.columns)}"
         )
 
@@ -131,7 +140,7 @@ def _validate_training_dataframe(df: pd.DataFrame, elt_contract: ELTContract) ->
         if df[col_name].isna().any():
             raise ValueError(f"{col_name} contains nulls but is required to be non-null.")
 
-    for col_name in ALLOWED_NULL_COLUMNS:
+    for col_name in ["avg_duration_7d_zone_hour", "avg_fare_30d_zone"]:
         if col_name not in df.columns:
             raise ValueError(f"{col_name} is missing from the dataset.")
 
@@ -159,10 +168,10 @@ def _validate_training_dataframe(df: pd.DataFrame, elt_contract: ELTContract) ->
         if (pd.to_numeric(df[col_name], errors="coerce") < 0).any():
             raise ValueError(f"{col_name} contains negative values.")
 
-    for col_name in ALLOWED_NULL_COLUMNS:
+    for col_name in ["avg_duration_7d_zone_hour", "avg_fare_30d_zone"]:
         series = pd.to_numeric(df[col_name], errors="coerce")
-        finite_mask = series.notna()
-        if np.isinf(series[finite_mask].to_numpy(dtype="float64", copy=False)).any():
+        finite = series.dropna().to_numpy(dtype="float64", copy=False)
+        if np.isinf(finite).any():
             raise ValueError(f"{col_name} contains infinite values.")
 
 
@@ -196,22 +205,12 @@ def _prepare_matrix_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
         "avg_fare_30d_zone",
         "trip_count_90d_zone_hour",
     ]:
-        values = pd.to_numeric(out[col_name], errors="coerce").astype("float32")
-        if col_name == "trip_count_90d_zone_hour" and values.isna().any():
-            raise ValueError(f"{col_name} must not contain nulls")
+        values = pd.to_numeric(out[col_name], errors="raise").astype("float32")
         if np.isinf(values.to_numpy(dtype="float32", copy=False)).any():
             raise ValueError(f"{col_name} contains infinite values")
         out[col_name] = values
 
     return out[MATRIX_FEATURE_COLUMNS]
-
-
-def _prepare_training_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
-    features = _prepare_matrix_frame(raw_df)
-    label = pd.to_numeric(raw_df[LABEL_COLUMN], errors="raise").astype("float32")
-    frame = features.copy()
-    frame[LABEL_COLUMN] = label.to_numpy(dtype="float32")
-    return frame[[*MATRIX_FEATURE_COLUMNS, LABEL_COLUMN]]
 
 
 def _fit_lgbm_candidate(
@@ -236,13 +235,13 @@ def _fit_lgbm_candidate(
         }
     )
 
-    train_prepared = _prepare_training_frame(train_df)
-    val_prepared = _prepare_training_frame(val_df)
+    train_prepared = _prepare_matrix_frame(train_df)
+    val_prepared = _prepare_matrix_frame(val_df)
 
     train_X = train_prepared[MATRIX_FEATURE_COLUMNS]
     val_X = val_prepared[MATRIX_FEATURE_COLUMNS]
-    y_train_raw = train_prepared[LABEL_COLUMN].to_numpy(dtype="float32")
-    y_val_raw = val_prepared[LABEL_COLUMN].to_numpy(dtype="float32")
+    y_train_raw = pd.to_numeric(train_df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
+    y_val_raw = pd.to_numeric(val_df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
 
     y_train = to_log_target(y_train_raw, label_cap_seconds)
     y_val = to_log_target(y_val_raw, label_cap_seconds)
@@ -425,7 +424,11 @@ def _onnx_output_names(onnx_model: object) -> list[str]:
     graph = getattr(onnx_model, "graph", None)
     if graph is None:
         raise RuntimeError("Exported ONNX model does not expose a graph")
-    output_names = [str(output.name).strip() for output in getattr(graph, "output", []) if str(output.name).strip()]
+    output_names = [
+        str(output.name).strip()
+        for output in getattr(graph, "output", [])
+        if str(output.name).strip()
+    ]
     if not output_names:
         raise RuntimeError("Exported ONNX model does not declare any outputs")
     if len(set(output_names)) != len(output_names):
@@ -450,10 +453,7 @@ def _materialize_training_bundle(
 
     onnx.save_model(onnx_model, str(model_path))
 
-    schema_payload = dict(training_result.bundle_contract)
-    if "output_names" not in schema_payload or not schema_payload["output_names"]:
-        raise RuntimeError("bundle_contract must include output_names")
-    write_json(schema_path, schema_payload)
+    write_json(schema_path, training_result.bundle_contract)
     write_json(metadata_path, training_result.bundle_metadata)
 
     model_sha256 = sha256_file(model_path)
@@ -476,8 +476,6 @@ def _materialize_training_bundle(
         raise RuntimeError("schema.json checksum validation failed after write")
     if sha256_file(metadata_path) != metadata_sha256:
         raise RuntimeError("metadata.json checksum validation failed after write")
-    if sha256_file(manifest_path) != sha256_file(manifest_path):
-        raise RuntimeError("manifest.json checksum validation failed after write")
 
     return model_path, schema_path, metadata_path, manifest_path
 
@@ -497,7 +495,10 @@ def _verify_onnx_parity(
     features = _prepare_matrix_frame(sample)
     x = features.to_numpy(dtype=np.float32, copy=False)
 
-    native_log = np.asarray(final_model.predict(features, num_iteration=best_iteration), dtype=np.float32).reshape(-1)
+    native_log = np.asarray(
+        final_model.predict(features, num_iteration=best_iteration),
+        dtype=np.float32,
+    ).reshape(-1)
 
     session = ort.InferenceSession(str(onnx_model_path), providers=["CPUExecutionProvider"])
     inputs = session.get_inputs()
@@ -532,11 +533,13 @@ def train_model_task(
     train_num_threads: int,
     tuning_sample_rows: int,
     max_boost_rounds: int,
-) -> TrainingResult:
+) -> str:
     if train_num_threads < 1:
         raise ValueError("train_num_threads must be >= 1")
     if train_num_threads > 3:
-        raise ValueError("train_num_threads must be <= 3 to stay within quota and avoid oversubscription")
+        raise ValueError(
+            "train_num_threads must be <= 3 to stay within quota and avoid oversubscription"
+        )
     if tuning_sample_rows < 1:
         raise ValueError("tuning_sample_rows must be >= 1")
     if max_boost_rounds < 1:
@@ -550,13 +553,11 @@ def train_model_task(
         )
         if elt_contract.schema_version != EXPECTED_SCHEMA_VERSION:
             raise RuntimeError(
-                f"Unexpected schema_version {elt_contract.schema_version!r}; "
-                f"expected {EXPECTED_SCHEMA_VERSION!r}"
+                f"Unexpected schema_version {elt_contract.schema_version!r}; expected {EXPECTED_SCHEMA_VERSION!r}"
             )
         if elt_contract.feature_version != EXPECTED_FEATURE_VERSION:
             raise RuntimeError(
-                f"Unexpected feature_version {elt_contract.feature_version!r}; "
-                f"expected {EXPECTED_FEATURE_VERSION!r}"
+                f"Unexpected feature_version {elt_contract.feature_version!r}; expected {EXPECTED_FEATURE_VERSION!r}"
             )
         if elt_contract.model_family != MODEL_FAMILY:
             raise RuntimeError(
@@ -597,7 +598,9 @@ def train_model_task(
             inner_cutoff,
         )
 
-    train_eval_label_values = pd.to_numeric(train_eval_df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
+    train_eval_label_values = pd.to_numeric(
+        train_eval_df[LABEL_COLUMN], errors="raise"
+    ).astype("float32").to_numpy()
     label_cap_seconds = float(np.quantile(train_eval_label_values, 0.99))
     train_label_p50_seconds = float(np.median(np.clip(train_eval_label_values, 0.0, label_cap_seconds)))
     logger.info(
@@ -638,9 +641,9 @@ def train_model_task(
             }
         )
 
-        train_prepared = _prepare_training_frame(train_eval_df)
+        train_prepared = _prepare_matrix_frame(train_eval_df)
         train_X = train_prepared[MATRIX_FEATURE_COLUMNS]
-        y_train_raw = train_prepared[LABEL_COLUMN].to_numpy(dtype="float32")
+        y_train_raw = pd.to_numeric(train_eval_df[LABEL_COLUMN], errors="raise").astype("float32").to_numpy()
         y_train = to_log_target(y_train_raw, label_cap_seconds)
 
         final_model = lgb.LGBMRegressor(**final_params, n_estimators=int(final_num_boost_round))
@@ -771,4 +774,4 @@ def train_model_task(
             upload_file_to_s3(manifest_path, artifact_plan.manifest_s3_uri, use_iam=USE_IAM)
 
     logger.info("train_model_task finished successfully")
-    return training_result
+    return training_result.to_json()
