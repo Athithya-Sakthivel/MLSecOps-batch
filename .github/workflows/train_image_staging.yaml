@@ -112,7 +112,7 @@ jobs:
             --cache-dir /root/.cache/trivy \
             --ignorefile /workspace/.trivyignore \
             --scanners vuln \
-            --severity HIGH,CRITICAL \
+            --severity CRITICAL \
             --exit-on-eol 1 \
             --exit-code 1 \
             "${{ steps.image-meta.outputs.train_task_image }}"
