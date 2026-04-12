@@ -106,6 +106,47 @@ def build_feature_matrix(
     return matrix
 
 
+def _normalize_output_values(output: Any, row_count: int) -> list[Any]:
+    """
+    Normalize one model output into a per-row python value list.
+
+    Rules:
+      - scalar output -> broadcast to all rows
+      - length-1 output -> broadcast to all rows
+      - batch-shaped output with first dimension == row_count -> one value per row
+      - multi-dimensional row values are preserved as lists
+    """
+    arr = np.asarray(output)
+
+    if row_count < 1:
+        return []
+
+    if arr.ndim == 0:
+        scalar = _to_python(arr.item())
+        return [scalar for _ in range(row_count)]
+
+    if arr.size == 1:
+        scalar = _to_python(arr.reshape(()).item())
+        return [scalar for _ in range(row_count)]
+
+    if arr.shape[0] != row_count:
+        raise ValueError(
+            f"Output batch dimension {arr.shape[0]} does not match row_count {row_count}"
+        )
+
+    values: list[Any] = []
+    for idx in range(row_count):
+        item = _to_python(arr[idx])
+
+        if isinstance(item, list) and len(item) == 1:
+            values.append(item[0])
+            continue
+
+        values.append(item)
+
+    return values
+
+
 def split_model_outputs(
     outputs: Sequence[Any],
     output_names: Sequence[str],
@@ -117,28 +158,16 @@ def split_model_outputs(
     if row_count < 1:
         return []
 
-    arrays = [np.asarray(output) for output in outputs]
-    normalized: list[list[tuple[str, Any]]] = [[] for _ in range(row_count)]
+    normalized: list[dict[str, Any]] = [dict() for _ in range(row_count)]
 
-    for name, arr in zip(output_names, arrays, strict=True):
-        if arr.ndim == 0:
-            scalar = _to_python(arr.item())
-            for row in normalized:
-                row.append((name, scalar))
-            continue
-
-        if arr.shape[0] != row_count:
-            if arr.size == 1:
-                scalar = _to_python(arr.reshape(()).item())
-                for row in normalized:
-                    row.append((name, scalar))
-                continue
+    for name, output in zip(output_names, outputs, strict=True):
+        values = _normalize_output_values(output, row_count)
+        if len(values) != row_count:
             raise ValueError(
-                f"Output '{name}' has batch dimension {arr.shape[0]}, expected {row_count}"
+                f"Output '{name}' produced {len(values)} row values, expected {row_count}"
             )
 
-        for idx in range(row_count):
-            value = _to_python(arr[idx])
-            normalized[idx].append((name, value))
+        for idx, value in enumerate(values):
+            normalized[idx][name] = value
 
-    return [{key: value for key, value in row} for row in normalized]
+    return normalized
