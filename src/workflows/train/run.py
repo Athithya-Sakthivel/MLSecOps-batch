@@ -20,6 +20,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
 TRAIN_PACKAGE_ROOT = SRC_ROOT / "workflows" / "train"
@@ -36,12 +38,20 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return _env_str(name, default).lower() in {"1", "true", "yes", "y", "on"}
 
 
+def split_namespaces(value: str) -> list[str]:
+    out: list[str] = []
+    for part in value.replace(",", " ").replace(";", " ").split():
+        part = part.strip()
+        if part:
+            out.append(part)
+    return out
+
+
 REMOTE_PROJECT = _env_str("REMOTE_PROJECT", "flytesnacks")
 REMOTE_DOMAIN = _env_str("REMOTE_DOMAIN", "development")
 TASK_NAMESPACE = _env_str("TRAIN_NAMESPACE", f"{REMOTE_PROJECT}-{REMOTE_DOMAIN}")
 
 K8S_CLUSTER = _env_str("K8S_CLUSTER", "kind").lower()
-
 TRAIN_PROFILE = _env_str(
     "TRAIN_PROFILE",
     _env_str(
@@ -49,12 +59,10 @@ TRAIN_PROFILE = _env_str(
         "staging" if K8S_CLUSTER in {"kind", "minikube", "docker-desktop", "local"} else "prod",
     ),
 ).lower()
-
 if TRAIN_PROFILE not in {"staging", "prod"}:
     raise RuntimeError(f"TRAIN_PROFILE must be 'staging' or 'prod', got {TRAIN_PROFILE!r}")
 
 TRAIN_SERVICE_ACCOUNT = _env_str("TRAIN_SERVICE_ACCOUNT", "ray") or "ray"
-
 TRAIN_TASK_IMAGE = _env_str("TRAIN_TASK_IMAGE")
 if not TRAIN_TASK_IMAGE:
     raise RuntimeError("TRAIN_TASK_IMAGE environment variable must be set and non-empty")
@@ -70,37 +78,38 @@ FLYTE_ADMIN_PORT = int(_env_str("FLYTE_ADMIN_PORT", "30081"))
 PORT_FORWARD_TARGET_PORT = int(_env_str("PORT_FORWARD_TARGET_PORT", "81"))
 PORT_FORWARD_PID_FILE = Path(_env_str("PORT_FORWARD_PID_FILE", "/tmp/flyteadmin-portforward-train.pid"))
 PORT_FORWARD_LOG = Path(_env_str("PORT_FORWARD_LOG", "/tmp/flyteadmin-portforward-train.log"))
-
 PORT_FORWARD_PROC: subprocess.Popen[str] | None = None
 
 ACTIVATE_LAUNCHPLANS = _env_bool("ACTIVATE_LAUNCHPLANS", "0")
 USE_LATEST = _env_bool("USE_LATEST", "0")
-
 PYFLYTE_REGISTER_EXTRA_ARGS = _env_str("PYFLYTE_REGISTER_EXTRA_ARGS", "")
 
-RESOURCE_QUOTA_NAME = _env_str("TRAIN_RESOURCE_QUOTA_NAME", "ray-workload-quota")
-
-RESOURCE_QUOTA_KIND_REQUESTS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_KIND_REQUESTS_CPU", "8")
-RESOURCE_QUOTA_KIND_REQUESTS_MEMORY = _env_str("TRAIN_RESOURCE_QUOTA_KIND_REQUESTS_MEMORY", "4Gi")
-RESOURCE_QUOTA_KIND_LIMITS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_KIND_LIMITS_CPU", "16")
-RESOURCE_QUOTA_KIND_LIMITS_MEMORY = _env_str("TRAIN_RESOURCE_QUOTA_KIND_LIMITS_MEMORY", "4Gi")
-RESOURCE_QUOTA_KIND_PODS = _env_str("TRAIN_RESOURCE_QUOTA_KIND_PODS", "60")
-RESOURCE_QUOTA_KIND_PVC = _env_str("TRAIN_RESOURCE_QUOTA_KIND_PVC", "40")
-RESOURCE_QUOTA_KIND_SERVICES = _env_str("TRAIN_RESOURCE_QUOTA_KIND_SERVICES", "50")
-
-RESOURCE_QUOTA_EKS_REQUESTS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_EKS_REQUESTS_CPU", "24")
-RESOURCE_QUOTA_EKS_REQUESTS_MEMORY = _env_str("TRAIN_RESOURCE_QUOTA_EKS_REQUESTS_MEMORY", "4Gi")
-RESOURCE_QUOTA_EKS_LIMITS_CPU = _env_str("TRAIN_RESOURCE_QUOTA_EKS_LIMITS_CPU", "48")
-RESOURCE_QUOTA_EKS_LIMITS_MEMORY = _env_str("TRAIN_RESOURCE_QUOTA_EKS_LIMITS_MEMORY", "4Gi")
-RESOURCE_QUOTA_EKS_PODS = _env_str("TRAIN_RESOURCE_QUOTA_EKS_PODS", "150")
-RESOURCE_QUOTA_EKS_PVC = _env_str("TRAIN_RESOURCE_QUOTA_EKS_PVC", "80")
-RESOURCE_QUOTA_EKS_SERVICES = _env_str("TRAIN_RESOURCE_QUOTA_EKS_SERVICES", "150")
+TASK_NAMESPACE_BOOTSTRAP_NAME = _env_str("TRAIN_TASK_NAMESPACE_BOOTSTRAP_NAME", "project-quota")
+TASK_NAMESPACE_RESOURCE_QUOTA_NAME = _env_str(
+    "TRAIN_TASK_NAMESPACE_RESOURCE_QUOTA_NAME",
+    TASK_NAMESPACE_BOOTSTRAP_NAME,
+)
+TASK_NAMESPACE_REQUESTS_CPU = _env_str("TRAIN_TASK_NAMESPACE_REQUESTS_CPU", "8")
+TASK_NAMESPACE_REQUESTS_MEMORY = _env_str("TRAIN_TASK_NAMESPACE_REQUESTS_MEMORY", "4Gi")
+TASK_NAMESPACE_LIMITS_CPU = _env_str("TRAIN_TASK_NAMESPACE_LIMITS_CPU", "16")
+TASK_NAMESPACE_LIMITS_MEMORY = _env_str("TRAIN_TASK_NAMESPACE_LIMITS_MEMORY", "4Gi")
+TASK_NAMESPACE_PODS = _env_str("TRAIN_TASK_NAMESPACE_PODS", "60")
+TASK_NAMESPACE_PVC = _env_str("TRAIN_TASK_NAMESPACE_PVC", "40")
+TASK_NAMESPACE_SERVICES = _env_str("TRAIN_TASK_NAMESPACE_SERVICES", "50")
 
 TRAIN_TASK_REQUESTS_CPU = _env_str("TRAIN_TASK_REQUESTS_CPU", "2")
 TRAIN_TASK_REQUESTS_MEMORY = _env_str("TRAIN_TASK_REQUESTS_MEMORY", "3Gi")
 TRAIN_TASK_LIMITS_CPU = _env_str("TRAIN_TASK_LIMITS_CPU", "3")
-TRAIN_TASK_LIMITS_MEMORY = _env_str("TRAIN_TASK_LIMITS_MEMORY", "3Gi")
+TRAIN_TASK_LIMITS_MEMORY = _env_str("TRAIN_TASK_LIMITS_MEMORY", "4Gi")
 TRAIN_DEFAULT_NUM_THREADS = _env_str("TRAIN_DEFAULT_NUM_THREADS", "2")
+
+DB_SECRET_NAME = _env_str("DB_SECRET_NAME", "db-pass")
+TASK_AWS_SECRET_NAME = _env_str("TASK_AWS_SECRET_NAME", "flyte-aws-credentials")
+TASK_SERVICE_ACCOUNT_NAME = _env_str("TASK_SERVICE_ACCOUNT", TRAIN_SERVICE_ACCOUNT) or TRAIN_SERVICE_ACCOUNT
+TASK_NAMESPACES = split_namespaces(_env_str("FLYTE_TASK_NAMESPACES", TASK_NAMESPACE)) or [TASK_NAMESPACE]
+
+APP_DB_USER = ""
+APP_DB_PASSWORD = ""
 
 
 def log(msg: str) -> None:
@@ -163,26 +172,24 @@ def stop_port_forward_if_any() -> None:
     pid: int | None = None
     if PORT_FORWARD_PID_FILE.is_file():
         try:
-            pid = int(PORT_FORWARD_PID_FILE.read_text().strip())
+            pid = int(PORT_FORWARD_PID_FILE.read_text(encoding="utf-8").strip())
         except Exception:
             pid = None
 
     if proc is not None:
         with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
+            os.killpg(proc.pid, signal.SIGTERM)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
             with contextlib.suppress(Exception):
                 proc.wait(timeout=10)
 
     if pid is not None and (proc is None or proc.pid != pid):
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
-        with contextlib.suppress(Exception):
-            os.waitpid(pid, 0)
 
     PORT_FORWARD_PID_FILE.unlink(missing_ok=True)
 
@@ -237,7 +244,7 @@ def start_port_forward() -> None:
         log_file.close()
 
     PORT_FORWARD_PROC = proc
-    PORT_FORWARD_PID_FILE.write_text(str(proc.pid))
+    PORT_FORWARD_PID_FILE.write_text(str(proc.pid), encoding="utf-8")
 
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -280,134 +287,153 @@ def init_flytectl() -> None:
     )
 
 
-def _quota_values() -> dict[str, str]:
-    if K8S_CLUSTER == "kind":
-        return {
-            "requests_cpu": RESOURCE_QUOTA_KIND_REQUESTS_CPU,
-            "requests_memory": RESOURCE_QUOTA_KIND_REQUESTS_MEMORY,
-            "limits_cpu": RESOURCE_QUOTA_KIND_LIMITS_CPU,
-            "limits_memory": RESOURCE_QUOTA_KIND_LIMITS_MEMORY,
-            "pods": RESOURCE_QUOTA_KIND_PODS,
-            "persistentvolumeclaims": RESOURCE_QUOTA_KIND_PVC,
-            "services": RESOURCE_QUOTA_KIND_SERVICES,
-        }
+def _namespace_manifest(namespace: str) -> dict[str, object]:
     return {
-        "requests_cpu": RESOURCE_QUOTA_EKS_REQUESTS_CPU,
-        "requests_memory": RESOURCE_QUOTA_EKS_REQUESTS_MEMORY,
-        "limits_cpu": RESOURCE_QUOTA_EKS_LIMITS_CPU,
-        "limits_memory": RESOURCE_QUOTA_EKS_LIMITS_MEMORY,
-        "pods": RESOURCE_QUOTA_EKS_PODS,
-        "persistentvolumeclaims": RESOURCE_QUOTA_EKS_PVC,
-        "services": RESOURCE_QUOTA_EKS_SERVICES,
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": namespace,
+            "labels": {"app.kubernetes.io/part-of": "flyte"},
+        },
     }
 
 
-def _bootstrap_manifest() -> str:
-    q = _quota_values()
-    return f"""apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {TRAIN_SERVICE_ACCOUNT}
-  namespace: {TASK_NAMESPACE}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: {TRAIN_SERVICE_ACCOUNT}
-  namespace: {TASK_NAMESPACE}
-rules:
-  - apiGroups: [""]
-    resources:
-      - pods
-      - pods/log
-      - services
-      - configmaps
-      - persistentvolumeclaims
-      - events
-    verbs:
-      - get
-      - list
-      - watch
-      - create
-      - update
-      - patch
-      - delete
-      - deletecollection
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {TRAIN_SERVICE_ACCOUNT}
-  namespace: {TASK_NAMESPACE}
-subjects:
-  - kind: ServiceAccount
-    name: {TRAIN_SERVICE_ACCOUNT}
-    namespace: {TASK_NAMESPACE}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: {TRAIN_SERVICE_ACCOUNT}
----
-apiVersion: v1
-kind: ResourceQuota
-metadata:
-  name: {RESOURCE_QUOTA_NAME}
-  namespace: {TASK_NAMESPACE}
-spec:
-  hard:
-    requests.cpu: "{q['requests_cpu']}"
-    requests.memory: "{q['requests_memory']}"
-    limits.cpu: "{q['limits_cpu']}"
-    limits.memory: "{q['limits_memory']}"
-    pods: "{q['pods']}"
-    persistentvolumeclaims: "{q['persistentvolumeclaims']}"
-    services: "{q['services']}"
-"""
+def _service_account_manifest(namespace: str) -> dict[str, object]:
+    return {
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": "default",
+            "namespace": namespace,
+        },
+    }
+
+
+def _task_service_account_manifest(namespace: str) -> dict[str, object]:
+    return {
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": TASK_SERVICE_ACCOUNT_NAME,
+            "namespace": namespace,
+        },
+    }
+
+
+def _role_manifest(namespace: str) -> dict[str, object]:
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "Role",
+        "metadata": {
+            "name": TASK_SERVICE_ACCOUNT_NAME,
+            "namespace": namespace,
+        },
+        "rules": [
+            {
+                "apiGroups": [""],
+                "resources": [
+                    "pods",
+                    "pods/log",
+                    "services",
+                    "configmaps",
+                    "persistentvolumeclaims",
+                    "events",
+                ],
+                "verbs": [
+                    "get",
+                    "list",
+                    "watch",
+                    "create",
+                    "update",
+                    "patch",
+                    "delete",
+                    "deletecollection",
+                ],
+            }
+        ],
+    }
+
+
+def _role_binding_manifest(namespace: str) -> dict[str, object]:
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {
+            "name": TASK_SERVICE_ACCOUNT_NAME,
+            "namespace": namespace,
+        },
+        "subjects": [
+            {
+                "kind": "ServiceAccount",
+                "name": TASK_SERVICE_ACCOUNT_NAME,
+                "namespace": namespace,
+            }
+        ],
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "Role",
+            "name": TASK_SERVICE_ACCOUNT_NAME,
+        },
+    }
+
+
+def _resource_quota_manifest(namespace: str) -> dict[str, object]:
+    return {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+            "name": TASK_NAMESPACE_RESOURCE_QUOTA_NAME,
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/name": "train-task-quota",
+                "app.kubernetes.io/part-of": "flyte",
+            },
+        },
+        "spec": {
+            "hard": {
+                "requests.cpu": TASK_NAMESPACE_REQUESTS_CPU,
+                "requests.memory": TASK_NAMESPACE_REQUESTS_MEMORY,
+                "limits.cpu": TASK_NAMESPACE_LIMITS_CPU,
+                "limits.memory": TASK_NAMESPACE_LIMITS_MEMORY,
+                "pods": TASK_NAMESPACE_PODS,
+                "persistentvolumeclaims": TASK_NAMESPACE_PVC,
+                "services": TASK_NAMESPACE_SERVICES,
+            }
+        },
+    }
+
+
+def _namespace_bootstrap_manifest(namespace: str) -> str:
+    manifests: list[dict[str, object]] = [
+        _namespace_manifest(namespace),
+        _service_account_manifest(namespace),
+        _task_service_account_manifest(namespace),
+        _role_manifest(namespace),
+        _role_binding_manifest(namespace),
+        _resource_quota_manifest(namespace),
+    ]
+    return "\n---\n".join(yaml.safe_dump(item, sort_keys=False).strip() for item in manifests) + "\n"
 
 
 def bootstrap_manifest_quota_line() -> str:
-    q = _quota_values()
     return (
-        f"requests.cpu={q['requests_cpu']}, "
-        f"requests.memory={q['requests_memory']}, "
-        f"limits.cpu={q['limits_cpu']}, "
-        f"limits.memory={q['limits_memory']}, "
-        f"pods={q['pods']}, "
-        f"persistentvolumeclaims={q['persistentvolumeclaims']}, "
-        f"services={q['services']}"
-    )
-
-
-def _ensure_namespace() -> None:
-    run_cmd(
-        [
-            "kubectl",
-            "create",
-            "namespace",
-            TASK_NAMESPACE,
-            "--dry-run=client",
-            "-o",
-            "yaml",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    run_cmd(
-        ["kubectl", "apply", "-f", "-"],
-        input_text=f"""apiVersion: v1
-kind: Namespace
-metadata:
-  name: {TASK_NAMESPACE}
-""",
+        f"requests.cpu={TASK_NAMESPACE_REQUESTS_CPU}, "
+        f"requests.memory={TASK_NAMESPACE_REQUESTS_MEMORY}, "
+        f"limits.cpu={TASK_NAMESPACE_LIMITS_CPU}, "
+        f"limits.memory={TASK_NAMESPACE_LIMITS_MEMORY}, "
+        f"pods={TASK_NAMESPACE_PODS}, "
+        f"persistentvolumeclaims={TASK_NAMESPACE_PVC}, "
+        f"services={TASK_NAMESPACE_SERVICES}"
     )
 
 
 def bootstrap_target_namespace() -> None:
     require_bin("kubectl")
-    log(f"Applying namespace, RBAC, and quota bootstrap for {TASK_NAMESPACE}")
-    _ensure_namespace()
-    run_cmd(["kubectl", "apply", "-f", "-"], input_text=_bootstrap_manifest())
-    log(f"Bootstrap applied for {TASK_NAMESPACE} with quota: {bootstrap_manifest_quota_line()}")
+    log(f"Applying namespace, RBAC and quota bootstrap for {TASK_NAMESPACE}")
+    run_cmd(["kubectl", "apply", "-f", "-"], input_text=_namespace_bootstrap_manifest(TASK_NAMESPACE))
+    log(
+        f"Bootstrap applied for {TASK_NAMESPACE} with quota: {bootstrap_manifest_quota_line()}"
+    )
 
 
 def _can_i(verb: str, resource: str) -> bool:
@@ -420,7 +446,7 @@ def _can_i(verb: str, resource: str) -> bool:
             resource,
             "-n",
             TASK_NAMESPACE,
-            f"--as=system:serviceaccount:{TASK_NAMESPACE}:{TRAIN_SERVICE_ACCOUNT}",
+            f"--as=system:serviceaccount:{TASK_NAMESPACE}:{TASK_SERVICE_ACCOUNT_NAME}",
         ],
         check=False,
         capture_output=True,
@@ -435,20 +461,20 @@ def ensure_namespace_bootstrap_ready() -> None:
     bootstrap_target_namespace()
 
     sa = run_cmd(
-        ["kubectl", "get", "serviceaccount", TRAIN_SERVICE_ACCOUNT, "-n", TASK_NAMESPACE],
+        ["kubectl", "get", "serviceaccount", TASK_SERVICE_ACCOUNT_NAME, "-n", TASK_NAMESPACE],
         check=False,
         capture_output=True,
     )
     if sa.returncode != 0:
-        fatal(f"service account {TRAIN_SERVICE_ACCOUNT} missing in {TASK_NAMESPACE}")
+        fatal(f"service account {TASK_SERVICE_ACCOUNT_NAME} missing in {TASK_NAMESPACE}")
 
     rq = run_cmd(
-        ["kubectl", "get", "resourcequota", RESOURCE_QUOTA_NAME, "-n", TASK_NAMESPACE],
+        ["kubectl", "get", "resourcequota", TASK_NAMESPACE_RESOURCE_QUOTA_NAME, "-n", TASK_NAMESPACE],
         check=False,
         capture_output=True,
     )
     if rq.returncode != 0:
-        fatal(f"resource quota {RESOURCE_QUOTA_NAME} missing in {TASK_NAMESPACE}")
+        fatal(f"resource quota {TASK_NAMESPACE_RESOURCE_QUOTA_NAME} missing in {TASK_NAMESPACE}")
 
     required_resources = ["pods", "services", "configmaps", "persistentvolumeclaims"]
     required_verbs = ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
@@ -461,7 +487,7 @@ def ensure_namespace_bootstrap_ready() -> None:
         missing.append("get pods/log")
 
     if missing:
-        fatal("service account lacks required Ray/Flyte permissions: " + ", ".join(missing))
+        fatal("service account lacks required Flyte permissions: " + ", ".join(missing))
 
     log(f"Bootstrap verified for {TASK_NAMESPACE}")
 
@@ -482,7 +508,6 @@ def _export_resource_env_defaults() -> None:
 
 def import_check() -> None:
     _export_resource_env_defaults()
-
     mod = importlib.import_module(WORKFLOW_IMPORT_MODULE)
     if not hasattr(mod, "TRAIN_WORKFLOW_LP"):
         fatal(f"{WORKFLOW_IMPORT_MODULE} does not expose TRAIN_WORKFLOW_LP")
@@ -510,13 +535,9 @@ def resolve_train_launchplan_name() -> str:
 def registration_tree_files() -> list[Path]:
     files: list[Path] = []
     for path in sorted(TRAIN_PACKAGE_ROOT.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        files.append(path)
-    for extra in (
-        TRAIN_PACKAGE_ROOT / "requirements.txt",
-        TRAIN_PACKAGE_ROOT / "Dockerfile.task_image",
-    ):
+        if "__pycache__" not in path.parts:
+            files.append(path)
+    for extra in (TRAIN_PACKAGE_ROOT / "requirements.txt", TRAIN_PACKAGE_ROOT / "Dockerfile.task_image"):
         if extra.is_file():
             files.append(extra)
     return files
@@ -594,7 +615,10 @@ def build_register_command(registration_version: str) -> list[str]:
     elif supports_fast:
         cmd.append("--fast=false")
     else:
-        fatal("installed pyflyte register does not advertise --copy or --fast; cannot safely disable fast registration")
+        fatal(
+            "installed pyflyte register does not advertise --copy or --fast; "
+            "cannot safely disable fast registration"
+        )
 
     if PYFLYTE_REGISTER_EXTRA_ARGS:
         cmd.extend(shlex.split(PYFLYTE_REGISTER_EXTRA_ARGS))
@@ -927,8 +951,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("register", help="Register train workflows and launch plans")
     sub.add_parser("train", help="Execute the train workflow")
     sub.add_parser("up", help="Register and then execute train")
-    sub.add_parser("diagnose", help="Inspect a Flyte execution and related Kubernetes resources").add_argument("execution_id")
-    sub.add_parser("delete", help="Delete a Flyte execution and matching Kubernetes resources").add_argument("execution_id")
+    sub.add_parser("diagnose", help="Inspect a Flyte execution and related Kubernetes resources").add_argument(
+        "execution_id"
+    )
+    sub.add_parser("delete", help="Delete a Flyte execution and matching Kubernetes resources").add_argument(
+        "execution_id"
+    )
     sub.add_parser("reset", help="Delete leftover train Ray / pod resources in the target namespace")
     return parser
 

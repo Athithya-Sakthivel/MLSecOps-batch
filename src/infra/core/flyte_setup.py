@@ -44,7 +44,7 @@ STORAGE_PROVIDER = os.environ.get("STORAGE_PROVIDER", "auto").strip().lower()
 USE_IAM = os.environ.get("USE_IAM", "false").lower() in {"1", "true", "yes", "y", "on"}
 
 AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
-S3_BUCKET = os.environ.get("S3_BUCKET", "e2e-mlops-data-681802563986")
+S3_BUCKET = os.environ.get("S3_BUCKET", "s3-temp-bucket-mlsecops-681802563986")
 S3_PREFIX = os.environ.get("S3_PREFIX", "").strip("/")
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "").strip()
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()

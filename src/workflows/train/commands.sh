@@ -1,6 +1,6 @@
 ruff check src/workflows/train --fix
-export S3_BUCKET="e2e-mlops-data-681802563986"
-export TRAIN_TASK_IMAGE="ghcr.io/athithya-sakthivel/flyte-train-task:2026-04-11-15-41--0663574@sha256:640fd1033418db4d47bf215d4b988cc4d04a7299cb8c7d86bf02199b38efeebd"
+export S3_BUCKET=${S3_BUCKET:-s3-temp-bucket-mlsecops-681802563986}
+export TRAIN_TASK_IMAGE="ghcr.io/athithya-sakthivel/flyte-train-task:2026-04-11-16-50--1edbfa8@sha256:c845c5ed96ebffe92285a7e8ad542769d20d6f457da12b817951a08cc712d283"
 export TRAIN_PROFILE="${TRAIN_PROFILE:-staging}"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 source .venv_train/bin/activate
@@ -14,4 +14,4 @@ python -m workflows.train.run train
 
 # kubectl -n flyte port-forward svc/flyteadmin 30081:81
 
-# flytectl get execution a65g6sbgkr28qm2n4x2j -p flytesnacks -d development --details
+# flytectl get execution av7p9wzs8qg4ms4kj4vq -p flytesnacks -d development --details

@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-readonly K8S_CLUSTER="${K8S_CLUSTER}"
+readonly K8S_CLUSTER="${K8S_CLUSTER:-kind}"
 readonly MANIFEST_DIR="src/manifests/storageclass"
 readonly TARGET_SC="default-storage-class"
 readonly LOCAL_PATH_PROVISIONER_TAG="${LOCAL_PATH_PROVISIONER_TAG:-v0.0.35}"

@@ -62,17 +62,22 @@ def _json_safe(value: object) -> object:
     return json.loads(json.dumps(value, default=str))
 
 
-def _require_dict(value: object, name: str) -> dict[str, object]:
-    if not isinstance(value, dict):
-        raise RuntimeError(f"{name} must be an object")
-    return value
-
-
 def _load_json_file(path: Path) -> dict[str, object]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise RuntimeError(f"{path} must contain a JSON object")
     return raw
+
+
+def _as_json_object(value: object, name: str) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"{name} must be a JSON object")
+        return parsed
+    raise RuntimeError(f"{name} must be a JSON object or JSON string")
 
 
 def _numeric_metrics(metrics: dict[str, object]) -> dict[str, float]:
@@ -93,7 +98,8 @@ def _validate_bundle_contract(
 ) -> None:
     if schema_payload.get("target_transform") != TARGET_TRANSFORM:
         raise RuntimeError(
-            f"schema.json target_transform must be {TARGET_TRANSFORM!r}, got {schema_payload.get('target_transform')!r}"
+            f"schema.json target_transform must be {TARGET_TRANSFORM!r}, "
+            f"got {schema_payload.get('target_transform')!r}"
         )
 
     feature_order = schema_payload.get("feature_order")
@@ -118,22 +124,26 @@ def _validate_bundle_contract(
         raise RuntimeError("metadata.json engineered_feature_order does not match the frozen matrix contract")
     if metadata_payload.get("preprocessing_version") != PREPROCESSING_VERSION:
         raise RuntimeError(
-            f"metadata.json preprocessing_version must be {PREPROCESSING_VERSION!r}, got {metadata_payload.get('preprocessing_version')!r}"
+            f"metadata.json preprocessing_version must be {PREPROCESSING_VERSION!r}, "
+            f"got {metadata_payload.get('preprocessing_version')!r}"
         )
     if metadata_payload.get("model_version") != model_version:
         raise RuntimeError(
-            f"metadata.json model_version must be {model_version!r}, got {metadata_payload.get('model_version')!r}"
+            f"metadata.json model_version must be {model_version!r}, "
+            f"got {metadata_payload.get('model_version')!r}"
         )
 
-    artifact_plan = _require_dict(metadata_payload.get("artifact_plan"), "metadata.json artifact_plan")
+    artifact_plan = _as_json_object(metadata_payload.get("artifact_plan"), "metadata.json artifact_plan")
     if artifact_plan.get("artifact_root_s3_uri") != artifact_plan_root:
         raise RuntimeError(
-            f"metadata.json artifact root mismatch: expected {artifact_plan_root!r}, got {artifact_plan.get('artifact_root_s3_uri')!r}"
+            "metadata.json artifact root mismatch: "
+            f"expected {artifact_plan_root!r}, got {artifact_plan.get('artifact_root_s3_uri')!r}"
         )
 
     if manifest_payload.get("source_uri") != artifact_plan_root:
         raise RuntimeError(
-            f"manifest.json source_uri mismatch: expected {artifact_plan_root!r}, got {manifest_payload.get('source_uri')!r}"
+            "manifest.json source_uri mismatch: "
+            f"expected {artifact_plan_root!r}, got {manifest_payload.get('source_uri')!r}"
         )
     if manifest_payload.get("format_version") != 1:
         raise RuntimeError("manifest.json format_version must be 1")
@@ -203,7 +213,7 @@ class Log1pFrozenMatrixPyFuncModel(mlflow.pyfunc.PythonModel):
         metadata_payload = _load_json_file(metadata_path)
         manifest_payload = _load_json_file(manifest_path)
 
-        artifact_plan = _require_dict(metadata_payload.get("artifact_plan"), "metadata.json artifact_plan")
+        artifact_plan = _as_json_object(metadata_payload.get("artifact_plan"), "metadata.json artifact_plan")
         _validate_bundle_contract(
             schema_payload=schema_payload,
             metadata_payload=metadata_payload,
@@ -277,11 +287,11 @@ def evaluate_and_register_task(
     if max_eval_rows < 1:
         raise ValueError("max_eval_rows must be >= 1")
 
-    training_result = _require_dict(json.loads(training_result_json), "training_result_json")
-    artifact_plan = _require_dict(training_result.get("artifact_plan"), "training_result_json.artifact_plan")
-    bundle_contract = _require_dict(training_result.get("bundle_contract"), "training_result_json.bundle_contract")
-    bundle_metadata = _require_dict(training_result.get("bundle_metadata"), "training_result_json.bundle_metadata")
-    elt_contract = _require_dict(training_result.get("elt_contract"), "training_result_json.elt_contract")
+    training_result = _as_json_object(json.loads(training_result_json), "training_result_json")
+    artifact_plan = _as_json_object(training_result.get("artifact_plan"), "training_result_json.artifact_plan")
+    bundle_contract = _as_json_object(training_result.get("bundle_contract"), "training_result_json.bundle_contract")
+    bundle_metadata = _as_json_object(training_result.get("bundle_metadata"), "training_result_json.bundle_metadata")
+    elt_contract = _as_json_object(training_result.get("elt_contract"), "training_result_json.elt_contract")
 
     with log_step("reload_iceberg_table_for_evaluation"):
         table = load_iceberg_table(ICEBERG_CATALOG_NAME, ICEBERG_REST_URI, ICEBERG_WAREHOUSE)
@@ -403,9 +413,14 @@ def evaluate_and_register_task(
                 )
 
                 mlflow.log_metrics(
-                    _numeric_metrics(_require_dict(training_result["holdout_metrics"], "training_result_json.holdout_metrics"))
+                    _numeric_metrics(
+                        _as_json_object(
+                            training_result["holdout_metrics"],
+                            "training_result_json.holdout_metrics",
+                        )
+                    )
                 )
-                holdout_baseline = _require_dict(
+                holdout_baseline = _as_json_object(
                     training_result["holdout_baseline_metrics"],
                     "training_result_json.holdout_baseline_metrics",
                 )
