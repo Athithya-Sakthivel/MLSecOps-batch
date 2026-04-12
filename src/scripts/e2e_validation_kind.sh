@@ -36,3 +36,6 @@ export PG_SERVER_NAME=mlsecops             # same lineage name
 make pg-restore-latest                     # restore latest base backup + WAL from s3 into fresh k8s cluster
 
 make train                                 # run Flyte training workflow (consumes Gold Iceberg tables)
+
+aws s3 ls s3://$S3_BUCKET/model-artifacts/ --recursive
+

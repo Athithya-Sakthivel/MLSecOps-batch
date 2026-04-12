@@ -1,3 +1,4 @@
+# src/workflows/deploy/model_store.py
 from __future__ import annotations
 
 import contextlib
@@ -10,7 +11,7 @@ import posixpath
 import shutil
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from string import hexdigits
@@ -32,6 +33,7 @@ _MAX_METADATA_BYTES = 1_048_576
 _LOCK_TIMEOUT_SECONDS = 300
 
 TARGET_TRANSFORM = "log1p"
+DEFAULT_PREPROCESSING_VERSION = "matrix_identity_v1"
 MAX_PREDICTION_SECONDS = 24.0 * 3600.0
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,20 @@ def _require_nonempty_str_list(values: Any, field_name: str) -> tuple[str, ...]:
         seen.add(value)
         cleaned.append(value)
     return tuple(cleaned)
+
+
+def _require_nonempty_int_list(values: Any, field_name: str) -> list[int]:
+    if not isinstance(values, list):
+        raise RuntimeError(f"{field_name} must be a list")
+    cleaned: list[int] = []
+    for idx, item in enumerate(values):
+        if isinstance(item, bool):
+            raise RuntimeError(f"{field_name}[{idx}] must be an integer")
+        try:
+            cleaned.append(int(item))
+        except Exception as exc:
+            raise RuntimeError(f"{field_name}[{idx}] must be an integer") from exc
+    return cleaned
 
 
 def _read_limited_text(src_fs: fsspec.AbstractFileSystem, src_path: str, max_bytes: int) -> str:
@@ -317,11 +333,13 @@ class LoadedModel:
     output_names: tuple[str, ...]
 
 
-def _cache_key(model_sha256: str, schema_sha256: str, model_version: str) -> str:
+def _cache_key(model_sha256: str, schema_sha256: str, metadata_sha256: str, model_version: str) -> str:
     h = hashlib.sha256()
     h.update(model_sha256.encode("utf-8"))
     h.update(b"\0")
     h.update(schema_sha256.encode("utf-8"))
+    h.update(b"\0")
+    h.update(metadata_sha256.encode("utf-8"))
     h.update(b"\0")
     h.update(model_version.encode("utf-8"))
     return h.hexdigest()[:16]
@@ -331,9 +349,12 @@ def _cache_dir(
     settings: Settings,
     model_sha256: str,
     schema_sha256: str,
+    metadata_sha256: str,
     model_version: str,
 ) -> Path:
-    cache_dir = Path(settings.model_cache_dir) / _cache_key(model_sha256, schema_sha256, model_version)
+    cache_dir = Path(settings.model_cache_dir) / _cache_key(
+        model_sha256, schema_sha256, metadata_sha256, model_version
+    )
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -348,13 +369,13 @@ def _parse_schema(raw: dict[str, Any]) -> ModelSchema:
         )
 
     feature_order = _require_nonempty_str_list(raw.get("feature_order"), "feature_order")
-    request_feature_order_raw = raw.get("request_feature_order", list(feature_order))
-    engineered_feature_order_raw = raw.get("engineered_feature_order", list(feature_order))
     request_feature_order = _require_nonempty_str_list(
-        request_feature_order_raw, "request_feature_order"
+        raw.get("request_feature_order", list(feature_order)),
+        "request_feature_order",
     )
     engineered_feature_order = _require_nonempty_str_list(
-        engineered_feature_order_raw, "engineered_feature_order"
+        raw.get("engineered_feature_order", list(feature_order)),
+        "engineered_feature_order",
     )
 
     if feature_order != request_feature_order:
@@ -419,6 +440,8 @@ def _parse_metadata(raw: dict[str, Any]) -> ModelMetadata:
     engineered_feature_order = _require_nonempty_str_list(
         raw.get("engineered_feature_order"), "engineered_feature_order"
     )
+    if request_feature_order != engineered_feature_order:
+        raise RuntimeError("metadata request_feature_order and engineered_feature_order must match")
 
     category_levels_raw = raw.get("category_levels", {})
     if not isinstance(category_levels_raw, dict):
@@ -427,17 +450,7 @@ def _parse_metadata(raw: dict[str, Any]) -> ModelMetadata:
     for key, values in category_levels_raw.items():
         if not isinstance(key, str) or not key.strip():
             raise RuntimeError("category_levels contains an invalid key")
-        if not isinstance(values, list):
-            raise RuntimeError(f"category_levels[{key!r}] must be a list")
-        cleaned: list[int] = []
-        for idx, item in enumerate(values):
-            if isinstance(item, bool):
-                raise RuntimeError(f"category_levels[{key!r}][{idx}] must be an integer")
-            try:
-                cleaned.append(int(item))
-            except Exception as exc:
-                raise RuntimeError(f"category_levels[{key!r}][{idx}] must be an integer") from exc
-        category_levels[key] = cleaned
+        category_levels[key] = _require_nonempty_int_list(values, f"category_levels[{key!r}]")
 
     bundle_contract_raw = raw.get("bundle_contract")
     bundle_contract = bundle_contract_raw if isinstance(bundle_contract_raw, dict) else None
@@ -445,14 +458,15 @@ def _parse_metadata(raw: dict[str, Any]) -> ModelMetadata:
     artifact_plan_raw = raw.get("artifact_plan")
     artifact_plan = artifact_plan_raw if isinstance(artifact_plan_raw, dict) else None
 
-    if request_feature_order != engineered_feature_order:
-        raise RuntimeError("metadata request_feature_order and engineered_feature_order must match")
     if schema_version != raw.get("schema_version"):
         raise RuntimeError("metadata schema_version mismatch")
     if feature_version != raw.get("feature_version"):
         raise RuntimeError("metadata feature_version mismatch")
-    if preprocessing_version != raw.get("preprocessing_version"):
-        raise RuntimeError("metadata preprocessing_version mismatch")
+    if preprocessing_version != DEFAULT_PREPROCESSING_VERSION:
+        raise RuntimeError(
+            f"metadata preprocessing_version must be {DEFAULT_PREPROCESSING_VERSION!r}, "
+            f"got {preprocessing_version!r}"
+        )
 
     return ModelMetadata(
         model_name=model_name,
@@ -525,9 +539,10 @@ def _validate_bundle_consistency(
     if schema.feature_order != metadata.engineered_feature_order:
         raise RuntimeError("Schema feature_order and metadata engineered_feature_order mismatch")
 
-    if metadata.preprocessing_version != "matrix_identity_v1":
+    if metadata.preprocessing_version != DEFAULT_PREPROCESSING_VERSION:
         raise RuntimeError(
-            f"Metadata preprocessing_version must be 'matrix_identity_v1', got {metadata.preprocessing_version!r}"
+            f"Metadata preprocessing_version must be {DEFAULT_PREPROCESSING_VERSION!r}, "
+            f"got {metadata.preprocessing_version!r}"
         )
 
     if settings.model_sha256:
@@ -536,6 +551,22 @@ def _validate_bundle_consistency(
             raise RuntimeError(
                 f"Manifest model_sha256 mismatch: expected {expected_model_sha256!r}, got {manifest.model_sha256!r}"
             )
+
+
+def _validate_artifact_plan(metadata: ModelMetadata, manifest: ModelBundleManifest) -> None:
+    if metadata.artifact_plan is None:
+        return
+    plan = metadata.artifact_plan
+    root_uri = plan.get("artifact_root_s3_uri")
+    if root_uri is not None and str(root_uri).rstrip("/") != manifest.source_uri.rstrip("/"):
+        raise RuntimeError(
+            f"artifact_plan.artifact_root_s3_uri mismatch: expected {manifest.source_uri!r}, got {root_uri!r}"
+        )
+
+    for key in ("model_s3_uri", "schema_s3_uri", "metadata_s3_uri", "manifest_s3_uri"):
+        value = plan.get(key)
+        if value is not None and not str(value).strip():
+            raise RuntimeError(f"artifact_plan.{key} must be a non-empty string when provided")
 
 
 def _validate_bundle_files(cache_dir: Path) -> None:
@@ -554,12 +585,8 @@ def _cleanup_bundle(cache_dir: Path) -> None:
     shutil.rmtree(cache_dir, ignore_errors=True)
 
 
-def _manifest_cache_key(manifest: ModelBundleManifest) -> str:
-    return _cache_key(manifest.model_sha256, manifest.schema_sha256, manifest.model_version)
-
-
 def _transform_prediction_outputs(
-    outputs: list[Any],
+    outputs: Sequence[Any],
     *,
     prediction_cap_seconds: float,
 ) -> list[Any]:
@@ -665,8 +692,15 @@ def load_model_bundle(settings: Settings) -> tuple[Path, ModelSchema, ModelMetad
         manifest=manifest,
         settings=settings,
     )
+    _validate_artifact_plan(metadata, manifest)
 
-    cache_dir = _cache_dir(settings, manifest.model_sha256, schema_sha256, manifest.model_version)
+    cache_dir = _cache_dir(
+        settings,
+        manifest.model_sha256,
+        schema_sha256,
+        metadata_sha256,
+        manifest.model_version,
+    )
     lock_dir = cache_dir.parent / f".{cache_dir.name}.lock"
     model_path = cache_dir / _BUNDLE_MODEL_NAME
     schema_path = cache_dir / _BUNDLE_SCHEMA_NAME
@@ -712,6 +746,7 @@ def load_model_bundle(settings: Settings) -> tuple[Path, ModelSchema, ModelMetad
                     manifest=cached_manifest,
                     settings=settings,
                 )
+                _validate_artifact_plan(cached_metadata, cached_manifest)
 
                 logger.info(
                     "bundle.load.cache_hit",

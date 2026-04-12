@@ -7,7 +7,7 @@ import re
 import sys
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from flytekit import Resources, task
@@ -149,7 +149,7 @@ def parse_table_list(env_name: str, default_value: str) -> list[str]:
 def utc_cutoff_string(days: int) -> str:
     if days < 0:
         raise RuntimeError(f"days must be non-negative, got {days}")
-    cutoff = datetime.now(UTC) - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     return cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
 

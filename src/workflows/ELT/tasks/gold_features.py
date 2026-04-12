@@ -7,7 +7,7 @@ import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from flytekit import Resources, task
@@ -1148,7 +1148,7 @@ def gold_features(silver: SilverTransformResult) -> GoldFeatureResult:
         "encoding_spec_json": encoding_spec_json,
         "aggregate_spec_json": aggregate_spec_json,
         "label_spec_json": label_spec_json,
-        "created_ts": datetime.now(UTC),
+        "created_ts": datetime.now(timezone.utc),
     }
 
     _validate_contract_stability(
