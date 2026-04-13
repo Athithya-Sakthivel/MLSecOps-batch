@@ -50,37 +50,43 @@ export FEATURE_ORDER=pickup_hour,pickup_dow,pickup_month,pickup_is_weekend,picku
 export ALLOW_EXTRA_FEATURES=false
 export MODEL_CACHE_DIR=/mlsecops/model-cache
 export LOG_LEVEL=WARNING
-export RAY_IMAGE=ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-12-18-01--cb879d3@sha256:745919dfe5ffec5474c0f07d28ed067e30ea232ccf1d49b7d177b0096e8a6bdf
+export RAY_IMAGE=ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-13-04-58--7d3aa0f@sha256:9e416db3e3eda0483bb726f017bc4efd7a87011175df017e96362c60102c2c23
 export USE_IAM=false
 
 
 python3 src/infra/deploy/inference_service.py --delete
 python3 src/infra/deploy/inference_service.py --rollout
-sleep 120
+sleep 180
 kubectl get pods -A
+
 
 python3 src/infra/deploy/inference_service.py --delete
 
-H=$(kubectl get pod -n inference -l ray.io/node-type=head -o jsonpath='{.items[0].metadata.name}')
 HEAD_SVC=$(kubectl get svc -n inference -o name | grep 'head-svc$' | head -n1 | cut -d/ -f2)
-
-kubectl get rayservice -n inference tabular-inference -o yaml | sed -n '/^status:/,$p' | head -n 220
-
-kubectl exec -n inference "$H" -c ray-head -- bash -lc '
-echo "=== ray status ==="
-ray status | sed -n "/Cluster status:/,/Autoscaler status:/p" | head -n 220
-echo
-echo "=== ray summary actors ==="
-ray summary actors | sed -n "1,180p"
-'
-
-kubectl port-forward -n inference "svc/$HEAD_SVC" 8265:8265 >/tmp/raypf.log 2>&1 &
+kubectl port-forward -n inference "svc/$HEAD_SVC" 8000:8000 >/tmp/pf.log 2>&1 &
 PF=$!
-sleep 4
-curl -sS http://127.0.0.1:8265/api/serve/applications/ | sed -n '1,260p'
-curl -sS http://127.0.0.1:8265/-/routes | sed -n '1,120p'
+sleep 5
+echo "=== HEALTH ==="
+curl -sS http://127.0.0.1:8000/-/healthz
+echo -e "\n=== PREDICTION ==="
+curl -sS -X POST http://127.0.0.1:8000/predict \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "instances": [{
+      "pickup_hour": 9,
+      "pickup_dow": 2,
+      "pickup_month": 4,
+      "pickup_is_weekend": 0,
+      "pickup_borough_id": 1,
+      "pickup_zone_id": 15,
+      "pickup_service_zone_id": 2,
+      "dropoff_borough_id": 1,
+      "dropoff_zone_id": 30,
+      "dropoff_service_zone_id": 2,
+      "route_pair_id": 123,
+      "avg_duration_7d_zone_hour": 500.0,
+      "avg_fare_30d_zone": 18.0,
+      "trip_count_90d_zone_hour": 60
+    }]
+  }'
 kill "$PF"
-
-kubectl port-forward -n inference svc/tabular-inference-t9m5h-head-svc 8000:8000
-
-

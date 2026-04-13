@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
-import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,15 +18,14 @@ STATE_DIR = MANIFEST_DIR / ".state"
 RENDERED_PATH = STATE_DIR / "rendered.yaml"
 HASH_PATH = STATE_DIR / "rendered.sha256"
 
-MANIFEST_REVISION_ANNOTATION = "inference-service.io/revision"
 AUTH_MODE_ANNOTATION = "inference-service.io/auth-mode"
 
-DEPLOYMENT_DEFAULTS = {
+DEPLOYMENT_DEFAULTS: dict[str, str] = {
     "NAMESPACE": "inference",
     "RAYSERVICE_NAME": "tabular-inference",
     "SERVICE_ACCOUNT_NAME": "ray-inference-sa",
     "AWS_SECRET_NAME": "aws-credentials",
-    "RAY_IMAGE": "ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-13-04-17--4f51ecd@sha256:230fdf88cdcebf1063d5002346f54b158f30b1147196d62db409313a103a67a4",
+    "RAY_IMAGE": "ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-13-04-58--7d3aa0f@sha256:9e416db3e3eda0483bb726f017bc4efd7a87011175df017e96362c60102c2c23",
     "RAY_VERSION": "2.54.1",
     "HEAD_CPU": "1",
     "HEAD_MEMORY": "3Gi",
@@ -44,7 +42,7 @@ DEPLOYMENT_DEFAULTS = {
     "FS_GROUP": "1000",
 }
 
-APP_ENV_DEFAULTS = {
+APP_ENV_DEFAULTS: dict[str, str] = {
     "DEPLOYMENT_PROFILE": "prod",
     "OTEL_SERVICE_NAME": "tabular-inference",
     "SERVICE_VERSION": "v1",
@@ -92,7 +90,6 @@ APP_ENV_DEFAULTS = {
 
 APP_ENV_ORDER = list(APP_ENV_DEFAULTS.keys())
 REQUIRED_APP_ENV_NAMES = {
-    "RAY_IMAGE",
     "MODEL_URI",
     "MODEL_VERSION",
     "MODEL_SHA256",
@@ -101,15 +98,7 @@ REQUIRED_APP_ENV_NAMES = {
     "FEATURE_ORDER",
 }
 
-PLACEHOLDER_VALUES = {
-    "RAY_IMAGE": DEPLOYMENT_DEFAULTS["RAY_IMAGE"],
-    "MODEL_URI": APP_ENV_DEFAULTS["MODEL_URI"],
-    "MODEL_VERSION": APP_ENV_DEFAULTS["MODEL_VERSION"],
-    "MODEL_SHA256": APP_ENV_DEFAULTS["MODEL_SHA256"],
-    "MODEL_INPUT_NAME": APP_ENV_DEFAULTS["MODEL_INPUT_NAME"],
-    "MODEL_OUTPUT_NAMES": APP_ENV_DEFAULTS["MODEL_OUTPUT_NAMES"],
-    "FEATURE_ORDER": APP_ENV_DEFAULTS["FEATURE_ORDER"],
-}
+PLACEHOLDER_VALUES = {key: APP_ENV_DEFAULTS[key] for key in REQUIRED_APP_ENV_NAMES}
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,12 +152,10 @@ class DeploymentSettings:
             raise RuntimeError("MODEL_CACHE_VOLUME must not be empty")
         if not self.model_cache_dir.strip():
             raise RuntimeError("MODEL_CACHE_DIR must not be empty")
-
         if self.worker_replicas < 1:
             raise RuntimeError("WORKER_REPLICAS must be >= 1")
         if self.worker_max_replicas < self.worker_replicas:
             raise RuntimeError("WORKER_MAX_REPLICAS must be >= WORKER_REPLICAS")
-
         if self.run_as_user < 1:
             raise RuntimeError("RUN_AS_USER must be >= 1")
         if self.run_as_group < 1:
@@ -178,13 +165,18 @@ class DeploymentSettings:
 
 
 def _env_str(name: str, default: str) -> str:
-    return os.getenv(name, default).strip()
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip() or default
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, str(default)).strip()
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
     try:
-        return int(raw)
+        return int(raw.strip())
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
 
@@ -206,7 +198,6 @@ def _validate_log_level(value: str) -> str:
     normalized = value.strip().upper()
     if normalized == "WARN":
         normalized = "WARNING"
-
     allowed = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
     if not normalized:
         return "WARNING"
@@ -232,10 +223,7 @@ def _validate_auth_mode() -> tuple[bool, str | None]:
             raise RuntimeError(
                 "Do not mix USE_IAM=true with AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
             )
-        role_arn = _require_nonempty(
-            os.getenv("KUBERAY_IAM_ROLE_ARN"),
-            "KUBERAY_IAM_ROLE_ARN is required when USE_IAM=true",
-        )
+        role_arn = os.getenv("KUBERAY_IAM_ROLE_ARN", "").strip() or None
         return True, role_arn
 
     if not access_key or not secret_key:
@@ -246,7 +234,7 @@ def _validate_auth_mode() -> tuple[bool, str | None]:
     return False, None
 
 
-def _static_credentials() -> tuple[dict[str, str], str]:
+def _static_credentials() -> dict[str, str]:
     access_key = _require_nonempty(
         os.getenv("AWS_ACCESS_KEY_ID"),
         "AWS_ACCESS_KEY_ID is required when USE_IAM=false",
@@ -255,12 +243,10 @@ def _static_credentials() -> tuple[dict[str, str], str]:
         os.getenv("AWS_SECRET_ACCESS_KEY"),
         "AWS_SECRET_ACCESS_KEY is required when USE_IAM=false",
     )
-    payload = {
+    return {
         "AWS_ACCESS_KEY_ID": access_key,
         "AWS_SECRET_ACCESS_KEY": secret_key,
     }
-    digest = hashlib.sha256(f"{access_key}\n{secret_key}".encode()).hexdigest()
-    return payload, digest
 
 
 def load_deployment_settings() -> DeploymentSettings:
@@ -303,19 +289,13 @@ def load_deployment_settings() -> DeploymentSettings:
 
 def load_app_env() -> dict[str, str]:
     env: dict[str, str] = {}
-
     for name in APP_ENV_ORDER:
-        default = APP_ENV_DEFAULTS[name]
-        value = _env_str(name, default)
-
+        value = _env_str(name, APP_ENV_DEFAULTS[name])
         if name == "LOG_LEVEL":
             value = _validate_log_level(value)
-
         if name in REQUIRED_APP_ENV_NAMES and (not value or value == PLACEHOLDER_VALUES[name]):
             raise RuntimeError(f"{name} is required and must be set explicitly")
-
         env[name] = value
-
     return env
 
 
@@ -330,147 +310,100 @@ def _base_labels(settings: DeploymentSettings) -> dict[str, str]:
 def _secret_ref_env(name: str, secret_name: str) -> dict[str, Any]:
     return {
         "name": name,
-        "valueFrom": {"secretKeyRef": {"name": secret_name, "key": name}},
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": secret_name,
+                "key": name,
+            }
+        },
     }
 
 
 def _build_container_env(app_env: dict[str, str], settings: DeploymentSettings) -> list[dict[str, Any]]:
     env: list[dict[str, Any]] = []
-
     for name in APP_ENV_ORDER:
         if name in {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}:
             if settings.use_iam:
                 continue
             env.append(_secret_ref_env(name, settings.aws_secret_name))
             continue
-
         if name == "USE_IAM":
             env.append({"name": name, "value": "true" if settings.use_iam else "false"})
             continue
-
         env.append({"name": name, "value": app_env[name]})
-
     return env
 
 
 def _container_security_context() -> dict[str, Any]:
     return {
         "allowPrivilegeEscalation": False,
-        "readOnlyRootFilesystem": True,
         "capabilities": {"drop": ["ALL"]},
     }
 
 
-def _probe_command(command: str) -> dict[str, Any]:
-    return {"exec": {"command": ["bash", "-lc", command]}}
+def _probe(command: str, timeout: int, period: int, failure_threshold: int) -> dict[str, Any]:
+    return {
+        "exec": {
+            "command": ["/bin/bash", "-lc", command],
+        },
+        "initialDelaySeconds": 0,
+        "timeoutSeconds": timeout,
+        "periodSeconds": period,
+        "failureThreshold": failure_threshold,
+        "successThreshold": 1,
+    }
 
 
-def _ray_health_check(address: str) -> str:
-    return f"ray health-check --address {address} >/dev/null 2>&1"
-
-
-def _python_http_check(url: str, timeout_s: int = 5) -> str:
+def _python_json_probe(url: str, expected_key: str, expected_value: str, timeout: int) -> str:
     return textwrap.dedent(
         f"""
         python3 - <<'PY'
-        import sys
+        import json
         import urllib.request
 
         try:
-            with urllib.request.urlopen({url!r}, timeout={timeout_s}) as resp:
-                body = resp.read().decode('utf-8', 'ignore')
+            with urllib.request.urlopen({url!r}, timeout={timeout}) as resp:
+                body = resp.read().decode("utf-8", "ignore")
         except Exception:
             raise SystemExit(1)
 
-        raise SystemExit(0 if 'success' in body else 1)
+        try:
+            payload = json.loads(body)
+        except Exception:
+            raise SystemExit(1)
+
+        raise SystemExit(0 if payload.get({expected_key!r}) == {expected_value!r} else 1)
         PY
         """
     ).strip()
 
 
-def _head_probes() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    ray = _ray_health_check("127.0.0.1:6379")
-    return _probe_command(ray), _probe_command(ray), _probe_command(ray)
-
-
-def _worker_probes() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    ray = _ray_health_check("127.0.0.1:52365")
-    serve = _python_http_check("http://127.0.0.1:8000/-/healthz")
-    return _probe_command(ray), _probe_command(f"{ray} && {serve}"), _probe_command(f"{ray} && {serve}")
-
-
-def _pod_template_common(settings: DeploymentSettings) -> dict[str, Any]:
+def _head_probes() -> dict[str, Any]:
+    ray_cmd = "ray health-check --address 127.0.0.1:6379 >/dev/null 2>&1"
     return {
-        "securityContext": {
-            "runAsNonRoot": True,
-            "runAsUser": settings.run_as_user,
-            "runAsGroup": settings.run_as_group,
-            "fsGroup": settings.fs_group,
-        },
-        "terminationGracePeriodSeconds": 30,
-        "volumes": [
-            {"name": "tmp", "emptyDir": {}},
-            {"name": "model-cache", "emptyDir": {}},
-            {"name": "shared-mem", "emptyDir": {"medium": "Memory", "sizeLimit": "3Gi"}},
-        ],
+        "startupProbe": _probe(ray_cmd, timeout=30, period=5, failure_threshold=60),
+        "readinessProbe": _probe(ray_cmd, timeout=15, period=5, failure_threshold=12),
+        "livenessProbe": _probe(ray_cmd, timeout=15, period=10, failure_threshold=12),
     }
 
 
-def _head_container(settings: DeploymentSettings, env: list[dict[str, Any]]) -> dict[str, Any]:
-    liveness, readiness, startup = _head_probes()
+def _worker_probes() -> dict[str, Any]:
+    ray_cmd = 'ray health-check --address "${FQ_RAY_IP}:6379" >/dev/null 2>&1'
+    http_cmd = _python_json_probe(
+        "http://127.0.0.1:8000/healthz",
+        expected_key="status",
+        expected_value="ok",
+        timeout=10,
+    )
     return {
-        "name": "ray-head",
-        "image": settings.ray_image,
-        "imagePullPolicy": "IfNotPresent",
-        "securityContext": _container_security_context(),
-        "resources": {
-            "requests": {"cpu": settings.head_cpu, "memory": settings.head_memory},
-            "limits": {"cpu": settings.head_cpu, "memory": settings.head_memory},
-        },
-        "volumeMounts": [
-            {"name": "tmp", "mountPath": "/tmp"},
-            {"name": "model-cache", "mountPath": settings.model_cache_volume},
-            {"name": "shared-mem", "mountPath": "/dev/shm"},
-        ],
-        "env": env,
-        "startupProbe": startup,
-        "readinessProbe": readiness,
-        "livenessProbe": liveness,
-    }
-
-
-def _worker_container(settings: DeploymentSettings, env: list[dict[str, Any]]) -> dict[str, Any]:
-    liveness, readiness, startup = _worker_probes()
-    return {
-        "name": "ray-worker",
-        "image": settings.ray_image,
-        "imagePullPolicy": "IfNotPresent",
-        "securityContext": _container_security_context(),
-        "resources": {
-            "requests": {"cpu": settings.worker_cpu, "memory": settings.worker_memory},
-            "limits": {"cpu": settings.worker_cpu, "memory": settings.worker_memory},
-        },
-        "volumeMounts": [
-            {"name": "tmp", "mountPath": "/tmp"},
-            {"name": "model-cache", "mountPath": settings.model_cache_volume},
-            {"name": "shared-mem", "mountPath": "/dev/shm"},
-        ],
-        "env": env,
-        "startupProbe": startup,
-        "readinessProbe": readiness,
-        "livenessProbe": liveness,
-    }
-
-
-def _secret_doc_metadata(settings: DeploymentSettings) -> dict[str, Any]:
-    return {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": settings.aws_secret_name,
-            "namespace": settings.namespace,
-            "labels": _base_labels(settings),
-        },
+        "startupProbe": _probe(ray_cmd, timeout=30, period=5, failure_threshold=60),
+        "readinessProbe": _probe(
+            f"{ray_cmd} && {http_cmd}",
+            timeout=20,
+            period=5,
+            failure_threshold=12,
+        ),
+        "livenessProbe": _probe(ray_cmd, timeout=15, period=10, failure_threshold=12),
     }
 
 
@@ -478,7 +411,10 @@ def build_namespace_doc(settings: DeploymentSettings) -> dict[str, Any]:
     return {
         "apiVersion": "v1",
         "kind": "Namespace",
-        "metadata": {"name": settings.namespace, "labels": _base_labels(settings)},
+        "metadata": {
+            "name": settings.namespace,
+            "labels": _base_labels(settings),
+        },
     }
 
 
@@ -497,7 +433,9 @@ def build_service_account_doc(settings: DeploymentSettings) -> dict[str, Any] | 
             "name": settings.service_account_name,
             "namespace": settings.namespace,
             "labels": _base_labels(settings),
-            "annotations": {"eks.amazonaws.com/role-arn": role_arn},
+            "annotations": {
+                "eks.amazonaws.com/role-arn": role_arn,
+            },
         },
     }
 
@@ -516,21 +454,113 @@ def build_secret_doc(settings: DeploymentSettings, secret_data: dict[str, str]) 
     }
 
 
-def build_rayservice_doc(settings: DeploymentSettings, app_env: dict[str, str], revision: str) -> dict[str, Any]:
-    labels = _base_labels(settings)
-    annotations = {AUTH_MODE_ANNOTATION: "iam" if settings.use_iam else "static", MANIFEST_REVISION_ANNOTATION: revision}
-    container_env = _build_container_env(app_env, settings)
-    pod_template_common = _pod_template_common(settings)
+def build_secret_delete_doc(settings: DeploymentSettings) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": settings.aws_secret_name,
+            "namespace": settings.namespace,
+        },
+    }
 
-    head_container = _head_container(settings, container_env)
-    worker_container = _worker_container(settings, container_env)
+
+def build_rayservice_doc(
+    settings: DeploymentSettings,
+    app_env: dict[str, str],
+) -> dict[str, Any]:
+    labels = _base_labels(settings)
+    annotations = {
+        AUTH_MODE_ANNOTATION: "iam" if settings.use_iam else "static",
+    }
+    container_env = _build_container_env(app_env, settings)
+
+    pod_template_common = {
+        "securityContext": {
+            "runAsNonRoot": True,
+            "runAsUser": settings.run_as_user,
+            "runAsGroup": settings.run_as_group,
+            "fsGroup": settings.fs_group,
+        },
+        "terminationGracePeriodSeconds": 30,
+        "volumes": [
+            {
+                "name": "model-cache",
+                "emptyDir": {},
+            }
+        ],
+    }
+
+    head_container = {
+        "name": "ray-head",
+        "image": settings.ray_image,
+        "imagePullPolicy": "IfNotPresent",
+        "securityContext": _container_security_context(),
+        "resources": {
+            "requests": {
+                "cpu": settings.head_cpu,
+                "memory": settings.head_memory,
+            },
+            "limits": {
+                "cpu": settings.head_cpu,
+                "memory": settings.head_memory,
+            },
+        },
+        "volumeMounts": [
+            {
+                "name": "model-cache",
+                "mountPath": settings.model_cache_volume,
+            }
+        ],
+        "env": container_env,
+        **_head_probes(),
+    }
+
+    worker_container = {
+        "name": "ray-worker",
+        "image": settings.ray_image,
+        "imagePullPolicy": "IfNotPresent",
+        "securityContext": _container_security_context(),
+        "resources": {
+            "requests": {
+                "cpu": settings.worker_cpu,
+                "memory": settings.worker_memory,
+            },
+            "limits": {
+                "cpu": settings.worker_cpu,
+                "memory": settings.worker_memory,
+            },
+        },
+        "volumeMounts": [
+            {
+                "name": "model-cache",
+                "mountPath": settings.model_cache_volume,
+            }
+        ],
+        "env": container_env,
+        **_worker_probes(),
+    }
 
     if settings.use_iam:
-        head_template_spec = {**pod_template_common, "serviceAccountName": settings.service_account_name, "containers": [head_container]}
-        worker_template_spec = {**pod_template_common, "serviceAccountName": settings.service_account_name, "containers": [worker_container]}
+        head_template_spec = {
+            **pod_template_common,
+            "serviceAccountName": settings.service_account_name,
+            "containers": [head_container],
+        }
+        worker_template_spec = {
+            **pod_template_common,
+            "serviceAccountName": settings.service_account_name,
+            "containers": [worker_container],
+        }
     else:
-        head_template_spec = {**pod_template_common, "containers": [head_container]}
-        worker_template_spec = {**pod_template_common, "containers": [worker_container]}
+        head_template_spec = {
+            **pod_template_common,
+            "containers": [head_container],
+        }
+        worker_template_spec = {
+            **pod_template_common,
+            "containers": [worker_container],
+        }
 
     serve_config_v2 = textwrap.dedent(
         """
@@ -560,14 +590,20 @@ def build_rayservice_doc(settings: DeploymentSettings, app_env: dict[str, str], 
             "rayClusterConfig": {
                 "rayVersion": settings.ray_version,
                 "enableInTreeAutoscaling": True,
-                "autoscalerOptions": {"version": "v2", "idleTimeoutSeconds": 60},
+                "autoscalerOptions": {
+                    "version": "v2",
+                    "idleTimeoutSeconds": 60,
+                },
                 "headGroupSpec": {
                     "serviceType": "ClusterIP",
                     "rayStartParams": {
                         "dashboard-host": "0.0.0.0",
+                        "include-dashboard": "true",
                         "num-cpus": settings.head_ray_num_cpus,
                     },
-                    "template": {"spec": head_template_spec},
+                    "template": {
+                        "spec": head_template_spec,
+                    },
                 },
                 "workerGroupSpecs": [
                     {
@@ -575,8 +611,12 @@ def build_rayservice_doc(settings: DeploymentSettings, app_env: dict[str, str], 
                         "replicas": settings.worker_replicas,
                         "minReplicas": 1,
                         "maxReplicas": settings.worker_max_replicas,
-                        "rayStartParams": {"num-cpus": settings.worker_ray_num_cpus},
-                        "template": {"spec": worker_template_spec},
+                        "rayStartParams": {
+                            "num-cpus": settings.worker_ray_num_cpus,
+                        },
+                        "template": {
+                            "spec": worker_template_spec,
+                        },
                     }
                 ],
             },
@@ -585,19 +625,38 @@ def build_rayservice_doc(settings: DeploymentSettings, app_env: dict[str, str], 
     }
 
 
-def _canonical_payload(docs: list[dict[str, Any]], secret_data: dict[str, str] | None) -> str:
-    payload = {"docs": docs, "secret_data": secret_data or {}}
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+def build_documents(settings: DeploymentSettings, app_env: dict[str, str]) -> list[dict[str, Any]]:
+    docs: list[dict[str, Any]] = [build_namespace_doc(settings)]
+
+    sa_doc = build_service_account_doc(settings)
+    if sa_doc is not None:
+        docs.append(sa_doc)
+
+    docs.append(build_rayservice_doc(settings, app_env))
+    return docs
 
 
-def _fingerprint(payload: str) -> tuple[str, str]:
-    digest = hashlib.sha256(payload.encode()).hexdigest()
-    revision = base64.b32encode(bytes.fromhex(digest)).decode("ascii").rstrip("=").lower()[:16]
-    return digest, revision
+def render_documents(docs: list[dict[str, Any]]) -> str:
+    return yaml.safe_dump_all(
+        docs,
+        sort_keys=False,
+        default_flow_style=False,
+        explicit_start=True,
+    )
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def ensure_state_dir() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def write_state(rendered_yaml: str, digest: str) -> None:
+    ensure_state_dir()
+    RENDERED_PATH.write_text(rendered_yaml, encoding="utf-8")
+    HASH_PATH.write_text(digest + "\n", encoding="utf-8")
 
 
 def read_previous_hash() -> str | None:
@@ -607,30 +666,44 @@ def read_previous_hash() -> str | None:
     return value or None
 
 
-def write_state(rendered_yaml: str, digest: str) -> None:
-    ensure_state_dir()
-    RENDERED_PATH.write_text(rendered_yaml, encoding="utf-8")
-    HASH_PATH.write_text(digest + "\n", encoding="utf-8")
+def write_temp_yaml(text: str) -> Path:
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    try:
+        tmp.write(text)
+        tmp.flush()
+        return Path(tmp.name)
+    finally:
+        tmp.close()
 
 
-def render_documents(docs: list[dict[str, Any]]) -> str:
-    return yaml.safe_dump_all(docs, sort_keys=False, default_flow_style=False, explicit_start=True)
+def kubectl_apply(path: Path) -> None:
+    subprocess.run(["kubectl", "apply", "-f", str(path)], check=True)
 
 
-def kubectl_apply_yaml(rendered_yaml: str) -> None:
-    subprocess.run(["kubectl", "apply", "-f", "-"], input=rendered_yaml, text=True, check=True)
-
-
-def kubectl_delete_yaml(rendered_yaml: str) -> None:
-    subprocess.run(["kubectl", "delete", "-f", "-", "--ignore-not-found"], input=rendered_yaml, text=True, check=True)
+def kubectl_delete(path: Path) -> None:
+    subprocess.run(["kubectl", "delete", "-f", str(path), "--ignore-not-found"], check=True)
 
 
 def kubectl_apply_doc(doc: dict[str, Any]) -> None:
-    kubectl_apply_yaml(render_documents([doc]))
+    path = write_temp_yaml(render_documents([doc]))
+    try:
+        kubectl_apply(path)
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def kubectl_delete_doc(doc: dict[str, Any]) -> None:
-    kubectl_delete_yaml(render_documents([doc]))
+    path = write_temp_yaml(render_documents([doc]))
+    try:
+        kubectl_delete(path)
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def rollout() -> int:
@@ -638,57 +711,63 @@ def rollout() -> int:
     app_env = load_app_env()
 
     secret_doc: dict[str, Any] | None = None
-    secret_data: dict[str, str] | None = None
     if not settings.use_iam:
-        secret_data, _ = _static_credentials()
-        secret_doc = build_secret_doc(settings, secret_data)
+        secret_doc = build_secret_doc(settings, _static_credentials())
 
-    namespace_doc = build_namespace_doc(settings)
-    sa_doc = build_service_account_doc(settings)
-    canonical_docs = [namespace_doc] + ([sa_doc] if sa_doc is not None else [])
+    docs = build_documents(settings, app_env)
+    rendered = render_documents(docs)
+    digest = sha256_text(rendered)
 
-    digest, revision = _fingerprint(_canonical_payload(canonical_docs, secret_data))
     previous = read_previous_hash()
     if previous == digest and RENDERED_PATH.exists():
         print(f"[OK] Manifest unchanged; hash={digest}")
         return 0
 
-    rayservice_doc = build_rayservice_doc(settings, app_env, revision)
-    docs_to_apply = [namespace_doc]
+    kubectl_apply_doc(docs[0])
     if secret_doc is not None:
-        docs_to_apply.append(secret_doc)
-    if sa_doc is not None:
-        docs_to_apply.append(sa_doc)
-    docs_to_apply.append(rayservice_doc)
+        kubectl_apply_doc(secret_doc)
+    if len(docs) > 1 and docs[1].get("kind") == "ServiceAccount":
+        kubectl_apply_doc(docs[1])
 
-    for doc in docs_to_apply:
-        kubectl_apply_doc(doc)
-
-    write_state(render_documents([*canonical_docs, rayservice_doc]), digest)
-    print(f"[OK] Rollout applied; hash={digest}")
-    return 0
+    rayservice_doc = docs[-1]
+    rayservice_path = write_temp_yaml(render_documents([rayservice_doc]))
+    try:
+        kubectl_apply(rayservice_path)
+        write_state(rendered, digest)
+        print(f"[OK] Rollout applied; hash={digest}")
+        return 0
+    finally:
+        try:
+            rayservice_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def delete() -> int:
     settings = load_deployment_settings()
 
+    namespace_doc = build_namespace_doc(settings)
+    sa_doc = build_service_account_doc(settings)
+    rayservice_doc: dict[str, Any] | None = None
+
     if RENDERED_PATH.exists():
         rendered_yaml = RENDERED_PATH.read_text(encoding="utf-8")
-        docs = [doc for doc in yaml.safe_load_all(rendered_yaml) if isinstance(doc, dict)]
-        namespace_doc = next((doc for doc in docs if doc.get("kind") == "Namespace"), build_namespace_doc(settings))
-        sa_doc = next((doc for doc in docs if doc.get("kind") == "ServiceAccount"), None)
-        rayservice_doc = next((doc for doc in docs if doc.get("kind") == "RayService"), None)
-    else:
-        namespace_doc = build_namespace_doc(settings)
-        sa_doc = build_service_account_doc(settings)
-        rayservice_doc = build_rayservice_doc(settings, load_app_env(), "bootstrap")
+        docs = list(yaml.safe_load_all(rendered_yaml))
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            if doc.get("kind") == "RayService":
+                rayservice_doc = doc
+                break
+
+    if rayservice_doc is None:
+        rayservice_doc = build_rayservice_doc(settings, load_app_env())
 
     secret_doc = None
     if not settings.use_iam:
-        secret_doc = _secret_doc_metadata(settings)
+        secret_doc = build_secret_delete_doc(settings)
 
-    if rayservice_doc is not None:
-        kubectl_delete_doc(rayservice_doc)
+    kubectl_delete_doc(rayservice_doc)
     if sa_doc is not None:
         kubectl_delete_doc(sa_doc)
     if secret_doc is not None:
