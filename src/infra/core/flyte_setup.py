@@ -83,7 +83,7 @@ CHART_NAME = os.environ.get("CHART_NAME", "flyte-core")
 CHART_VERSION = os.environ.get("CHART_VERSION", "1.16.4")
 RELEASE_NAME = os.environ.get("RELEASE_NAME", "flyte")
 
-READY_TIMEOUT = os.environ.get("READY_TIMEOUT", "1200")
+READY_TIMEOUT = int(os.environ.get("READY_TIMEOUT", "1200"))
 ROLLOUT_TIMEOUT = os.environ.get("ROLLOUT_TIMEOUT", "1200s")
 DNS_TIMEOUT = int(os.environ.get("DNS_TIMEOUT", "300"))
 FLYTE_ATOMIC = os.environ.get("FLYTE_ATOMIC", "false").lower() in {"1", "true", "yes", "y", "on"}
@@ -91,9 +91,31 @@ FLYTE_ATOMIC = os.environ.get("FLYTE_ATOMIC", "false").lower() in {"1", "true", 
 DELETE_TARGET_NAMESPACE = os.environ.get("DELETE_TARGET_NAMESPACE", "true").lower() in {"1", "true", "yes", "y", "on"}
 DELETE_TASK_NAMESPACES = os.environ.get("DELETE_TASK_NAMESPACES", "false").lower() in {"1", "true", "yes", "y", "on"}
 DELETE_FLYTE_CRDS = os.environ.get("DELETE_FLYTE_CRDS", "true").lower() in {"1", "true", "yes", "y", "on"}
+FORCE_FINALIZER_REMOVAL = os.environ.get("FORCE_FINALIZER_REMOVAL", "true").lower() in {"1", "true", "yes", "y", "on"}
 
 APP_DB_USER = ""
 APP_DB_PASSWORD = ""
+
+MANAGED_LABEL_SELECTORS = [
+    f"app.kubernetes.io/instance={RELEASE_NAME}",
+    "app.kubernetes.io/part-of=flyte",
+]
+
+FLYTE_CR_RESOURCES = [
+    "workflows.flyte.org",
+    "launchplans.flyte.org",
+    "tasks.flyte.org",
+    "workflows.flyte.io",
+    "launchplans.flyte.io",
+    "tasks.flyte.io",
+]
+
+CLUSTER_MANAGED_RESOURCES = [
+    "clusterroles",
+    "clusterrolebindings",
+    "mutatingwebhookconfigurations",
+    "validatingwebhookconfigurations",
+]
 
 
 def ts() -> str:
@@ -108,7 +130,31 @@ def fatal(msg: str) -> None:
     print(f"[{ts()}] [flyte][FATAL] {msg}", file=sys.stderr, flush=True)
     raise SystemExit(1)
 
+def wait_for_service_endpoints(namespace: str, svc_name: str, max_wait: int = 180) -> None:
+    elapsed = 0
+    while True:
+        cp = run(
+            [
+                "kubectl",
+                "-n",
+                namespace,
+                "get",
+                "endpoints",
+                svc_name,
+                "-o",
+                "jsonpath={.subsets[*].addresses[*].ip}",
+            ],
+            check=False,
+        )
+        if cp.returncode == 0 and cp.stdout.strip():
+            return
 
+        time.sleep(5)
+        elapsed += 5
+        if elapsed >= max_wait:
+            fatal(f"Service '{svc_name}' has no endpoints after {max_wait}s")
+
+            
 def require_bin(name: str) -> None:
     if shutil.which(name) is None:
         fatal(f"{name} required in PATH")
@@ -208,10 +254,7 @@ def ensure_default_serviceaccount(namespace: str) -> None:
         {
             "apiVersion": "v1",
             "kind": "ServiceAccount",
-            "metadata": {
-                "name": "default",
-                "namespace": namespace,
-            },
+            "metadata": {"name": "default", "namespace": namespace},
         }
     )
 
@@ -220,10 +263,7 @@ def patch_default_serviceaccount_annotation(namespace: str, key: str, value: str
     if not key or not value:
         return
     ensure_default_serviceaccount(namespace)
-    run(
-        ["kubectl", "-n", namespace, "annotate", "sa", "default", f"{key}={value}", "--overwrite"],
-        check=True,
-    )
+    run(["kubectl", "-n", namespace, "annotate", "sa", "default", f"{key}={value}", "--overwrite"], check=True)
 
 
 def ensure_serviceaccount(namespace: str, name: str, annotations: dict[str, str] | None = None) -> None:
@@ -278,17 +318,7 @@ def secret_value(namespace: str, secret_name: str, key: str) -> str:
 def find_app_secret_name() -> str:
     selector = f"cnpg.io/cluster={CNPG_CLUSTER},cnpg.io/userType=app"
     cp = run(
-        [
-            "kubectl",
-            "-n",
-            POSTGRES_NS,
-            "get",
-            "secret",
-            "-l",
-            selector,
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ],
+        ["kubectl", "-n", POSTGRES_NS, "get", "secret", "-l", selector, "-o", "jsonpath={.items[0].metadata.name}"],
         check=False,
     )
     if cp.returncode == 0 and cp.stdout.strip():
@@ -512,14 +542,8 @@ def build_k8s_block(provider: str) -> dict[str, Any]:
 def build_task_resource_defaults() -> dict[str, Any]:
     return {
         "task_resources": {
-            "defaults": {
-                "cpu": "500m",
-                "memory": "512Mi",
-            },
-            "limits": {
-                "cpu": "32",
-                "memory": "32Gi",
-            },
+            "defaults": {"cpu": "500m", "memory": "512Mi"},
+            "limits": {"cpu": "32", "memory": "32Gi"},
         }
     }
 
@@ -546,7 +570,7 @@ def build_values(provider: str) -> dict[str, Any]:
         raw_prefix = os.environ.get("FLYTE_RAWOUTPUT_PREFIX", "")
         remote_scheme = "local"
 
-    values: dict[str, Any] = {
+    return {
         "deployRedoc": False,
         "flyteadmin": {
             "enabled": True,
@@ -707,7 +731,6 @@ def build_values(provider: str) -> dict[str, Any]:
         "daskoperator": {"enabled": yaml_bool(FLYTE_DASK_OPERATOR_ENABLED)},
         "databricks": {"enabled": yaml_bool(FLYTE_DATABRICKS_ENABLED)},
     }
-    return values
 
 
 def render_values_file(values: dict[str, Any]) -> None:
@@ -731,6 +754,7 @@ def validate_rendered_values() -> None:
             TARGET_NS,
             "-f",
             str(VALUES_FILE),
+            "--skip-crds",
         ],
         check=True,
     )
@@ -773,23 +797,16 @@ def service_has_endpoints(namespace: str, name: str) -> bool:
 def ensure_dns_ready() -> None:
     log("waiting for cluster DNS")
     deadline = time.monotonic() + DNS_TIMEOUT
-    candidates = ("coredns", "kube-dns")
-    service_candidates = ("kube-dns", "coredns", "dns")
-
     while time.monotonic() < deadline:
-        for name in candidates:
-            if deployment_available("kube-system", name):
-                log(f"cluster DNS ready via deployment/{name}")
+        for name in ("coredns", "kube-dns"):
+            if deployment_available("kube-system", name) or daemonset_ready("kube-system", name):
+                log(f"cluster DNS ready via {name}")
                 return
-            if daemonset_ready("kube-system", name):
-                log(f"cluster DNS ready via daemonset/{name}")
-                return
-        for name in service_candidates:
+        for name in ("kube-dns", "coredns", "dns"):
             if service_has_endpoints("kube-system", name):
                 log(f"cluster DNS ready via service/{name} endpoints")
                 return
         time.sleep(2)
-
     fatal(f"DNS not ready after {DNS_TIMEOUT}s")
 
 
@@ -892,9 +909,7 @@ def compute_rollout_hash(values: dict[str, Any], provider: str) -> str:
 
 def read_cluster_hash() -> str:
     cp = run(["kubectl", "-n", TARGET_NS, "get", "configmap", STATE_CONFIGMAP, "-o", "jsonpath={.data.spec-hash}"], check=False)
-    if cp.returncode != 0:
-        return ""
-    return cp.stdout.strip()
+    return cp.stdout.strip() if cp.returncode == 0 else ""
 
 
 def write_cluster_hash(spec_hash: str) -> None:
@@ -910,24 +925,6 @@ def write_cluster_hash(spec_hash: str) -> None:
 def release_exists() -> bool:
     cp = run(["helm", "list", "-n", TARGET_NS, "--filter", f"^{RELEASE_NAME}$", "-q"], check=False)
     return cp.returncode == 0 and bool(cp.stdout.strip())
-
-
-def helm_template_validate() -> None:
-    run(
-        [
-            "helm",
-            "template",
-            RELEASE_NAME,
-            f"{CHART_REPO_NAME}/{CHART_NAME}",
-            "--version",
-            CHART_VERSION,
-            "-n",
-            TARGET_NS,
-            "-f",
-            str(VALUES_FILE),
-        ],
-        check=True,
-    )
 
 
 def helm_repo_sync() -> None:
@@ -972,18 +969,6 @@ def ensure_task_namespace_ready(namespace: str, provider: str) -> None:
 def ensure_task_namespaces_ready(provider: str) -> None:
     for namespace in split_namespaces(os.environ.get("FLYTE_TASK_NAMESPACES", "flytesnacks-development")):
         ensure_task_namespace_ready(namespace, provider)
-
-
-def wait_for_service_endpoints(namespace: str, svc_name: str, max_wait: int = 180) -> None:
-    elapsed = 0
-    while True:
-        cp = run(["kubectl", "-n", namespace, "get", "endpoints", svc_name, "-o", "jsonpath={.subsets[*].addresses[*].ip}"], check=False)
-        if cp.returncode == 0 and cp.stdout.strip():
-            return
-        time.sleep(5)
-        elapsed += 5
-        if elapsed >= max_wait:
-            fatal(f"Service '{svc_name}' has no endpoints after {max_wait}s")
 
 
 def install_or_upgrade(provider: str, values: dict[str, Any], spec_hash: str) -> None:
@@ -1060,52 +1045,189 @@ def reconcile(provider: str) -> None:
     print_summary(provider, spec_hash)
 
 
-def delete_task_namespace_bootstrap(namespace: str) -> None:
-    for kind, name in (("secret", TASK_AWS_SECRET_NAME), ("serviceaccount", TASK_SERVICE_ACCOUNT)):
-        run(["kubectl", "-n", namespace, "delete", kind, name, "--ignore-not-found"], check=False)
+def api_resources(*, namespaced: bool) -> list[str]:
+    flag = "--namespaced=true" if namespaced else "--namespaced=false"
+    cp = run(["kubectl", "api-resources", "--verbs=list", flag, "-o", "name"], check=True)
+    out = []
+    for line in cp.stdout.splitlines():
+        line = line.strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def get_objects(resource: str, *, namespace: str | None = None, all_namespaces: bool = False) -> list[dict[str, Any]]:
+    cmd = ["kubectl", "get", resource, "-o", "json"]
+    if all_namespaces:
+        cmd.insert(2, "-A")
+    elif namespace:
+        cmd[2:2] = ["-n", namespace]
+    cp = run(cmd, check=False)
+    if cp.returncode != 0 or not cp.stdout.strip():
+        return []
+    try:
+        payload = json.loads(cp.stdout)
+    except Exception:
+        return []
+    return payload.get("items", [])
+
+
+def wait_for_objects_deleted(
+    resource: str,
+    *,
+    namespace: str | None = None,
+    all_namespaces: bool = False,
+    timeout: int = 120,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not get_objects(resource, namespace=namespace, all_namespaces=all_namespaces):
+            return True
+        time.sleep(2)
+    return not get_objects(resource, namespace=namespace, all_namespaces=all_namespaces)
+
+
+def patch_finalizers(resource: str, *, namespace: str | None = None, all_namespaces: bool = False) -> int:
+    patched = 0
+    for obj in get_objects(resource, namespace=namespace, all_namespaces=all_namespaces):
+        meta = obj.get("metadata", {})
+        if not meta.get("finalizers"):
+            continue
+        name = meta.get("name")
+        ns = meta.get("namespace")
+        if not name:
+            continue
+        cmd = ["kubectl", "patch", resource, name, "--type=merge", "-p", '{"metadata":{"finalizers":[]}}']
+        if ns:
+            cmd[2:2] = ["-n", ns]
+        if not all_namespaces and namespace is None and ns:
+            cmd[2:2] = ["-n", ns]
+        cp = run(cmd, check=False)
+        if cp.returncode == 0:
+            patched += 1
+    return patched
+
+
+def delete_resource_type(resource: str, *, namespace: str | None = None, all_namespaces: bool = False, selector: str | None = None) -> None:
+    cmd = ["kubectl", "delete", resource]
+    if all_namespaces:
+        cmd.append("-A")
+    elif namespace:
+        cmd.extend(["-n", namespace])
+    if selector:
+        cmd.extend(["-l", selector])
+    cmd.extend(["--ignore-not-found", "--wait=true", f"--timeout={READY_TIMEOUT}s"])
+    run(cmd, check=False)
+
+
+def delete_selected_resources(resource_types: list[str], *, namespace: str | None = None, all_namespaces: bool = False, selector: str | None = None) -> None:
+    for resource in resource_types:
+        delete_resource_type(resource, namespace=namespace, all_namespaces=all_namespaces, selector=selector)
 
 
 def delete_flyte_custom_resources() -> None:
-    resources = [
-        "workflows.flyte.org",
-        "launchplans.flyte.org",
-        "tasks.flyte.org",
-        "workflows.flyte.io",
-        "launchplans.flyte.io",
-        "tasks.flyte.io",
-    ]
-    for resource in resources:
-        run(["kubectl", "delete", resource, "--all", "--all-namespaces", "--ignore-not-found", "--wait=true"], check=False)
+    for resource in FLYTE_CR_RESOURCES:
+        log(f"deleting Flyte CRs: {resource}")
+        delete_resource_type(resource, all_namespaces=True)
+        if not wait_for_objects_deleted(resource, all_namespaces=True, timeout=180) and FORCE_FINALIZER_REMOVAL:
+            patched = patch_finalizers(resource, all_namespaces=True)
+            if patched:
+                log(f"patched finalizers on {patched} {resource} object(s)")
+            delete_resource_type(resource, all_namespaces=True)
+            wait_for_objects_deleted(resource, all_namespaces=True, timeout=180)
+
+
+def delete_flyte_managed_namespaced_objects(namespace: str) -> None:
+    resources = api_resources(namespaced=True)
+    for selector in MANAGED_LABEL_SELECTORS:
+        delete_selected_resources(resources, namespace=namespace, selector=selector)
+    if FORCE_FINALIZER_REMOVAL:
+        for resource in resources:
+            patch_finalizers(resource, namespace=namespace)
+            delete_resource_type(resource, namespace=namespace)
+
+
+def delete_flyte_managed_cluster_objects() -> None:
+    resources = CLUSTER_MANAGED_RESOURCES
+    for selector in MANAGED_LABEL_SELECTORS:
+        delete_selected_resources(resources, all_namespaces=False, selector=selector)
+    if FORCE_FINALIZER_REMOVAL:
+        for resource in resources:
+            patch_finalizers(resource)
+            delete_resource_type(resource)
 
 
 def delete_flyte_crds() -> None:
     delete_flyte_custom_resources()
-    for crd in (
-        "workflows.flyte.org",
-        "launchplans.flyte.org",
-        "tasks.flyte.org",
-        "workflows.flyte.io",
-        "launchplans.flyte.io",
-        "tasks.flyte.io",
-    ):
-        run(["kubectl", "delete", "crd", crd, "--ignore-not-found", "--wait=true"], check=False)
+    for crd in FLYTE_CR_RESOURCES:
+        run(["kubectl", "delete", "crd", crd, "--ignore-not-found", "--wait=true", f"--timeout={READY_TIMEOUT}s"], check=False)
+
+
+def delete_namespace(namespace: str) -> None:
+    if namespace == "default":
+        return
+    run(["kubectl", "delete", "namespace", namespace, "--ignore-not-found", "--wait=true", f"--timeout={READY_TIMEOUT}s"], check=False)
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        cp = run(["kubectl", "get", "namespace", namespace], check=False)
+        if cp.returncode != 0:
+            return
+        time.sleep(2)
+    if FORCE_FINALIZER_REMOVAL:
+        run(["kubectl", "patch", "namespace", namespace, "--type=merge", "-p", '{"metadata":{"finalizers":[]}}'], check=False)
+        run(["kubectl", "delete", "namespace", namespace, "--ignore-not-found", "--wait=true", f"--timeout={READY_TIMEOUT}s"], check=False)
+
+
+def delete_task_namespace_bootstrap(namespace: str) -> None:
+    for kind, name in (("secret", TASK_AWS_SECRET_NAME), ("serviceaccount", TASK_SERVICE_ACCOUNT)):
+        run(["kubectl", "-n", namespace, "delete", kind, name, "--ignore-not-found", "--wait=true", f"--timeout={READY_TIMEOUT}s"], check=False)
+
+
+def release_uninstall() -> None:
+    run(
+        [
+            "helm",
+            "uninstall",
+            RELEASE_NAME,
+            "-n",
+            TARGET_NS,
+            "--ignore-not-found",
+            "--wait",
+            "--timeout",
+            f"{READY_TIMEOUT}s",
+        ],
+        check=False,
+    )
 
 
 def delete_all() -> None:
+    task_namespaces = split_namespaces(os.environ.get("FLYTE_TASK_NAMESPACES", "flytesnacks-development"))
+
     delete_flyte_custom_resources()
-    run(["helm", "uninstall", RELEASE_NAME, "-n", TARGET_NS], check=False)
-    run(["kubectl", "-n", TARGET_NS, "delete", "secret", DB_SECRET_NAME, "--ignore-not-found"], check=False)
-    run(["kubectl", "-n", TARGET_NS, "delete", "secret", AUTH_SECRET_NAME, "--ignore-not-found"], check=False)
-    run(["kubectl", "-n", TARGET_NS, "delete", "secret", STORAGE_SECRET_NAME, "--ignore-not-found"], check=False)
-    run(["kubectl", "-n", TARGET_NS, "delete", "configmap", STATE_CONFIGMAP, "--ignore-not-found"], check=False)
+    release_uninstall()
+
+    delete_flyte_managed_namespaced_objects(TARGET_NS)
+    for namespace in task_namespaces:
+        delete_flyte_managed_namespaced_objects(namespace)
+
+    delete_flyte_managed_cluster_objects()
+
+    run(["kubectl", "-n", TARGET_NS, "delete", "secret", DB_SECRET_NAME, "--ignore-not-found", "--wait=true", f"--timeout={READY_TIMEOUT}s"], check=False)
+    run(["kubectl", "-n", TARGET_NS, "delete", "secret", AUTH_SECRET_NAME, "--ignore-not-found", "--wait=true", f"--timeout={READY_TIMEOUT}s"], check=False)
+    run(["kubectl", "-n", TARGET_NS, "delete", "secret", STORAGE_SECRET_NAME, "--ignore-not-found", "--wait=true", f"--timeout={READY_TIMEOUT}s"], check=False)
+    run(["kubectl", "-n", TARGET_NS, "delete", "configmap", STATE_CONFIGMAP, "--ignore-not-found", "--wait=true", f"--timeout={READY_TIMEOUT}s"], check=False)
+
     if DELETE_TARGET_NAMESPACE:
-        run(["kubectl", "delete", "namespace", TARGET_NS, "--ignore-not-found"], check=False)
-    for namespace in split_namespaces(os.environ.get("FLYTE_TASK_NAMESPACES", "flytesnacks-development")):
+        delete_namespace(TARGET_NS)
+
+    for namespace in task_namespaces:
         delete_task_namespace_bootstrap(namespace)
         if DELETE_TASK_NAMESPACES:
-            run(["kubectl", "delete", "namespace", namespace, "--ignore-not-found"], check=False)
+            delete_namespace(namespace)
+
     if DELETE_FLYTE_CRDS:
         delete_flyte_crds()
+
     log("deleted Flyte release and bootstrap objects")
 
 
@@ -1139,6 +1261,7 @@ def cli() -> int:
                 "  FLYTE_INGRESS_ENABLED=true|false\n"
                 "  FLYTE_ATOMIC=true|false\n"
                 "  DNS_TIMEOUT=seconds\n"
+                "  FORCE_FINALIZER_REMOVAL=true|false\n"
             )
             return 0
         fatal(f"unknown option: {sys.argv[1]}")

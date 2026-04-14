@@ -60,10 +60,10 @@ spec:
             resources:
               requests:
                 cpu: '1'
-                memory: 3Gi
+                memory: 4Gi
               limits:
                 cpu: '1'
-                memory: 3Gi
+                memory: 4Gi
             volumeMounts:
             - name: model-cache
               mountPath: /mlsecops
@@ -145,11 +145,11 @@ spec:
             - name: OTEL_TRACES_SAMPLER
               value: parentbased_traceidratio
             - name: OTEL_TRACES_SAMPLER_ARG
-              value: '0.10'
+              value: '0.70'
             - name: LOG_LEVEL
-              value: WARNING
+              value: INFO
             - name: SLOW_REQUEST_MS
-              value: '500.0'
+              value: '1'
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -223,10 +223,10 @@ spec:
             resources:
               requests:
                 cpu: '1'
-                memory: 1536Mi
+                memory: 3536Mi
               limits:
                 cpu: '1'
-                memory: 1536Mi
+                memory: 3536Mi
             volumeMounts:
             - name: model-cache
               mountPath: /mlsecops

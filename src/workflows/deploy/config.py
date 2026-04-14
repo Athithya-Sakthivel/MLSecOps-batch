@@ -7,8 +7,7 @@ from typing import Literal
 
 DeploymentProfile = Literal["prod"]
 
-# Fixed production baseline.
-# Keep these stable unless profiling or an incident specifically justifies a change.
+# Stable production defaults for this repo.
 PROD_DEFAULTS: dict[str, str] = {
     "SERVE_NUM_CPUS": "1.0",
     "SERVE_MIN_REPLICAS": "1",
@@ -26,9 +25,10 @@ PROD_DEFAULTS: dict[str, str] = {
     "SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_S": "20.0",
     "ORT_INTRA_OP_NUM_THREADS": "1",
     "ORT_INTER_OP_NUM_THREADS": "1",
+    "ORT_PROVIDERS": "CPUExecutionProvider",
     "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
     "OTEL_TRACES_SAMPLER_ARG": "0.10",
-    "LOG_LEVEL": "WARNING",
+    "LOG_LEVEL": "INFO",
 }
 
 
@@ -37,10 +37,6 @@ def _profile() -> DeploymentProfile:
     if raw != "prod":
         raise RuntimeError("DEPLOYMENT_PROFILE is fixed to 'prod' in this build")
     return "prod"
-
-
-def _profile_default(name: str, default: str) -> str:
-    return os.getenv(name, PROD_DEFAULTS.get(name, default))
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -73,7 +69,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_int_profile(name: str, default: int) -> int:
-    raw = _profile_default(name, str(default))
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        raw = PROD_DEFAULTS.get(name, str(default))
     return _parse_int(name, raw)
 
 
@@ -100,7 +98,9 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _env_float_profile(name: str, default: float) -> float:
-    raw = _profile_default(name, str(default))
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        raw = PROD_DEFAULTS.get(name, str(default))
     return _parse_float(name, raw)
 
 
@@ -110,20 +110,6 @@ def _env_float_any(names: tuple[str, ...], default: float) -> float:
         if raw is not None and raw.strip() != "":
             return _parse_float(name, raw)
     return default
-
-
-def _env_ratio(name: str, default: float) -> float:
-    value = _env_float(name, default)
-    if not 0.0 <= value <= 1.0:
-        raise RuntimeError(f"{name} must be in the range [0.0, 1.0], got {value!r}")
-    return value
-
-
-def _env_ratio_profile(name: str, default: float) -> float:
-    value = _env_float_profile(name, default)
-    if not 0.0 <= value <= 1.0:
-        raise RuntimeError(f"{name} must be in the range [0.0, 1.0], got {value!r}")
-    return value
 
 
 def _env_list(name: str, default: list[str], sep: str = ",") -> list[str]:
@@ -139,8 +125,8 @@ def _env_tuple(name: str, default: tuple[str, ...], sep: str = ",") -> tuple[str
 
 def _env_otlp_timeout_seconds() -> float:
     """
-    OpenTelemetry exporters commonly use OTEL_EXPORTER_OTLP_TIMEOUT in milliseconds.
-    Keep OTEL_EXPORTER_OTLP_TIMEOUT_SECONDS as a fallback for older deployments.
+    OTEL_EXPORTER_OTLP_TIMEOUT is typically supplied in milliseconds.
+    OTEL_EXPORTER_OTLP_TIMEOUT_SECONDS is supported as a fallback for older setups.
     """
     raw_ms = os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
     if raw_ms is not None and raw_ms.strip() != "":
@@ -159,9 +145,7 @@ def _validate_log_level(value: str) -> str:
     if not normalized:
         return "WARNING"
     if normalized not in allowed:
-        raise RuntimeError(
-            f"LOG_LEVEL must be one of {sorted(allowed)}, got {value!r}"
-        )
+        raise RuntimeError(f"LOG_LEVEL must be one of {sorted(allowed)}, got {value!r}")
     return "WARNING" if normalized == "WARN" else normalized
 
 
@@ -171,6 +155,33 @@ def _ensure_unique(names: tuple[str, ...], field_name: str) -> None:
         if name in seen:
             raise RuntimeError(f"{field_name} contains duplicate name: {name}")
         seen.add(name)
+
+
+def _normalize_sampler_name(raw: str) -> str:
+    return raw.strip().lower()
+
+
+def _sampler_ratio(sampler: str, raw_arg: str | None) -> float:
+    sampler = _normalize_sampler_name(sampler)
+
+    if sampler in {"always_on", "parentbased_always_on"}:
+        return 1.0
+    if sampler in {"always_off", "parentbased_always_off"}:
+        return 0.0
+
+    if sampler in {"traceidratio", "parentbased_traceidratio"}:
+        if raw_arg is None or raw_arg.strip() == "":
+            return 1.0
+        value = _parse_float("OTEL_TRACES_SAMPLER_ARG", raw_arg)
+        if not 0.0 <= value <= 1.0:
+            raise RuntimeError("OTEL_TRACES_SAMPLER_ARG must be in the range [0.0, 1.0]")
+        return value
+
+    raise RuntimeError(
+        "OTEL_TRACES_SAMPLER must be one of "
+        "'always_on', 'always_off', 'traceidratio', "
+        "'parentbased_always_on', 'parentbased_always_off', 'parentbased_traceidratio'"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,9 +338,7 @@ def get_settings() -> Settings:
 
     model_uri = _env_str("MODEL_URI")
     if not model_uri:
-        raise RuntimeError(
-            "MODEL_URI is required and should point to a bundle root or a model file"
-        )
+        raise RuntimeError("MODEL_URI is required and should point to a bundle root or a model file")
 
     model_output_names = _env_tuple("MODEL_OUTPUT_NAMES", tuple())
     model_input_name = _env_str("MODEL_INPUT_NAME") or None
@@ -388,18 +397,15 @@ def get_settings() -> Settings:
         10000,
     )
 
-    otel_traces_sampler = _env_str(
-        "OTEL_TRACES_SAMPLER",
-        PROD_DEFAULTS["OTEL_TRACES_SAMPLER"],
+    otel_traces_sampler = _normalize_sampler_name(
+        _env_str("OTEL_TRACES_SAMPLER", PROD_DEFAULTS["OTEL_TRACES_SAMPLER"])
     )
-    trace_sample_ratio = _env_ratio_profile(
-        "OTEL_TRACES_SAMPLER_ARG",
-        float(PROD_DEFAULTS["OTEL_TRACES_SAMPLER_ARG"]),
+    trace_sample_ratio = _sampler_ratio(
+        otel_traces_sampler,
+        os.getenv("OTEL_TRACES_SAMPLER_ARG"),
     )
 
-    log_level = _validate_log_level(
-        _env_str("LOG_LEVEL", PROD_DEFAULTS["LOG_LEVEL"])
-    )
+    log_level = _validate_log_level(_env_str("LOG_LEVEL", PROD_DEFAULTS["LOG_LEVEL"]))
     slow_request_ms = _env_float_profile("SLOW_REQUEST_MS", 500.0)
 
     return Settings(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import atexit
-import json
 import logging
 import threading
 from collections.abc import Callable
@@ -27,7 +26,12 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+from opentelemetry.sdk.trace.sampling import (
+    AlwaysOffSampler,
+    AlwaysOnSampler,
+    ParentBased,
+    TraceIdRatioBased,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,47 +74,41 @@ def _current_span_fields() -> dict[str, str]:
         return {
             "trace_id": f"{ctx.trace_id:032x}",
             "span_id": f"{ctx.span_id:016x}",
+            "trace_flags": f"{int(ctx.trace_flags):02x}",
         }
     except Exception:
         return {}
 
 
-def _json_log(level_label: str, event: str, message: str, **fields: Any) -> str:
-    payload: dict[str, Any] = {
+def _log_with_fields(level: int, event: str, message: str, **fields: Any) -> None:
+    payload = {
         "component": "telemetry",
         "event": event,
-        "level": level_label,
-        "message": message,
         **{k: v for k, v in fields.items() if v is not None},
+        **_current_span_fields(),
     }
-    payload.update(_current_span_fields())
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    logger.log(level, message, extra=payload)
 
 
 def _log_info(event: str, message: str, **fields: Any) -> None:
-    logger.info(_json_log("INFO", event, message, **fields))
+    _log_with_fields(logging.INFO, event, message, **fields)
 
 
 def _log_warn(event: str, message: str, **fields: Any) -> None:
-    logger.warning(_json_log("WARNING", event, message, **fields))
+    _log_with_fields(logging.WARNING, event, message, **fields)
 
 
 def _log_exception(event: str, message: str, **fields: Any) -> None:
-    logger.exception(_json_log("ERROR", event, message, **fields))
+    payload = {
+        "component": "telemetry",
+        "event": event,
+        **{k: v for k, v in fields.items() if v is not None},
+        **_current_span_fields(),
+    }
+    logger.exception(message, extra=payload)
 
 
 def _grpc_endpoint(endpoint: str) -> tuple[str, bool]:
-    """
-    Normalize an OTLP/gRPC endpoint.
-
-    Accepted forms:
-      - collector:4317
-      - http://collector:4317
-      - https://collector:4317
-
-    This module is intentionally gRPC-only. If a path is supplied, fail fast
-    instead of silently guessing protocol semantics.
-    """
     raw = endpoint.strip()
     if not raw:
         raise ValueError("otel_endpoint must be set")
@@ -166,7 +164,7 @@ def _require_positive_number(name: str, value: object) -> float:
 
 def _require_ratio(name: str, value: object) -> float:
     num = _require_nonnegative_number(name, value)
-    if num > 1.0:
+    if not 0.0 <= num <= 1.0:
         raise ValueError(f"{name} must be between 0.0 and 1.0")
     return num
 
@@ -181,23 +179,32 @@ def _require_positive_int(name: str, value: object) -> int:
     return num
 
 
-def _effective_log_level(settings: Settings) -> str:
-    return _normalize_level_name(settings.log_level)
+def _normalize_sampler_name(raw: str | None) -> str:
+    return (_clean_str(raw) or "parentbased_traceidratio").strip().lower()
 
 
-def _build_sampler(settings: Settings) -> ParentBased | TraceIdRatioBased:
-    sampler = (settings.otel_traces_sampler or "").strip().lower()
+def _build_sampler(settings: Settings):
+    sampler = _normalize_sampler_name(settings.otel_traces_sampler)
     ratio = _require_ratio("trace_sample_ratio", settings.trace_sample_ratio)
 
-    if sampler == "parentbased_traceidratio":
-        return ParentBased(root=TraceIdRatioBased(ratio))
+    if sampler == "always_on":
+        return AlwaysOnSampler()
+    if sampler == "always_off":
+        return AlwaysOffSampler()
     if sampler == "traceidratio":
         return TraceIdRatioBased(ratio)
+    if sampler == "parentbased_always_on":
+        return ParentBased(root=AlwaysOnSampler())
+    if sampler == "parentbased_always_off":
+        return ParentBased(root=AlwaysOffSampler())
+    if sampler == "parentbased_traceidratio":
+        return ParentBased(root=TraceIdRatioBased(ratio))
 
     raise ValueError(
         "unsupported OTEL_TRACES_SAMPLER value: "
         f"{settings.otel_traces_sampler!r}. Supported values: "
-        "'parentbased_traceidratio', 'traceidratio'"
+        "'always_on', 'always_off', 'traceidratio', "
+        "'parentbased_always_on', 'parentbased_always_off', 'parentbased_traceidratio'"
     )
 
 
@@ -212,7 +219,7 @@ def _config_key(
         endpoint,
         insecure,
         tuple(sorted(resource_attrs.items())),
-        settings.otel_traces_sampler,
+        _normalize_sampler_name(settings.otel_traces_sampler),
         _require_ratio("trace_sample_ratio", settings.trace_sample_ratio),
         _require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
         _require_positive_int(
@@ -241,6 +248,7 @@ def _log_record_factory(
             if ctx is not None and ctx.is_valid:
                 record.trace_id = f"{ctx.trace_id:032x}"
                 record.span_id = f"{ctx.span_id:016x}"
+                record.trace_flags = f"{int(ctx.trace_flags):02x}"
         except Exception:
             pass
         return record
@@ -315,6 +323,9 @@ class TelemetryHandle:
                 ("tracer_provider", self.tracer_provider),
             ):
                 try:
+                    force_flush = getattr(provider, "force_flush", None)
+                    if callable(force_flush):
+                        force_flush()
                     provider.shutdown()
                     _log_info(
                         event="telemetry.shutdown.provider_complete",
@@ -348,7 +359,7 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
     global _HANDLE, _STATE_KEY, _ATEEXIT_REGISTERED
 
     with _STATE_LOCK:
-        log_level_name = _effective_log_level(settings)
+        log_level_name = _normalize_level_name(settings.log_level)
         endpoint, insecure = _grpc_endpoint(settings.otel_endpoint)
         resource = _resource(settings)
         resource_attrs = {
@@ -467,7 +478,6 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
 
             root_logger = logging.getLogger()
             root_logger.setLevel(_level_to_int(log_level_name))
-            root_logger.propagate = True
 
             existing_handler = next(
                 (

@@ -15,7 +15,7 @@ from config import get_settings
 from model_store import LoadedModel, load_loaded_model
 from opentelemetry import metrics, trace
 from opentelemetry.propagate import extract
-from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.trace import SpanKind, Status, StatusCode, get_current_span
 from ray import serve
 from ray.serve.handle import DeploymentHandle
 from schemas import build_feature_matrix, coerce_instances, split_model_outputs
@@ -28,23 +28,23 @@ SETTINGS = get_settings()
 BACKEND_DEPLOYMENT_NAME = f"{SETTINGS.serve_deployment_name}_backend"
 INGRESS_DEPLOYMENT_NAME = SETTINGS.serve_deployment_name
 
-# Keep the HTTP shim lightweight and keep all heavy work on the backend replica.
 INGRESS_NUM_CPUS = 0.0
 BACKEND_NUM_CPUS = float(SETTINGS.replica_num_cpus)
 
-# Let the HTTP shim absorb bursts without blocking the model replica.
 INGRESS_MAX_ONGOING_REQUESTS = max(SETTINGS.max_ongoing_requests, 32)
-# Keep the model replica able to batch while avoiding unbounded queue growth.
 BACKEND_MAX_ONGOING_REQUESTS = max(SETTINGS.max_ongoing_requests, SETTINGS.batch_max_size)
 
 REQUEST_ID_HEADER = "X-Request-Id"
 
 logger = logging.getLogger("tabular-inference")
 BASE_LOG_FIELDS: dict[str, Any] = {
-    "service_name": SETTINGS.service_name,
-    "service_version": SETTINGS.service_version,
-    "deployment": SETTINGS.serve_deployment_name,
-    "model_uri": SETTINGS.model_uri,
+    "service.name": SETTINGS.service_name,
+    "service.version": SETTINGS.service_version,
+    "deployment.name": SETTINGS.serve_deployment_name,
+    "deployment.environment": SETTINGS.deployment_environment,
+    "k8s.cluster.name": SETTINGS.cluster_name,
+    "service.instance.id": SETTINGS.instance_id,
+    "model.uri": SETTINGS.model_uri,
 }
 
 
@@ -131,6 +131,33 @@ def configure_logging() -> None:
 
 
 configure_logging()
+
+
+def _current_span() -> trace.Span | None:
+    try:
+        span = get_current_span()
+        ctx = span.get_span_context()
+        if ctx is None or not ctx.is_valid:
+            return None
+        return span
+    except Exception:
+        return None
+
+
+def _span_event(event: str, **attrs: Any) -> None:
+    span = _current_span()
+    if span is not None:
+        span.add_event(event, attributes={k: v for k, v in attrs.items() if v is not None})
+
+
+def _span_error(exc: BaseException, **attrs: Any) -> None:
+    span = _current_span()
+    if span is not None:
+        for key, value in attrs.items():
+            if value is not None:
+                span.set_attribute(key, value)
+        span.record_exception(exc)
+        span.set_status(Status(StatusCode.ERROR))
 
 
 def _log(logger_obj: logging.Logger, level: int, event: str, **fields: Any) -> None:
@@ -306,8 +333,16 @@ class InferenceBackend:
                         "model.version": self.effective_model_version,
                     },
                 )
-                span.record_exception(exc)
-                span.set_status(Status(StatusCode.ERROR))
+                _span_error(
+                    exc,
+                    **{
+                        "batch.request_count": request_count,
+                        "batch.size": batch_instance_count,
+                        "model.name": self.model_name,
+                        "model.version": self.effective_model_version,
+                        "error.type": exc.__class__.__name__,
+                    },
+                )
                 _log_exception(
                     self.logger,
                     "predict_batch_failed",
@@ -434,7 +469,24 @@ class TabularInferenceApp:
     ) -> JSONResponse:
         try:
             payload = await request.json()
-        except (JSONDecodeError, ValueError):
+        except (JSONDecodeError, ValueError) as exc:
+            _span_event(
+                "predict_invalid_json",
+                **{
+                    "http.route": "/predict",
+                    "http.method": "POST",
+                    "request.id": request_id,
+                    "error.type": exc.__class__.__name__,
+                },
+            )
+            _log(
+                self.logger,
+                logging.WARNING,
+                "predict_invalid_json",
+                route="/predict",
+                request_id=request_id,
+                error_type=exc.__class__.__name__,
+            )
             return _json_response({"detail": "Invalid JSON body"}, 400, request_id=request_id)
 
         try:
@@ -451,6 +503,14 @@ class TabularInferenceApp:
             try:
                 backend_info = await self._get_backend_info(refresh=False)
             except Exception as exc:
+                _span_event(
+                    "backend_unavailable",
+                    **{
+                        "http.route": "/predict",
+                        "request.id": request_id,
+                        "error.type": exc.__class__.__name__,
+                    },
+                )
                 return _json_response(
                     {"detail": f"Backend unavailable: {exc}"},
                     503,
@@ -475,6 +535,16 @@ class TabularInferenceApp:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                _span_error(
+                    exc,
+                    **{
+                        "http.route": "/predict",
+                        "request.id": request_id,
+                        "model.name": backend_info["model_name"],
+                        "model.version": backend_info["model_version"],
+                        "error.type": exc.__class__.__name__,
+                    },
+                )
                 _log_exception(
                     self.logger,
                     "predict_backend_failed",
@@ -488,6 +558,18 @@ class TabularInferenceApp:
 
             total_ms = (time.perf_counter() - request_start) * 1000.0
             if total_ms >= self.settings.slow_request_ms:
+                _span_event(
+                    "predict_slow_request",
+                    **{
+                        "http.route": "/predict",
+                        "request.id": request_id,
+                        "model.name": backend_info["model_name"],
+                        "model.version": backend_info["model_version"],
+                        "batch.size": n_instances,
+                        "latency_ms": round(total_ms, 3),
+                        "slow_request_threshold_ms": self.settings.slow_request_ms,
+                    },
+                )
                 _log(
                     self.logger,
                     logging.WARNING,
@@ -521,6 +603,17 @@ class TabularInferenceApp:
             model_name = backend_info["model_name"] if backend_info else "model"
             model_version = backend_info["model_version"] if backend_info else self.settings.model_version
 
+            _span_event(
+                "predict_validation_failed",
+                **{
+                    "http.route": "/predict",
+                    "request.id": request_id,
+                    "model.name": model_name,
+                    "model.version": model_version,
+                    "error.type": "validation_error",
+                    "error.message": str(exc),
+                },
+            )
             _log(
                 self.logger,
                 logging.WARNING,
@@ -535,6 +628,14 @@ class TabularInferenceApp:
             return _json_response({"detail": str(exc)}, 422, request_id=request_id)
 
         except Exception as exc:
+            _span_error(
+                exc,
+                **{
+                    "http.route": "/predict",
+                    "request.id": request_id,
+                    "error.type": exc.__class__.__name__,
+                },
+            )
             _log_exception(
                 self.logger,
                 "predict_internal_failure",
