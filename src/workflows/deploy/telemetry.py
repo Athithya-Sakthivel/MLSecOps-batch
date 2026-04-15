@@ -26,12 +26,14 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.sdk.trace.sampling import (
-    AlwaysOffSampler,
-    AlwaysOnSampler,
-    ParentBased,
-    TraceIdRatioBased,
-)
+
+try:
+    from opentelemetry.sdk.trace.sampling import ALWAYS_OFF, ALWAYS_ON, ParentBased, TraceIdRatioBased
+except ImportError:  # pragma: no cover
+    from opentelemetry.sdk.trace.sampling import AlwaysOffSampler, AlwaysOnSampler, ParentBased, TraceIdRatioBased
+
+    ALWAYS_ON = AlwaysOnSampler()
+    ALWAYS_OFF = AlwaysOffSampler()
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +182,7 @@ def _require_positive_int(name: str, value: object) -> int:
 
 
 def _normalize_sampler_name(raw: str | None) -> str:
-    return (_clean_str(raw) or "parentbased_traceidratio").strip().lower()
+    return (_clean_str(raw) or "parentbased_always_on").strip().lower()
 
 
 def _build_sampler(settings: Settings):
@@ -188,15 +190,15 @@ def _build_sampler(settings: Settings):
     ratio = _require_ratio("trace_sample_ratio", settings.trace_sample_ratio)
 
     if sampler == "always_on":
-        return AlwaysOnSampler()
+        return ALWAYS_ON
     if sampler == "always_off":
-        return AlwaysOffSampler()
+        return ALWAYS_OFF
     if sampler == "traceidratio":
         return TraceIdRatioBased(ratio)
     if sampler == "parentbased_always_on":
-        return ParentBased(root=AlwaysOnSampler())
+        return ParentBased(root=ALWAYS_ON)
     if sampler == "parentbased_always_off":
-        return ParentBased(root=AlwaysOffSampler())
+        return ParentBased(root=ALWAYS_OFF)
     if sampler == "parentbased_traceidratio":
         return ParentBased(root=TraceIdRatioBased(ratio))
 

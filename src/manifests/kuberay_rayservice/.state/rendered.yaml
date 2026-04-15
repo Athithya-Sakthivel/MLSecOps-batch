@@ -49,7 +49,7 @@ spec:
             emptyDir: {}
           containers:
           - name: ray-head
-            image: ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-13-04-58--7d3aa0f@sha256:9e416db3e3eda0483bb726f017bc4efd7a87011175df017e96362c60102c2c23
+            image: ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-14-09-29--55b46d7@sha256:f46b83c48f3b392cf9016eb99f83775bbe0036f95c00a4c464acb55183aae00b
             imagePullPolicy: IfNotPresent
             securityContext:
               allowPrivilegeEscalation: false
@@ -212,7 +212,7 @@ spec:
           volumes: *id002
           containers:
           - name: ray-worker
-            image: ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-13-04-58--7d3aa0f@sha256:9e416db3e3eda0483bb726f017bc4efd7a87011175df017e96362c60102c2c23
+            image: ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-14-09-29--55b46d7@sha256:f46b83c48f3b392cf9016eb99f83775bbe0036f95c00a4c464acb55183aae00b
             imagePullPolicy: IfNotPresent
             securityContext:
               allowPrivilegeEscalation: false

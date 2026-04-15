@@ -27,16 +27,15 @@ export FEATURE_ORDER="${FEATURE_ORDER:-pickup_hour,pickup_dow,pickup_month,picku
 export ALLOW_EXTRA_FEATURES="${ALLOW_EXTRA_FEATURES:-false}"
 export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-/mlsecops/model-cache}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
-export RAY_IMAGE="${RAY_IMAGE:-ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-13-04-58--7d3aa0f@sha256:9e416db3e3eda0483bb726f017bc4efd7a87011175df017e96362c60102c2c23}"
+export RAY_IMAGE="${RAY_IMAGE:-ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-14-09-29--55b46d7@sha256:f46b83c48f3b392cf9016eb99f83775bbe0036f95c00a4c464acb55183aae00b}"
 export USE_IAM="${USE_IAM:-false}"
 export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://signoz-otel-collector.signoz.svc.cluster.local:4317}"
 export SLOW_REQUEST_MS="${SLOW_REQUEST_MS:-1}"
-export WORKER_MEMORY=3536Mi
 
 # Tracing:
 # - always_on => set OTEL_TRACES_SAMPLER=always_on and unset the arg
 # - otherwise => ratio sampler with numeric arg
-if [[ "${TRACE_ALWAYS_ON:-0}" == "1" || "${OTEL_TRACES_SAMPLER:-}" == "always_on" || "${OTEL_TRACES_SAMPLER_ARG:-}" == "always_on" ]]; then
+if [[ "${TRACE_ALWAYS_ON:-0}" == "1" ]]; then
   export OTEL_TRACES_SAMPLER="always_on"
   unset OTEL_TRACES_SAMPLER_ARG || true
 else
@@ -390,8 +389,8 @@ main() {
     bootstrap_kind_cluster
     install_default_storage_class
     install_kuberay_operator
-    rollout_signoz
     rollout_inference
+    rollout_signoz
   fi
 
   # SigNoz and inference rollouts should already have created their pods.

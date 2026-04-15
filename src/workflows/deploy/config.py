@@ -26,8 +26,7 @@ PROD_DEFAULTS: dict[str, str] = {
     "ORT_INTRA_OP_NUM_THREADS": "1",
     "ORT_INTER_OP_NUM_THREADS": "1",
     "ORT_PROVIDERS": "CPUExecutionProvider",
-    "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
-    "OTEL_TRACES_SAMPLER_ARG": "0.10",
+    "OTEL_TRACES_SAMPLER": "parentbased_always_on",
     "LOG_LEVEL": "INFO",
 }
 
@@ -104,14 +103,6 @@ def _env_float_profile(name: str, default: float) -> float:
     return _parse_float(name, raw)
 
 
-def _env_float_any(names: tuple[str, ...], default: float) -> float:
-    for name in names:
-        raw = os.getenv(name)
-        if raw is not None and raw.strip() != "":
-            return _parse_float(name, raw)
-    return default
-
-
 def _env_list(name: str, default: list[str], sep: str = ",") -> list[str]:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -125,7 +116,7 @@ def _env_tuple(name: str, default: tuple[str, ...], sep: str = ",") -> tuple[str
 
 def _env_otlp_timeout_seconds() -> float:
     """
-    OTEL_EXPORTER_OTLP_TIMEOUT is typically supplied in milliseconds.
+    OTEL_EXPORTER_OTLP_TIMEOUT is expected in milliseconds in this app.
     OTEL_EXPORTER_OTLP_TIMEOUT_SECONDS is supported as a fallback for older setups.
     """
     raw_ms = os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
