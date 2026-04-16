@@ -1,7 +1,35 @@
-// src/terraform/modules/ecr/main.tf
-// ECR repositories for AgentOps-ServiceAutomation
-// Compatible with OpenTofu v1.11.5 and hashicorp/aws v6.x (resource/argument names conform to provider v6.x docs).
-// Creates explicit repositories (no placeholders) and lifecycle policies to retain a bounded number of images.
+// src/terraform/aws/modules/ecr/main.tf
+// ECR repository module for the MLOps platform.
+//
+// Responsibilities:
+// - create repositories from root-provided input
+// - enforce immutable tags by default
+// - enable scan-on-push by default
+// - enforce AES256 encryption by default
+// - attach exactly one lifecycle policy per repository
+//
+// This module is production-owned, not optional, and must remain tfvars-driven.
+// It must not contain AgentOps-specific names.
+
+variable "repositories" {
+  description = "Map of logical repository key -> repository configuration."
+  type = map(object({
+    name                 = string
+    image_tag_mutability = optional(string, "IMMUTABLE")
+    scan_on_push         = optional(bool, true)
+    encryption_type      = optional(string, "AES256")
+    retain_last_images   = optional(number, 30)
+  }))
+
+  validation {
+    condition = alltrue([
+      for k, v in var.repositories :
+      length(v.name) > 0 &&
+      v.retain_last_images > 0
+    ])
+    error_message = "Each repositories entry must define a non-empty name and retain_last_images > 0."
+  }
+}
 
 variable "tags" {
   description = "Tags applied to all ECR repositories created by this module."
@@ -10,39 +38,51 @@ variable "tags" {
 }
 
 locals {
-  merged_tags = merge({ ManagedBy = "agentops-serviceautomation" }, var.tags)
+  env_tag = lookup(var.tags, "Environment", "prod")
+
+  common_tags = merge(
+    {
+      ManagedBy   = "mlops-platform-terraform"
+      Environment = local.env_tag
+    },
+    var.tags
+  )
 }
 
-############################
-# agentops-frontend
-############################
-resource "aws_ecr_repository" "agentops_frontend" {
-  name                 = "agentops-frontend"
-  image_tag_mutability = "IMMUTABLE"
+resource "aws_ecr_repository" "this" {
+  for_each = var.repositories
+
+  name                 = each.value.name
+  image_tag_mutability = each.value.image_tag_mutability
 
   image_scanning_configuration {
-    scan_on_push = true
+    scan_on_push = each.value.scan_on_push
   }
 
   encryption_configuration {
-    encryption_type = "AES256"
+    encryption_type = each.value.encryption_type
   }
 
-  tags = local.merged_tags
+  tags = merge(local.common_tags, {
+    Name = each.value.name
+    Role = each.key
+  })
 }
 
-resource "aws_ecr_lifecycle_policy" "agentops_frontend" {
-  repository = aws_ecr_repository.agentops_frontend.name
+resource "aws_ecr_lifecycle_policy" "this" {
+  for_each = var.repositories
+
+  repository = aws_ecr_repository.this[each.key].name
 
   policy = jsonencode({
     rules = [
       {
         rulePriority = 1
-        description  = "Keep last 30 images"
+        description  = "Keep last ${each.value.retain_last_images} images"
         selection = {
           tagStatus   = "any"
           countType   = "imageCountMoreThan"
-          countNumber = 30
+          countNumber = each.value.retain_last_images
         }
         action = {
           type = "expire"
@@ -52,224 +92,23 @@ resource "aws_ecr_lifecycle_policy" "agentops_frontend" {
   })
 }
 
-############################
-# agentops-inference
-############################
-resource "aws_ecr_repository" "agentops_inference" {
-  name                 = "agentops-inference"
-  image_tag_mutability = "IMMUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
-
-  tags = local.merged_tags
-}
-
-resource "aws_ecr_lifecycle_policy" "agentops_inference" {
-  repository = aws_ecr_repository.agentops_inference.name
-
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Keep last 30 images"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 30
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
-}
-
-############################
-# agentops-auth
-############################
-resource "aws_ecr_repository" "agentops_auth" {
-  name                 = "agentops-auth"
-  image_tag_mutability = "IMMUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
-
-  tags = local.merged_tags
-}
-
-resource "aws_ecr_lifecycle_policy" "agentops_auth" {
-  repository = aws_ecr_repository.agentops_auth.name
-
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Keep last 30 images"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 30
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
-}
-
-############################
-# agentops-cloudnativepg
-############################
-resource "aws_ecr_repository" "agentops_cloudnativepg" {
-  name                 = "agentops-cloudnativepg"
-  image_tag_mutability = "IMMUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
-
-  tags = local.merged_tags
-}
-
-resource "aws_ecr_lifecycle_policy" "agentops_cloudnativepg" {
-  repository = aws_ecr_repository.agentops_cloudnativepg.name
-
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Keep last 30 images"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 30
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
-}
-
-############################
-# agentops-postgresql
-############################
-resource "aws_ecr_repository" "agentops_postgresql" {
-  name                 = "agentops-postgresql"
-  image_tag_mutability = "IMMUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
-
-  tags = local.merged_tags
-}
-
-resource "aws_ecr_lifecycle_policy" "agentops_postgresql" {
-  repository = aws_ecr_repository.agentops_postgresql.name
-
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Keep last 30 images"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 30
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
-}
-
-############################
-# agentops-cloudflared
-############################
-resource "aws_ecr_repository" "agentops_cloudflared" {
-  name                 = "agentops-cloudflared"
-  image_tag_mutability = "IMMUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
-
-  tags = local.merged_tags
-}
-
-resource "aws_ecr_lifecycle_policy" "agentops_cloudflared" {
-  repository = aws_ecr_repository.agentops_cloudflared.name
-
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Keep last 30 images"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 30
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
-}
-
-############################
-# Outputs
-############################
 output "repository_url_map" {
-  description = "Map of repository name -> repository URL (https://<account>.dkr.ecr.<region>.amazonaws.com/<name>)"
+  description = "Logical repository key -> repository URL."
   value = {
-    "agentops-frontend"      = aws_ecr_repository.agentops_frontend.repository_url
-    "agentops-inference"     = aws_ecr_repository.agentops_inference.repository_url
-    "agentops-auth"          = aws_ecr_repository.agentops_auth.repository_url
-    "agentops-cloudnativepg" = aws_ecr_repository.agentops_cloudnativepg.repository_url
-    "agentops-postgresql"    = aws_ecr_repository.agentops_postgresql.repository_url
-    "agentops-cloudflared"   = aws_ecr_repository.agentops_cloudflared.repository_url
+    for k, repo in aws_ecr_repository.this : k => repo.repository_url
   }
 }
 
 output "repository_arn_map" {
-  description = "Map of repository name -> repository ARN"
+  description = "Logical repository key -> repository ARN."
   value = {
-    "agentops-frontend"      = aws_ecr_repository.agentops_frontend.arn
-    "agentops-inference"     = aws_ecr_repository.agentops_inference.arn
-    "agentops-auth"          = aws_ecr_repository.agentops_auth.arn
-    "agentops-cloudnativepg" = aws_ecr_repository.agentops_cloudnativepg.arn
-    "agentops-postgresql"    = aws_ecr_repository.agentops_postgresql.arn
-    "agentops-cloudflared"   = aws_ecr_repository.agentops_cloudflared.arn
+    for k, repo in aws_ecr_repository.this : k => repo.arn
+  }
+}
+
+output "repository_name_map" {
+  description = "Logical repository key -> repository name."
+  value = {
+    for k, repo in aws_ecr_repository.this : k => repo.name
   }
 }

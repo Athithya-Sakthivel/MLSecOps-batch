@@ -1,192 +1,369 @@
-// src/terraform/modules/iam_post_eks/main.tf
-// Post-EKS IAM + optional control-plane <-> node SG rules.
-// IRSA roles are created unconditionally; SG rules are created only when
-// the operator explicitly enables them via module variable `create_sg_rules = true`.
-// This avoids accidental duplicate-rule attempts and plan-time unknown count issues.
+// src/terraform/aws/modules/iam_post_eks/main.tf
+// Post-EKS IAM identities:
+// - IRSA roles for Kubernetes service accounts (S3 access)
+// - GitHub Actions OIDC roles (ECR push/pull access)
 
 variable "name_prefix" {
-  type    = string
-  default = "agentops"
+  description = "Prefix used for IAM role and policy names."
+  type        = string
+  default     = "mlops"
 }
 
 variable "tags" {
-  type    = map(string)
-  default = {}
+  description = "Tags applied to resources."
+  type        = map(string)
+  default     = {}
 }
 
 variable "oidc_provider_arn" {
-  type    = string
-  default = ""
+  description = "ARN of the EKS OIDC provider."
+  type        = string
 }
 
 variable "oidc_provider_issuer" {
+  description = "OIDC issuer host/path without https:// prefix."
   type        = string
-  description = "OIDC issuer host/path (without https://)"
-  default     = ""
 }
 
-variable "ebs_csi_policy_arn" {
-  type    = string
-  default = ""
+variable "s3_bucket_name_map" {
+  description = "Logical bucket key -> bucket name."
+  type        = map(string)
 }
 
-variable "cluster_autoscaler_policy_arn" {
-  type    = string
-  default = ""
+variable "s3_bucket_arn_map" {
+  description = "Logical bucket key -> bucket ARN."
+  type        = map(string)
 }
 
-variable "ebs_sa_namespace" {
-  type    = string
-  default = "kube-system"
+variable "irsa_roles" {
+  description = "IRSA role definitions."
+  type = map(object({
+    namespace       = string
+    service_account = string
+    bucket_key      = string
+    access          = string
+  }))
+
+  validation {
+    condition = alltrue([
+      for _, role in var.irsa_roles :
+      contains(keys(var.s3_bucket_name_map), role.bucket_key) &&
+      contains(keys(var.s3_bucket_arn_map), role.bucket_key) &&
+      contains(["read", "read_write"], role.access) &&
+      length(trimspace(role.namespace)) > 0 &&
+      length(trimspace(role.service_account)) > 0
+    ])
+    error_message = "Each irsa_roles item must reference a valid bucket_key, valid access mode, namespace, and service_account."
+  }
 }
 
-variable "ebs_sa_name" {
-  type    = string
-  default = "ebs-csi-controller-sa"
+variable "github_actions_roles" {
+  description = "GitHub Actions OIDC role definitions."
+  type = map(object({
+    repository = string
+    branch     = string
+    role_name  = string
+  }))
+
+  validation {
+    condition = alltrue([
+      for role_key, role in var.github_actions_roles :
+      contains(
+        [
+          "flyte_elt_task",
+          "flyte_train_task",
+          "tabular_inference_service"
+        ],
+        role_key
+      ) &&
+      can(regex("^[a-z0-9._-]+/[a-z0-9._-]+$", role.repository)) &&
+      length(trimspace(role.branch)) > 0 &&
+      length(trimspace(role.role_name)) > 0
+    ])
+    error_message = "GitHub Actions roles must use approved keys and repository format owner/repo in lowercase."
+  }
 }
 
-variable "autoscaler_sa_namespace" {
-  type    = string
-  default = "kube-system"
-}
+data "aws_partition" "current" {}
 
-variable "autoscaler_sa_name" {
-  type    = string
-  default = "cluster-autoscaler"
-}
+data "aws_caller_identity" "current" {}
 
-variable "node_security_group_id" {
-  description = "Worker node security group id (from modules/security)."
-  type        = string
-  default     = ""
-}
-
-variable "cluster_security_group_id" {
-  description = "EKS control-plane security group id (from modules/eks)."
-  type        = string
-  default     = ""
-}
-
-# Explicit operator-controlled flag. Default false to avoid accidental duplicate SG-rule creation.
-variable "create_sg_rules" {
-  description = "When true, the module will create control-plane <-> node SG rules. Set to true only after cluster and node SGs exist and you have confirmed rules are not already present."
-  type        = bool
-  default     = false
-}
+data "aws_region" "current" {}
 
 locals {
-  name_prefix = var.name_prefix
-  common_tags = merge({ ManagedBy = "agentops-serviceautomation" }, var.tags)
+  env_tag = lookup(var.tags, "Environment", "prod")
+
+  common_tags = merge(
+    {
+      ManagedBy   = "opentofu"
+      Platform    = "mlops"
+      Environment = local.env_tag
+    },
+    var.tags
+  )
+
+  irsa_role_names = {
+    for k, _ in var.irsa_roles :
+    k => "${var.name_prefix}-${k}-irsa-role"
+  }
+
+  irsa_policy_names = {
+    for k, _ in var.irsa_roles :
+    k => "${var.name_prefix}-${k}-irsa-policy"
+  }
+
+  github_role_names = {
+    for k, v in var.github_actions_roles :
+    k => v.role_name
+  }
+
+  github_policy_names = {
+    for k, v in var.github_actions_roles :
+    k => "${v.role_name}-policy"
+  }
+
+  // Explicit ECR repository names for the CI identities.
+  // This avoids deriving the ECR repo name from the GitHub repo path.
+  github_ecr_repository_names = {
+    flyte_elt_task            = "flyte-elt-task"
+    flyte_train_task          = "flyte-train-task"
+    tabular_inference_service = "tabular-inference-service"
+  }
+
+  list_bucket_actions = ["s3:ListBucket"]
+
+  read_object_actions = ["s3:GetObject"]
+
+  read_write_object_actions = [
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:DeleteObject"
+  ]
 }
 
-########################
-# IRSA Roles (EBS CSI, Cluster Autoscaler)
-########################
-resource "aws_iam_role" "ebs_csi_irsa" {
-  name = "${local.name_prefix}-ebs-csi-irsa-role"
+###############################################################################
+# IRSA trust policies
+###############################################################################
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Principal = {
-          Federated = var.oidc_provider_arn
-        }
-        Action = "sts:AssumeRoleWithWebIdentity"
-        Condition = {
-          StringEquals = {
-            ("${var.oidc_provider_issuer}:sub") = "system:serviceaccount:${var.ebs_sa_namespace}:${var.ebs_sa_name}"
-            ("${var.oidc_provider_issuer}:aud") = "sts.amazonaws.com"
-          }
-        }
-      }
+data "aws_iam_policy_document" "irsa_assume_role" {
+  for_each = var.irsa_roles
+
+  statement {
+    sid     = "AllowAssumeRoleWithWebIdentity"
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [var.oidc_provider_arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${var.oidc_provider_issuer}:sub"
+      values = [
+        "system:serviceaccount:${each.value.namespace}:${each.value.service_account}"
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${var.oidc_provider_issuer}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+  }
+}
+
+###############################################################################
+# IRSA S3 access policies
+###############################################################################
+
+data "aws_iam_policy_document" "irsa_s3_access" {
+  for_each = var.irsa_roles
+
+  statement {
+    sid       = "AllowBucketListing"
+    effect    = "Allow"
+    actions   = local.list_bucket_actions
+    resources = [var.s3_bucket_arn_map[each.value.bucket_key]]
+  }
+
+  statement {
+    sid    = "AllowObjectAccess"
+    effect = "Allow"
+
+    actions = each.value.access == "read" ? local.read_object_actions : local.read_write_object_actions
+
+    resources = [
+      "${var.s3_bucket_arn_map[each.value.bucket_key]}/*"
     ]
-  })
-
-  tags = local.common_tags
+  }
 }
 
-resource "aws_iam_role_policy_attachment" "ebs_csi_attach" {
-  role       = aws_iam_role.ebs_csi_irsa.name
-  policy_arn = var.ebs_csi_policy_arn
+resource "aws_iam_role" "irsa" {
+  for_each = var.irsa_roles
+
+  name               = local.irsa_role_names[each.key]
+  assume_role_policy = data.aws_iam_policy_document.irsa_assume_role[each.key].json
+  tags               = local.common_tags
 }
 
-resource "aws_iam_role" "cluster_autoscaler_irsa" {
-  name = "${local.name_prefix}-cluster-autoscaler-irsa-role"
+resource "aws_iam_policy" "irsa" {
+  for_each = var.irsa_roles
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Principal = {
-          Federated = var.oidc_provider_arn
-        }
-        Action = "sts:AssumeRoleWithWebIdentity"
-        Condition = {
-          StringEquals = {
-            ("${var.oidc_provider_issuer}:sub") = "system:serviceaccount:${var.autoscaler_sa_namespace}:${var.autoscaler_sa_name}"
-            ("${var.oidc_provider_issuer}:aud") = "sts.amazonaws.com"
-          }
-        }
-      }
+  name        = local.irsa_policy_names[each.key]
+  description = "IRSA S3 policy for ${each.key}"
+  policy      = data.aws_iam_policy_document.irsa_s3_access[each.key].json
+  tags        = local.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "irsa" {
+  for_each = var.irsa_roles
+
+  role       = aws_iam_role.irsa[each.key].name
+  policy_arn = aws_iam_policy.irsa[each.key].arn
+}
+
+###############################################################################
+# GitHub Actions trust policies
+###############################################################################
+
+data "aws_iam_policy_document" "github_assume_role" {
+  for_each = var.github_actions_roles
+
+  statement {
+    sid     = "AllowGitHubActionsOIDC"
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type = "Federated"
+      identifiers = [
+        "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+      values = [
+        "repo:${each.value.repository}:ref:refs/heads/${each.value.branch}"
+      ]
+    }
+  }
+}
+
+###############################################################################
+# GitHub Actions ECR access policies
+###############################################################################
+
+data "aws_iam_policy_document" "github_ecr_push" {
+  for_each = var.github_actions_roles
+
+  statement {
+    sid       = "AllowECRAuth"
+    effect    = "Allow"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "AllowECRPushPull"
+    effect = "Allow"
+
+    actions = [
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:BatchGetImage",
+      "ecr:CompleteLayerUpload",
+      "ecr:InitiateLayerUpload",
+      "ecr:PutImage",
+      "ecr:UploadLayerPart"
     ]
-  })
 
-  tags = local.common_tags
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ecr:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:repository/${local.github_ecr_repository_names[each.key]}"
+    ]
+  }
 }
 
-resource "aws_iam_role_policy_attachment" "cluster_autoscaler_attach" {
-  role       = aws_iam_role.cluster_autoscaler_irsa.name
-  policy_arn = var.cluster_autoscaler_policy_arn
+resource "aws_iam_role" "github_actions" {
+  for_each = var.github_actions_roles
+
+  name               = local.github_role_names[each.key]
+  assume_role_policy = data.aws_iam_policy_document.github_assume_role[each.key].json
+  tags               = local.common_tags
 }
 
-########################
-# Control-plane <-> Nodes SG rules (explicit)
-# - Created only if create_sg_rules = true.
-# - Operator must ensure the SG IDs are correct and that identical rules don't already exist.
-########################
+resource "aws_iam_policy" "github_actions" {
+  for_each = var.github_actions_roles
 
-resource "aws_security_group_rule" "nodes_to_api_https" {
-  count = var.create_sg_rules ? 1 : 0
-
-  security_group_id        = var.cluster_security_group_id
-  type                     = "ingress"
-  from_port                = 443
-  to_port                  = 443
-  protocol                 = "tcp"
-  source_security_group_id = var.node_security_group_id
-  description              = "Allow worker nodes to call EKS API server (TCP/443)"
+  name        = local.github_policy_names[each.key]
+  description = "GitHub Actions ECR policy for ${each.key}"
+  policy      = data.aws_iam_policy_document.github_ecr_push[each.key].json
+  tags        = local.common_tags
 }
 
-resource "aws_security_group_rule" "api_to_kubelet" {
-  count = var.create_sg_rules ? 1 : 0
+resource "aws_iam_role_policy_attachment" "github_actions" {
+  for_each = var.github_actions_roles
 
-  security_group_id        = var.node_security_group_id
-  type                     = "ingress"
-  from_port                = 10250
-  to_port                  = 10250
-  protocol                 = "tcp"
-  source_security_group_id = var.cluster_security_group_id
-  description              = "Allow EKS control plane to reach kubelet on workers (TCP/10250)"
+  role       = aws_iam_role.github_actions[each.key].name
+  policy_arn = aws_iam_policy.github_actions[each.key].arn
 }
 
-########################
+###############################################################################
 # Outputs
-########################
+###############################################################################
 
-output "ebs_csi_irsa_role_arn" {
-  value       = aws_iam_role.ebs_csi_irsa.arn
-  description = "ARN of the EBS CSI IRSA role"
+output "irsa_role_arns" {
+  description = "IRSA role ARNs."
+  value = {
+    for k, v in aws_iam_role.irsa :
+    k => v.arn
+  }
 }
 
-output "cluster_autoscaler_irsa_role_arn" {
-  value       = aws_iam_role.cluster_autoscaler_irsa.arn
-  description = "ARN of the Cluster Autoscaler IRSA role"
+output "irsa_role_names" {
+  description = "IRSA role names."
+  value = {
+    for k, v in aws_iam_role.irsa :
+    k => v.name
+  }
 }
 
-output "cluster_node_sg_rules_applied" {
-  description = "True if create_sg_rules was true (operator intent)."
-  value       = var.create_sg_rules
+output "irsa_policy_arns" {
+  description = "IRSA policy ARNs."
+  value = {
+    for k, v in aws_iam_policy.irsa :
+    k => v.arn
+  }
+}
+
+output "github_actions_role_arns" {
+  description = "GitHub Actions role ARNs."
+  value = {
+    for k, v in aws_iam_role.github_actions :
+    k => v.arn
+  }
+}
+
+output "github_actions_role_names" {
+  description = "GitHub Actions role names."
+  value = {
+    for k, v in aws_iam_role.github_actions :
+    k => v.name
+  }
+}
+
+output "github_actions_policy_arns" {
+  description = "GitHub Actions policy ARNs."
+  value = {
+    for k, v in aws_iam_policy.github_actions :
+    k => v.arn
+  }
 }

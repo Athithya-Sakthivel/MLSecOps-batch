@@ -142,10 +142,14 @@ spec:
               value: '15000'
             - name: OTEL_METRIC_EXPORT_TIMEOUT_MS
               value: '10000'
+            - name: OTEL_TRACES_SAMPLER
+              value: parentbased_traceidratio
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: '0.7'
             - name: LOG_LEVEL
-              value: WARNING
+              value: INFO
             - name: SLOW_REQUEST_MS
-              value: '100.0'
+              value: '100'
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:

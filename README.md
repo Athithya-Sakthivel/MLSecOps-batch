@@ -11,3 +11,11 @@ export AWS_REGION=ap-south-1
 bash src/scripts/e2e_validation_kind.sh
 ```
 
+
+export PG_IRSA_ROLE_ARN
+
+![alt text](traces.png)
+![alt text](image-1.png)
+![alt text](image.png)
+![alt text](image-1.png)
+![alt text](image-2.png)

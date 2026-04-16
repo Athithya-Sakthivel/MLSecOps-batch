@@ -31,8 +31,8 @@ DB_HOST = os.environ.get("DB_HOST", "")
 DB_NAME = os.environ.get("DB_NAME", "mlflow")
 
 DB_SECRET_NAMESPACE = os.environ.get("DB_SECRET_NAMESPACE", POSTGRES_NS)
-DB_USERNAME_KEY = os.environ.get("DB_USERNAME_KEY", "username")  # which field in the secret contains the DB username
-DB_PASSWORD_KEY = os.environ.get("DB_PASSWORD_KEY", "password")  # which field in the secret contains the DB password
+DB_USERNAME_KEY = os.environ.get("DB_USERNAME_KEY", "username")
+DB_PASSWORD_KEY = os.environ.get("DB_PASSWORD_KEY", "password")
 DB_PORT_KEY = os.environ.get("DB_PORT_KEY", "port")
 
 MLFLOW_NAME = os.environ.get("MLFLOW_NAME", "mlflow")
@@ -113,6 +113,10 @@ else:
 
 MLFLOW_REPLICAS = int(os.environ.get("MLFLOW_REPLICAS", "1"))
 MLFLOW_MIN_READY_SECONDS = int(os.environ.get("MLFLOW_MIN_READY_SECONDS", "10"))
+
+
+def is_eks() -> bool:
+    return K8S_CLUSTER == "eks"
 
 
 def ts() -> str:
@@ -343,13 +347,18 @@ def ensure_s3_auth_secret() -> None:
     ensure_secret(TARGET_NS, S3_AUTH_SECRET_NAME, data, "s3-auth-secret.yaml")
 
 
-def ensure_service_account() -> None:
+def service_account_annotations() -> dict[str, str]:
     annotations: dict[str, str] = {}
     if MLFLOW_USE_IAM:
+        if not is_eks():
+            fatal("MLFLOW_USE_IAM=true requires K8S_CLUSTER=eks")
         if not AWS_ROLE_ARN:
             fatal("AWS_ROLE_ARN is required when MLFLOW_USE_IAM=true")
         annotations["eks.amazonaws.com/role-arn"] = AWS_ROLE_ARN
+    return annotations
 
+
+def ensure_service_account() -> None:
     apply_manifest(
         {
             "apiVersion": "v1",
@@ -358,7 +367,7 @@ def ensure_service_account() -> None:
                 "name": SERVICE_ACCOUNT_NAME,
                 "namespace": TARGET_NS,
                 "labels": {"app.kubernetes.io/name": MLFLOW_NAME},
-                "annotations": annotations,
+                "annotations": service_account_annotations(),
             },
         },
         "serviceaccount.yaml",
@@ -680,6 +689,25 @@ def topology_spread_constraints() -> list[dict[str, Any]]:
     ]
 
 
+def scheduling_overrides() -> dict[str, Any]:
+    if not is_eks():
+        return {}
+
+    return {
+        "nodeSelector": {
+            "node-type": "general",
+        },
+        "tolerations": [
+            {
+                "key": "node-type",
+                "operator": "Equal",
+                "value": "general",
+                "effect": "NoSchedule",
+            }
+        ],
+    }
+
+
 def deployment_manifest() -> dict[str, Any]:
     checksum_source = {
         "db_host": DB_HOST,
@@ -708,8 +736,44 @@ def deployment_manifest() -> dict[str, Any]:
         "cpu_limit": MLFLOW_CPU_LIMIT,
         "mem_request": MLFLOW_MEM_REQUEST,
         "mem_limit": MLFLOW_MEM_LIMIT,
+        "k8s_cluster": K8S_CLUSTER,
     }
     checksum = hashlib.sha256(yaml_dump(checksum_source).encode("utf-8")).hexdigest()
+
+    pod_spec: dict[str, Any] = {
+        "serviceAccountName": SERVICE_ACCOUNT_NAME,
+        "securityContext": base_pod_security_context(),
+        "topologySpreadConstraints": topology_spread_constraints(),
+        **scheduling_overrides(),
+        "containers": [
+            {
+                "name": "mlflow",
+                "image": MLFLOW_IMAGE,
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["/bin/sh", "-lc"],
+                "args": [server_script()],
+                "env": build_common_env(),
+                "ports": [{"name": "http", "containerPort": MLFLOW_PORT, "protocol": "TCP"}],
+                "resources": {
+                    "requests": {
+                        "cpu": MLFLOW_CPU_REQUEST,
+                        "memory": MLFLOW_MEM_REQUEST,
+                    },
+                    "limits": {
+                        "cpu": MLFLOW_CPU_LIMIT,
+                        "memory": MLFLOW_MEM_LIMIT,
+                    },
+                },
+                "startupProbe": startup_probe(),
+                "readinessProbe": readiness_probe(),
+                "livenessProbe": liveness_probe(),
+                "securityContext": base_container_security_context(),
+                "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+            }
+        ],
+        "terminationGracePeriodSeconds": 30,
+        "volumes": [{"name": "tmp", "emptyDir": {}}],
+    }
 
     return {
         "apiVersion": "apps/v1",
@@ -740,45 +804,16 @@ def deployment_manifest() -> dict[str, Any]:
                     "labels": pod_template_labels(),
                     "annotations": {"mlflow.io/config-checksum": checksum},
                 },
-                "spec": {
-                    "serviceAccountName": SERVICE_ACCOUNT_NAME,
-                    "securityContext": base_pod_security_context(),
-                    "topologySpreadConstraints": topology_spread_constraints(),
-                    "containers": [
-                        {
-                            "name": "mlflow",
-                            "image": MLFLOW_IMAGE,
-                            "imagePullPolicy": "IfNotPresent",
-                            "command": ["/bin/sh", "-lc"],
-                            "args": [server_script()],
-                            "env": build_common_env(),
-                            "ports": [{"name": "http", "containerPort": MLFLOW_PORT, "protocol": "TCP"}],
-                            "resources": {
-                                "requests": {
-                                    "cpu": MLFLOW_CPU_REQUEST,
-                                    "memory": MLFLOW_MEM_REQUEST,
-                                },
-                                "limits": {
-                                    "cpu": MLFLOW_CPU_LIMIT,
-                                    "memory": MLFLOW_MEM_LIMIT,
-                                },
-                            },
-                            "startupProbe": startup_probe(),
-                            "readinessProbe": readiness_probe(),
-                            "livenessProbe": liveness_probe(),
-                            "securityContext": base_container_security_context(),
-                            "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
-                        }
-                    ],
-                    "terminationGracePeriodSeconds": 30,
-                    "volumes": [{"name": "tmp", "emptyDir": {}}],
-                },
+                "spec": pod_spec,
             },
         },
     }
 
 
-def pdb_manifest() -> dict[str, Any]:
+def pdb_manifest() -> dict[str, Any] | None:
+    if MLFLOW_REPLICAS < 2:
+        return None
+
     return {
         "apiVersion": "policy/v1",
         "kind": "PodDisruptionBudget",
@@ -985,6 +1020,8 @@ def main() -> None:
         fatal("MLFLOW_S3_BUCKET is required; local fallback has been removed")
     if DB_ACCESS_MODE not in {"pooler", "rw"}:
         fatal("DB_ACCESS_MODE must be pooler or rw")
+    if MLFLOW_USE_IAM and not is_eks():
+        fatal("MLFLOW_USE_IAM=true requires K8S_CLUSTER=eks")
     if MLFLOW_USE_IAM and not AWS_ROLE_ARN:
         fatal("AWS_ROLE_ARN is required when MLFLOW_USE_IAM=true")
     if not MLFLOW_USE_IAM and (not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY):
@@ -1011,7 +1048,11 @@ def main() -> None:
 
     log("rendering manifests")
     apply_manifest(service_manifest(), "service.yaml")
-    apply_manifest(pdb_manifest(), "pdb.yaml")
+
+    pdb = pdb_manifest()
+    if pdb is not None:
+        apply_manifest(pdb, "pdb.yaml")
+
     apply_manifest(deployment_manifest(), "deployment.yaml")
 
     wait_for_rollout(MLFLOW_NAME)
@@ -1048,7 +1089,7 @@ def cli() -> int:
                 "Useful env:\n"
                 "  MLFLOW_REPLICAS=2\n"
                 "  MLFLOW_MIN_READY_SECONDS=10\n"
-                "  K8S_CLUSTER=kind|other\n"
+                "  K8S_CLUSTER=kind|eks\n"
                 "  MLFLOW_USE_IAM=true|false\n"
                 "  AWS_ROLE_ARN=arn:aws:iam::... (required when MLFLOW_USE_IAM=true)\n"
                 "  AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (required when MLFLOW_USE_IAM=false)\n"

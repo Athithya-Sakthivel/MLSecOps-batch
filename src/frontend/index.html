@@ -1,0 +1,239 @@
+<!-- src/frontend/index.html -->
+<!doctype html>
+<html lang="en" class="h-full">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tabular Inference Console</title>
+    <meta
+      name="description"
+      content="Cloudflare Pages frontend for tabular ML inference with OIDC auth and Ray Serve prediction."
+    />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="./styles.css" />
+    <script defer src="./app.js"></script>
+  </head>
+
+  <body class="min-h-full bg-slate-950 text-slate-100">
+    <div class="mx-auto flex min-h-screen max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
+      <header class="panel flex flex-col gap-4 p-5 md:flex-row md:items-center md:justify-between">
+        <div>
+          <div class="flex items-center gap-3">
+            <div class="h-3 w-3 rounded-full bg-cyan-400 pulse-dot"></div>
+            <h1 class="text-2xl font-semibold tracking-tight">Tabular Inference Console</h1>
+          </div>
+          <p class="mt-2 max-w-2xl text-sm text-slate-300">
+            Static UI on Cloudflare Pages. Auth via <code class="mono">auth.api</code>, prediction via
+            <code class="mono">predict.api</code>.
+          </p>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <span id="session-pill" class="pill pill-neutral">Session: checking…</span>
+          <span id="ready-pill" class="pill pill-neutral">Model: loading…</span>
+        </div>
+      </header>
+
+      <main class="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
+        <section class="grid gap-6">
+          <section class="panel p-5">
+            <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h2 class="text-lg font-semibold">Authentication</h2>
+                <p class="mt-1 text-sm text-slate-300">
+                  Log in with your provider, then the app can call <code class="mono">/predict</code> with credentials.
+                </p>
+              </div>
+
+              <button
+                id="logout-btn"
+                type="button"
+                class="btn btn-secondary hidden"
+              >
+                Logout
+              </button>
+            </div>
+
+            <div id="auth-panel" class="mt-4 flex flex-wrap gap-3">
+              <button type="button" class="btn btn-primary" data-provider="google">Continue with Google</button>
+              <button type="button" class="btn btn-primary" data-provider="microsoft">Continue with Microsoft</button>
+              <button type="button" class="btn btn-primary" data-provider="github">Continue with GitHub</button>
+            </div>
+
+            <div id="user-panel" class="hidden mt-5 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+              <div class="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <div class="text-sm uppercase tracking-[0.18em] text-slate-400">Signed in as</div>
+                  <div id="user-name" class="mt-1 text-lg font-medium">—</div>
+                </div>
+                <div id="user-provider" class="pill pill-info">—</div>
+              </div>
+              <div id="user-meta" class="mt-3 text-sm text-slate-300"></div>
+            </div>
+          </section>
+
+          <section class="panel p-5">
+            <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h2 class="text-lg font-semibold">Model readiness</h2>
+                <p class="mt-1 text-sm text-slate-300">
+                  Pulled from <code class="mono">GET /readyz</code>. This is the live schema source for the form.
+                </p>
+              </div>
+              <button id="refresh-ready-btn" type="button" class="btn btn-secondary">Refresh</button>
+            </div>
+
+            <div id="ready-grid" class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              <div class="info-card">
+                <div class="info-label">Status</div>
+                <div id="ready-status" class="info-value">Loading…</div>
+              </div>
+              <div class="info-card">
+                <div class="info-label">Model</div>
+                <div id="ready-model" class="info-value">—</div>
+              </div>
+              <div class="info-card">
+                <div class="info-label">Model version</div>
+                <div id="ready-model-version" class="info-value">—</div>
+              </div>
+              <div class="info-card">
+                <div class="info-label">Schema version</div>
+                <div id="ready-schema-version" class="info-value">—</div>
+              </div>
+              <div class="info-card">
+                <div class="info-label">Feature version</div>
+                <div id="ready-feature-version" class="info-value">—</div>
+              </div>
+              <div class="info-card">
+                <div class="info-label">Prediction cap</div>
+                <div id="ready-cap" class="info-value">—</div>
+              </div>
+            </div>
+
+            <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+              <summary class="cursor-pointer select-none text-sm font-medium text-slate-200">
+                Feature order
+              </summary>
+              <div class="mt-3">
+                <div id="feature-order" class="flex flex-wrap gap-2"></div>
+              </div>
+            </details>
+          </section>
+
+          <section class="panel p-5">
+            <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h2 class="text-lg font-semibold">Prediction</h2>
+                <p class="mt-1 text-sm text-slate-300">
+                  Use structured form mode for normal use. Switch to JSON mode for direct payload debugging.
+                </p>
+              </div>
+
+              <div class="inline-flex rounded-2xl border border-slate-800 bg-slate-900 p-1">
+                <button id="mode-form-btn" type="button" class="mode-btn mode-btn-active">Form</button>
+                <button id="mode-json-btn" type="button" class="mode-btn">JSON</button>
+              </div>
+            </div>
+
+            <div id="form-mode" class="mt-5">
+              <div class="mb-3 flex items-center justify-between gap-3">
+                <div class="text-sm text-slate-300">
+                  Build one or more instances. Every field is numeric.
+                </div>
+                <button id="add-instance-btn" type="button" class="btn btn-secondary">Add instance</button>
+              </div>
+
+              <div id="instances-container" class="grid gap-4"></div>
+
+              <div class="mt-5 flex flex-wrap items-center gap-3">
+                <button id="predict-btn-form" type="button" class="btn btn-primary">Run prediction</button>
+                <span id="form-help" class="text-sm text-slate-400">POST /predict</span>
+              </div>
+            </div>
+
+            <div id="json-mode" class="mt-5 hidden">
+              <label for="json-input" class="mb-2 block text-sm font-medium text-slate-200">
+                Raw request body
+              </label>
+              <textarea
+                id="json-input"
+                class="input-area min-h-[18rem] w-full"
+                spellcheck="false"
+                placeholder='{"instances":[{"pickup_hour":8,"pickup_dow":1}]}'
+              ></textarea>
+
+              <div class="mt-4 flex flex-wrap items-center gap-3">
+                <button id="predict-btn-json" type="button" class="btn btn-primary">Run prediction</button>
+                <button id="load-sample-btn" type="button" class="btn btn-secondary">Load sample</button>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <aside class="grid gap-6">
+          <section class="panel p-5">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <h2 class="text-lg font-semibold">Output</h2>
+                <p class="mt-1 text-sm text-slate-300">
+                  Response, request ID, status, and latency.
+                </p>
+              </div>
+              <button id="copy-response-btn" type="button" class="btn btn-secondary">Copy output</button>
+            </div>
+
+            <div class="mt-4 grid gap-3 sm:grid-cols-2">
+              <div class="info-card">
+                <div class="info-label">HTTP status</div>
+                <div id="http-status" class="info-value">—</div>
+              </div>
+              <div class="info-card">
+                <div class="info-label">Request ID</div>
+                <div id="request-id" class="info-value mono">—</div>
+              </div>
+              <div class="info-card">
+                <div class="info-label">Latency</div>
+                <div id="latency" class="info-value">—</div>
+              </div>
+              <div class="info-card">
+                <div class="info-label">Instances</div>
+                <div id="instance-count" class="info-value">—</div>
+              </div>
+            </div>
+
+            <pre id="prediction-output" class="output-box mt-4 min-h-[18rem] overflow-auto">No prediction yet.</pre>
+          </section>
+
+          <section class="panel p-5">
+            <h2 class="text-lg font-semibold">Debug</h2>
+            <p class="mt-1 text-sm text-slate-300">
+              Raw request and raw backend response for reproducibility.
+            </p>
+
+            <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-900/70 p-4" open>
+              <summary class="cursor-pointer select-none text-sm font-medium text-slate-200">
+                Raw request
+              </summary>
+              <pre id="raw-request" class="output-box mt-3 min-h-40 overflow-auto">—</pre>
+            </details>
+
+            <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-900/70 p-4" open>
+              <summary class="cursor-pointer select-none text-sm font-medium text-slate-200">
+                Raw response
+              </summary>
+              <pre id="raw-response" class="output-box mt-3 min-h-40 overflow-auto">—</pre>
+            </details>
+
+            <div id="error-banner" class="mt-4 hidden rounded-2xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-200"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <noscript>
+      <div class="mx-auto max-w-2xl p-6 text-center text-slate-200">
+        JavaScript is required for this interface.
+      </div>
+    </noscript>
+  </body>
+</html>

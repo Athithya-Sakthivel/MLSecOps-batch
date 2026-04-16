@@ -19,13 +19,16 @@ RENDERED_PATH = STATE_DIR / "rendered.yaml"
 HASH_PATH = STATE_DIR / "rendered.sha256"
 
 AUTH_MODE_ANNOTATION = "inference-service.io/auth-mode"
+K8S_CLUSTER_ENV = "K8S_CLUSTER"
+
+SUPPORTED_CLUSTERS = {"kind", "eks"}
 
 DEPLOYMENT_DEFAULTS: dict[str, str] = {
     "NAMESPACE": "inference",
     "RAYSERVICE_NAME": "tabular-inference",
     "SERVICE_ACCOUNT_NAME": "ray-inference-sa",
     "AWS_SECRET_NAME": "aws-credentials",
-    "RAY_IMAGE": "ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-15-06-12--b2617e3@sha256:3615562548755e906ad17945518267cfadbac7bdaacc5a76fc6ebd4dfbcfd6f4",
+    "RAY_IMAGE": "ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-13-04-58--7d3aa0f@sha256:9e416db3e3eda0483bb726f017bc4efd7a87011175df017e96362c60102c2c23",
     "RAY_VERSION": "2.54.1",
     "HEAD_CPU": "1",
     "HEAD_MEMORY": "4Gi",
@@ -79,6 +82,8 @@ APP_ENV_DEFAULTS: dict[str, str] = {
     "OTEL_EXPORTER_OTLP_TIMEOUT": "10000",
     "OTEL_METRIC_EXPORT_INTERVAL_MS": "15000",
     "OTEL_METRIC_EXPORT_TIMEOUT_MS": "10000",
+    "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
+    "OTEL_TRACES_SAMPLER_ARG": "0.10",
     "LOG_LEVEL": "WARNING",
     "SLOW_REQUEST_MS": "100.0",
     "AWS_ACCESS_KEY_ID": "",
@@ -101,6 +106,7 @@ PLACEHOLDER_VALUES = {key: APP_ENV_DEFAULTS[key] for key in REQUIRED_APP_ENV_NAM
 
 @dataclass(frozen=True, slots=True)
 class DeploymentSettings:
+    cluster: str
     namespace: str
     rayservice_name: str
     service_account_name: str
@@ -124,6 +130,8 @@ class DeploymentSettings:
     irsa_role_arn: str | None
 
     def __post_init__(self) -> None:
+        if self.cluster not in SUPPORTED_CLUSTERS:
+            raise RuntimeError(f"K8S_CLUSTER must be one of {sorted(SUPPORTED_CLUSTERS)}, got {self.cluster!r}")
         if not self.namespace.strip():
             raise RuntimeError("NAMESPACE must not be empty")
         if not self.rayservice_name.strip():
@@ -160,6 +168,10 @@ class DeploymentSettings:
             raise RuntimeError("RUN_AS_GROUP must be >= 1")
         if self.fs_group < 1:
             raise RuntimeError("FS_GROUP must be >= 1")
+        if self.cluster == "kind" and self.use_iam:
+            raise RuntimeError("USE_IAM=true is not supported for K8S_CLUSTER=kind")
+        if self.cluster == "eks" and self.use_iam and not self.irsa_role_arn:
+            raise RuntimeError("KUBERAY_IAM_ROLE_ARN is required when K8S_CLUSTER=eks and USE_IAM=true")
 
 
 def _env_str(name: str, default: str) -> str:
@@ -204,15 +216,19 @@ def _validate_log_level(value: str) -> str:
     return normalized
 
 
-def _profile() -> str:
-    raw = os.getenv("DEPLOYMENT_PROFILE", "prod").strip().lower()
-    if raw != "prod":
-        raise RuntimeError("DEPLOYMENT_PROFILE is fixed to 'prod' in this build")
-    return "prod"
+def _cluster() -> str:
+    raw = os.getenv(K8S_CLUSTER_ENV, "kind").strip().lower()
+    if raw not in SUPPORTED_CLUSTERS:
+        raise RuntimeError(f"{K8S_CLUSTER_ENV} must be one of {sorted(SUPPORTED_CLUSTERS)}, got {raw!r}")
+    return raw
 
 
-def _validate_auth_mode() -> tuple[bool, str | None]:
-    use_iam = _env_bool("USE_IAM", False)
+def _default_use_iam(cluster: str) -> bool:
+    return cluster == "eks"
+
+
+def _validate_auth_mode(cluster: str) -> tuple[bool, str | None]:
+    use_iam = _env_bool("USE_IAM", _default_use_iam(cluster))
     access_key = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
     secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
 
@@ -244,9 +260,11 @@ def _static_credentials() -> dict[str, str]:
 
 
 def load_deployment_settings() -> DeploymentSettings:
-    use_iam, irsa_role_arn = _validate_auth_mode()
+    cluster = _cluster()
+    use_iam, irsa_role_arn = _validate_auth_mode(cluster)
 
     return DeploymentSettings(
+        cluster=cluster,
         namespace=_env_str("NAMESPACE", DEPLOYMENT_DEFAULTS["NAMESPACE"]),
         rayservice_name=_env_str("RAYSERVICE_NAME", DEPLOYMENT_DEFAULTS["RAYSERVICE_NAME"]),
         service_account_name=_env_str("SERVICE_ACCOUNT_NAME", DEPLOYMENT_DEFAULTS["SERVICE_ACCOUNT_NAME"]),
@@ -288,6 +306,79 @@ def _base_labels(settings: DeploymentSettings) -> dict[str, str]:
         "app.kubernetes.io/name": settings.rayservice_name,
         "app.kubernetes.io/managed-by": "inference-service",
         "app.kubernetes.io/component": "inference",
+    }
+
+
+def _pod_labels(settings: DeploymentSettings, role: str) -> dict[str, str]:
+    labels = _base_labels(settings).copy()
+    labels.update(
+        {
+            "app.kubernetes.io/part-of": settings.rayservice_name,
+            "ray.io/group": role,
+        }
+    )
+    return labels
+
+
+def _node_selector_for_role(settings: DeploymentSettings, role: str) -> dict[str, str] | None:
+    if settings.cluster != "eks":
+        return None
+    if role == "head":
+        return {"node-type": "general"}
+    if role == "worker":
+        return {"node-type": "compute"}
+    raise RuntimeError(f"unknown Ray role: {role!r}")
+
+
+def _tolerations_for_role(settings: DeploymentSettings, role: str) -> list[dict[str, Any]]:
+    if settings.cluster == "eks":
+        key = "node-type"
+        value = "general" if role == "head" else "compute"
+        return [
+            {
+                "key": key,
+                "operator": "Equal",
+                "value": value,
+                "effect": "NoSchedule",
+            }
+        ]
+
+    # kind: tolerate the default control-plane taint so a single-node cluster works.
+    return [
+        {
+            "key": "node-role.kubernetes.io/control-plane",
+            "operator": "Exists",
+            "effect": "NoSchedule",
+        },
+        {
+            "key": "node-role.kubernetes.io/master",
+            "operator": "Exists",
+            "effect": "NoSchedule",
+        },
+    ]
+
+
+def _ray_pod_spec_common(settings: DeploymentSettings, role: str) -> dict[str, Any]:
+    spec: dict[str, Any] = {
+        "serviceAccountName": settings.service_account_name if settings.use_iam else None,
+        "nodeSelector": _node_selector_for_role(settings, role),
+        "tolerations": _tolerations_for_role(settings, role),
+        "securityContext": {
+            "runAsNonRoot": True,
+            "runAsUser": settings.run_as_user,
+            "runAsGroup": settings.run_as_group,
+            "fsGroup": settings.fs_group,
+        },
+        "terminationGracePeriodSeconds": 30,
+        "volumes": _shared_volumes(),
+    }
+    # Ray/KubeRay expects a standard PodSpec. Remove explicit None values.
+    return {key: value for key, value in spec.items() if value is not None}
+
+
+def _pod_template_metadata(settings: DeploymentSettings, role: str) -> dict[str, Any]:
+    return {
+        "labels": _pod_labels(settings, role),
     }
 
 
@@ -468,6 +559,31 @@ def _shared_mounts(settings: DeploymentSettings) -> list[dict[str, Any]]:
     ]
 
 
+def build_pdb_doc(settings: DeploymentSettings) -> dict[str, Any] | None:
+    if settings.cluster != "eks":
+        return None
+
+    return {
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": {
+            "name": f"{settings.rayservice_name}-head-pdb",
+            "namespace": settings.namespace,
+            "labels": _pod_labels(settings, "head"),
+        },
+        "spec": {
+            "minAvailable": 1,
+            "selector": {
+                "matchLabels": {
+                    "app.kubernetes.io/name": settings.rayservice_name,
+                    "app.kubernetes.io/component": "inference",
+                    "ray.io/group": "head",
+                }
+            },
+        },
+    }
+
+
 def build_rayservice_doc(settings: DeploymentSettings, app_env: dict[str, str]) -> dict[str, Any]:
     labels = _base_labels(settings)
     annotations = {
@@ -579,6 +695,7 @@ def build_rayservice_doc(settings: DeploymentSettings, app_env: dict[str, str]) 
                         "num-cpus": settings.head_ray_num_cpus,
                     },
                     "template": {
+                        "metadata": _pod_template_metadata(settings, "head"),
                         "spec": head_template_spec,
                     },
                 },
@@ -592,6 +709,7 @@ def build_rayservice_doc(settings: DeploymentSettings, app_env: dict[str, str]) 
                             "num-cpus": settings.worker_ray_num_cpus,
                         },
                         "template": {
+                            "metadata": _pod_template_metadata(settings, "worker"),
                             "spec": worker_template_spec,
                         },
                     }
@@ -605,8 +723,11 @@ def build_rayservice_doc(settings: DeploymentSettings, app_env: dict[str, str]) 
 def build_documents(settings: DeploymentSettings, app_env: dict[str, str]) -> list[dict[str, Any]]:
     docs: list[dict[str, Any]] = [build_namespace_doc(settings)]
     sa_doc = build_service_account_doc(settings)
+    pdb_doc = build_pdb_doc(settings)
     if sa_doc is not None:
         docs.append(sa_doc)
+    if pdb_doc is not None:
+        docs.append(pdb_doc)
     docs.append(build_rayservice_doc(settings, app_env))
     return docs
 
@@ -689,8 +810,8 @@ def rollout() -> int:
     kubectl_apply_doc(docs[0])
     if secret_doc is not None:
         kubectl_apply_doc(secret_doc)
-    if len(docs) > 1 and docs[1].get("kind") == "ServiceAccount":
-        kubectl_apply_doc(docs[1])
+    for doc in docs[1:-1]:
+        kubectl_apply_doc(doc)
 
     rayservice_doc = docs[-1]
     rayservice_path = write_temp_yaml(render_documents([rayservice_doc]))
@@ -710,6 +831,7 @@ def delete() -> int:
     settings = load_deployment_settings()
     namespace_doc = build_namespace_doc(settings)
     sa_doc = build_service_account_doc(settings)
+    pdb_doc = build_pdb_doc(settings)
     rayservice_doc: dict[str, Any] | None = None
 
     if RENDERED_PATH.exists():
@@ -726,6 +848,8 @@ def delete() -> int:
     secret_doc = build_secret_delete_doc(settings) if not settings.use_iam else None
 
     kubectl_delete_doc(rayservice_doc)
+    if pdb_doc is not None:
+        kubectl_delete_doc(pdb_doc)
     if sa_doc is not None:
         kubectl_delete_doc(sa_doc)
     if secret_doc is not None:

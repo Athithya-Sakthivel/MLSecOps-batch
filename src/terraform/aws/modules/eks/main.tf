@@ -1,82 +1,67 @@
-// src/terraform/modules/eks/main.tf
+// src/terraform/aws/modules/eks/main.tf
 // EKS cluster + managed nodegroups.
-// Compatible with OpenTofu/Terraform >=1.11.5 and hashicorp/aws 6.x.
 //
-// Notes:
-// - The module requires the caller to provide a node_security_group_id (SG attached to worker nodes).
-//   The module creates the control-plane ingress rule that allows worker-node SG -> control-plane:443
-//   so kubelet on nodes can register the node during bootstrap.
-// - If you use a custom EC2 Launch Template for node bootstrap, supply launch_template_id / version.
-// - This module intentionally does NOT attempt to pre-validate computed module outputs (they may be unknown
-//   during plan). Ensure your root module wires and depends_on modules correctly.
+// This version fixes the nodegroup bootstrap path by making the worker
+// security group explicit in a module-owned launch template.
+// Managed nodegroups are always created with a launch template; when custom
+// security groups are used there, EKS does not add the cluster security group
+// automatically, so the worker SG must be attached deliberately.
+//
+// Source of truth:
+// - private cluster endpoint
+// - EKS cluster security group
+// - worker node security group attached through launch template
+// - nodegroup -> control-plane ingress rule on TCP/443
+//
+// References from current provider/docs:
+// - EKS managed node groups are always deployed with a launch template.
+// - If you specify custom security groups in the launch template, EKS does
+//   not add the cluster security group automatically.
+// - Launch templates can specify vpc_security_group_ids.
 
 variable "cluster_name" {
-  description = "EKS cluster name"
+  description = "EKS cluster name."
   type        = string
 }
 
 variable "region" {
-  description = "AWS region"
+  description = "AWS region."
   type        = string
   default     = "ap-south-1"
 }
 
 variable "vpc_id" {
-  description = "VPC id"
+  description = "VPC ID."
   type        = string
 }
 
 variable "subnet_ids" {
-  description = "List of private subnet IDs (two AZs)."
+  description = "Private subnet IDs for the managed nodegroups."
   type        = list(string)
 }
 
 variable "node_security_group_id" {
-  description = "Security group ID used by worker nodes (required). Pass module.security.node_security_group_id from root."
+  description = "Security group ID used by worker nodes."
   type        = string
 
   validation {
-    condition     = var.node_security_group_id != ""
-    error_message = "node_security_group_id must be provided to this module (pass module.security.node_security_group_id from root)."
+    condition     = length(trimspace(var.node_security_group_id)) > 0
+    error_message = "node_security_group_id must be provided."
   }
 }
 
-variable "endpoint_security_group_id" {
-  description = "Optional SG used for VPC interface endpoints (passed for reference)."
-  type        = string
-  default     = ""
-}
-
 variable "cluster_role_arn" {
-  description = "IAM role ARN for the EKS control plane (from iam_pre_eks)"
+  description = "IAM role ARN for the EKS control plane."
   type        = string
 }
 
 variable "node_role_arn" {
-  description = "IAM role ARN for EC2 nodegroups (from iam_pre_eks)"
+  description = "IAM role ARN for EKS worker nodes."
   type        = string
-}
-
-variable "ebs_csi_policy_arn" {
-  description = "ARN of the EBS CSI managed policy (from iam_pre_eks)."
-  type        = string
-  default     = ""
-}
-
-variable "cluster_autoscaler_policy_arn" {
-  description = "ARN of the Cluster Autoscaler policy (from iam_pre_eks)."
-  type        = string
-  default     = ""
-}
-
-variable "ecr_repository_urls" {
-  description = "Map of ECR logical name -> repo URL (convenience)."
-  type        = map(string)
-  default     = {}
 }
 
 variable "system_nodegroup" {
-  description = "System nodegroup sizing object."
+  description = "Sizing for the system nodegroup."
   type = object({
     instance_type = string
     min_size      = number
@@ -85,8 +70,8 @@ variable "system_nodegroup" {
   })
 }
 
-variable "inference_nodegroup" {
-  description = "Inference nodegroup sizing object."
+variable "workloads_nodegroup" {
+  description = "Sizing for the workloads nodegroup."
   type = object({
     instance_type = string
     min_size      = number
@@ -96,65 +81,96 @@ variable "inference_nodegroup" {
 }
 
 variable "system_node_taints" {
-  description = "List of taints for system nodegroup (structured: key,value,effect)."
+  description = "Structured taints for the system nodegroup."
   type = list(object({
     key    = string
     value  = string
     effect = string
   }))
-  default = [{ key = "node-role", value = "system", effect = "NO_SCHEDULE" }]
+  default = [
+    { key = "node-type", value = "general", effect = "NO_SCHEDULE" }
+  ]
 
   validation {
-    condition     = alltrue([for t in var.system_node_taints : contains(["NO_SCHEDULE", "NO_EXECUTE", "PREFER_NO_SCHEDULE"], t.effect)])
-    error_message = "Each system_node_taints[].effect must be one of: NO_SCHEDULE, NO_EXECUTE, PREFER_NO_SCHEDULE"
+    condition = alltrue([
+      for t in var.system_node_taints :
+      contains(["NO_SCHEDULE", "NO_EXECUTE", "PREFER_NO_SCHEDULE"], t.effect)
+    ])
+    error_message = "Each system_node_taints[].effect must be one of NO_SCHEDULE, NO_EXECUTE, or PREFER_NO_SCHEDULE."
   }
 }
 
-variable "inference_node_labels" {
-  description = "Labels for inference nodegroup"
+variable "workloads_node_taints" {
+  description = "Structured taints for the workloads nodegroup."
+  type = list(object({
+    key    = string
+    value  = string
+    effect = string
+  }))
+  default = [
+    { key = "node-type", value = "compute", effect = "NO_SCHEDULE" }
+  ]
+
+  validation {
+    condition = alltrue([
+      for t in var.workloads_node_taints :
+      contains(["NO_SCHEDULE", "NO_EXECUTE", "PREFER_NO_SCHEDULE"], t.effect)
+    ])
+    error_message = "Each workloads_node_taints[].effect must be one of NO_SCHEDULE, NO_EXECUTE, or PREFER_NO_SCHEDULE."
+  }
+}
+
+variable "system_node_labels" {
+  description = "Labels applied to system nodes."
   type        = map(string)
-  default     = {}
+  default     = { "node-type" = "general" }
+}
+
+variable "workloads_node_labels" {
+  description = "Labels applied to workloads nodes."
+  type        = map(string)
+  default     = { "node-type" = "compute" }
 }
 
 variable "enabled_cluster_log_types" {
-  description = "Control-plane log types to enable."
+  description = "EKS control-plane log types. Keep empty to avoid a CloudWatch dependency."
   type        = list(string)
-  default     = ["api", "audit", "authenticator"]
+  default     = []
 }
 
-variable "tags" {
-  description = "Tags applied to resources"
-  type        = map(string)
-  default     = {}
-}
-
-# Optional: support a custom launch template for nodegroups (reduces failure modes when you manage AMI/user-data centrally)
 variable "launch_template_id" {
-  description = "Optional EC2 Launch Template ID for managed nodegroups (leave empty to let EKS create/choose instances)."
+  description = "Retained for backward compatibility. Internal module-owned launch templates are used."
   type        = string
   default     = ""
 }
 
 variable "launch_template_version" {
-  description = "Optional Launch Template version (string). Use empty string to let AWS default ($Latest)."
+  description = "Retained for backward compatibility. Internal module-owned launch templates are used."
   type        = string
   default     = ""
+}
+
+variable "tags" {
+  description = "Tags applied to resources."
+  type        = map(string)
+  default     = {}
 }
 
 data "aws_partition" "current" {}
 data "aws_caller_identity" "current" {}
 
 locals {
-  merged_tags = merge(
+  env_tag = lookup(var.tags, "Environment", "prod")
+
+  common_tags = merge(
     {
-      ManagedBy   = "agentops-serviceautomation"
+      ManagedBy   = "opentofu"
+      Platform    = "mlops"
+      Environment = local.env_tag
       Name        = var.cluster_name
-      Environment = lookup(var.tags, "Environment", "")
     },
     var.tags
   )
-
-  root_principal_arn = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"
 }
 
 data "aws_iam_policy_document" "eks_secrets_encryption" {
@@ -165,7 +181,9 @@ data "aws_iam_policy_document" "eks_secrets_encryption" {
 
     principals {
       type        = "AWS"
-      identifiers = [local.root_principal_arn]
+      identifiers = [
+        "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"
+      ]
     }
 
     resources = ["*"]
@@ -222,24 +240,20 @@ resource "aws_kms_key" "eks_secrets" {
   enable_key_rotation     = true
   policy                  = data.aws_iam_policy_document.eks_secrets_encryption.json
 
-  tags = local.merged_tags
+  tags = local.common_tags
 }
 
 resource "aws_kms_alias" "eks_secrets" {
   name          = "alias/${var.cluster_name}-eks-secrets"
-  target_key_id  = aws_kms_key.eks_secrets.key_id
+  target_key_id = aws_kms_key.eks_secrets.key_id
 }
 
-#########################
-# EKS cluster (private)
-#########################
 resource "aws_eks_cluster" "this" {
   name     = var.cluster_name
   role_arn = var.cluster_role_arn
 
   vpc_config {
-    subnet_ids = var.subnet_ids
-
+    subnet_ids              = var.subnet_ids
     endpoint_public_access  = false
     endpoint_private_access = true
   }
@@ -254,19 +268,16 @@ resource "aws_eks_cluster" "this" {
 
   enabled_cluster_log_types = var.enabled_cluster_log_types
 
-  tags = local.merged_tags
+  tags = local.common_tags
 }
 
-# Expose cluster security group id (control plane SG) for use by other modules/root.
 output "cluster_security_group_id" {
+  description = "Control-plane security group ID created by EKS."
   value       = aws_eks_cluster.this.vpc_config[0].cluster_security_group_id
-  description = "Control-plane security group id created/managed by the EKS control plane"
 }
 
-# Allow worker nodes to reach control plane on TCP/443.
-# This rule must exist before nodegroups attempt to bootstrap and register.
 resource "aws_security_group_rule" "allow_nodes_to_control_plane" {
-  description              = "Allow worker nodes to contact control plane (kube-apiserver) on TCP/443"
+  description              = "Allow worker nodes to contact the EKS API server on TCP/443."
   type                     = "ingress"
   from_port                = 443
   to_port                  = 443
@@ -275,27 +286,43 @@ resource "aws_security_group_rule" "allow_nodes_to_control_plane" {
   source_security_group_id = var.node_security_group_id
 }
 
-# Retrieve TLS certificate for issuer and compute SHA1 fingerprint for the OIDC provider.
-data "tls_certificate" "eks_oidc" {
-  url = aws_eks_cluster.this.identity[0].oidc[0].issuer
+resource "aws_launch_template" "nodes" {
+  name_prefix   = "${var.cluster_name}-nodes-"
+  update_default_version = true
+
+  vpc_security_group_ids = [var.node_security_group_id]
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+    instance_metadata_tags      = "disabled"
+  }
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+
+    ebs {
+      volume_size           = 20
+      volume_type           = "gp3"
+      encrypted             = true
+      delete_on_termination = true
+    }
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = local.common_tags
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+    tags          = local.common_tags
+  }
+
+  tags = local.common_tags
 }
 
-resource "aws_iam_openid_connect_provider" "this" {
-  url = aws_eks_cluster.this.identity[0].oidc[0].issuer
-
-  client_id_list = ["sts.amazonaws.com"]
-
-  thumbprint_list = [
-    data.tls_certificate.eks_oidc.certificates[0].sha1_fingerprint
-  ]
-
-  tags = local.merged_tags
-}
-
-#########################
-# Node group: system (stateful workloads)
-# depends on the control-plane SG rule to exist first
-#########################
 resource "aws_eks_node_group" "system" {
   depends_on = [aws_security_group_rule.allow_nodes_to_control_plane]
 
@@ -321,79 +348,101 @@ resource "aws_eks_node_group" "system" {
     }
   }
 
-  dynamic "launch_template" {
-    for_each = var.launch_template_id != "" ? [1] : []
-    content {
-      id      = var.launch_template_id
-      version = var.launch_template_version != "" ? var.launch_template_version : "$Latest"
-    }
+  labels = var.system_node_labels
+
+  launch_template {
+    id      = aws_launch_template.nodes.id
+    version = "$Latest"
   }
 
-  tags = local.merged_tags
+  update_config {
+    max_unavailable = 1
+  }
+
+  tags = local.common_tags
 }
 
-#########################
-# Node group: inference (stateless inference + auth)
-# depends on the control-plane SG rule to exist first
-#########################
-resource "aws_eks_node_group" "inference" {
+resource "aws_eks_node_group" "workloads" {
   depends_on = [aws_security_group_rule.allow_nodes_to_control_plane]
 
   cluster_name    = aws_eks_cluster.this.name
-  node_group_name = "${var.cluster_name}-inference"
+  node_group_name = "${var.cluster_name}-workloads"
   node_role_arn   = var.node_role_arn
   subnet_ids      = var.subnet_ids
 
   scaling_config {
-    desired_size = var.inference_nodegroup.desired_size
-    min_size     = var.inference_nodegroup.min_size
-    max_size     = var.inference_nodegroup.max_size
+    desired_size = var.workloads_nodegroup.desired_size
+    min_size     = var.workloads_nodegroup.min_size
+    max_size     = var.workloads_nodegroup.max_size
   }
 
-  instance_types = [var.inference_nodegroup.instance_type]
+  instance_types = [var.workloads_nodegroup.instance_type]
 
-  labels = var.inference_node_labels
-
-  dynamic "launch_template" {
-    for_each = var.launch_template_id != "" ? [1] : []
+  dynamic "taint" {
+    for_each = var.workloads_node_taints
     content {
-      id      = var.launch_template_id
-      version = var.launch_template_version != "" ? var.launch_template_version : "$Latest"
+      key    = taint.value.key
+      value  = taint.value.value
+      effect = taint.value.effect
     }
   }
 
-  tags = local.merged_tags
+  labels = var.workloads_node_labels
+
+  launch_template {
+    id      = aws_launch_template.nodes.id
+    version = "$Latest"
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  tags = local.common_tags
 }
 
-#########################
-# Outputs (cluster info)
-#########################
+resource "aws_iam_openid_connect_provider" "this" {
+  url = aws_eks_cluster.this.identity[0].oidc[0].issuer
+
+  client_id_list = ["sts.amazonaws.com"]
+
+  thumbprint_list = [
+    data.tls_certificate.eks_oidc.certificates[0].sha1_fingerprint
+  ]
+
+  tags = local.common_tags
+}
+
+data "tls_certificate" "eks_oidc" {
+  url = aws_eks_cluster.this.identity[0].oidc[0].issuer
+}
+
 output "cluster_name" {
-  description = "EKS cluster name"
+  description = "EKS cluster name."
   value       = aws_eks_cluster.this.name
 }
 
 output "cluster_endpoint" {
-  description = "EKS cluster API server endpoint"
+  description = "EKS cluster API endpoint."
   value       = aws_eks_cluster.this.endpoint
 }
 
 output "cluster_ca_data" {
-  description = "Base64-encoded certificate authority data for the cluster"
+  description = "Base64-encoded CA data for the cluster."
   value       = aws_eks_cluster.this.certificate_authority[0].data
 }
 
 output "oidc_provider_arn" {
-  description = "ARN of the aws_iam_openid_connect_provider"
+  description = "ARN of the EKS OIDC provider."
   value       = aws_iam_openid_connect_provider.this.arn
 }
 
 output "oidc_provider_issuer" {
-  description = "OIDC issuer host/path without https://"
+  description = "OIDC issuer host/path without https:// prefix."
   value       = replace(aws_eks_cluster.this.identity[0].oidc[0].issuer, "https://", "")
 }
 
 output "secrets_encryption_kms_key_arn" {
-  description = "KMS key ARN used for EKS secrets encryption"
+  description = "KMS key ARN used for EKS secrets encryption."
   value       = aws_kms_key.eks_secrets.arn
 }

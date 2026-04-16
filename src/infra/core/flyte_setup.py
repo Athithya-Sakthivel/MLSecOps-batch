@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -17,6 +18,10 @@ from typing import Any
 
 import yaml
 
+# -----------------------------------------------------------------------------
+# Environment
+# -----------------------------------------------------------------------------
+
 MANIFEST_DIR = Path(os.environ.get("MANIFEST_DIR", "src/manifests/flyte"))
 VALUES_FILE = Path(os.environ.get("VALUES_FILE", str(MANIFEST_DIR / "values.yaml")))
 STATE_CONFIGMAP = os.environ.get("STATE_CONFIGMAP", "flyte-bootstrap-state")
@@ -33,7 +38,7 @@ DB_SECRET_NAME = os.environ.get("DB_SECRET_NAME", "db-pass")
 AUTH_SECRET_NAME = os.environ.get("AUTH_SECRET_NAME", "flyte-secret-auth")
 STORAGE_SECRET_NAME = os.environ.get("STORAGE_SECRET_NAME", "flyte-storage-config")
 TASK_AWS_SECRET_NAME = os.environ.get("TASK_AWS_SECRET_NAME", "flyte-aws-credentials")
-TASK_SERVICE_ACCOUNT = os.environ.get("TASK_SERVICE_ACCOUNT", "default").strip() or "default"
+TASK_SERVICE_ACCOUNT = os.environ.get("TASK_SERVICE_ACCOUNT", "flyte-task").strip() or "flyte-task"
 
 FLYTE_ADMIN_DB = os.environ.get("FLYTE_ADMIN_DB", "flyteadmin")
 FLYTE_DATACATALOG_DB = os.environ.get("FLYTE_DATACATALOG_DB", "datacatalog")
@@ -42,6 +47,7 @@ FLYTE_OAUTH_CLIENT_SECRET = os.environ.get("FLYTE_OAUTH_CLIENT_SECRET", "flytepr
 
 STORAGE_PROVIDER = os.environ.get("STORAGE_PROVIDER", "auto").strip().lower()
 USE_IAM = os.environ.get("USE_IAM", "false").lower() in {"1", "true", "yes", "y", "on"}
+K8S_CLUSTER = os.environ.get("K8S_CLUSTER", "auto").strip().lower()
 
 AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
 S3_BUCKET = os.environ.get("S3_BUCKET", "s3-temp-bucket-mlsecops-681802563986")
@@ -51,17 +57,8 @@ AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
 AWS_SESSION_TOKEN = os.environ.get("AWS_SESSION_TOKEN", "").strip()
 AWS_ROLE_ARN = os.environ.get("AWS_ROLE_ARN", "").strip()
-
-GCP_PROJECT = os.environ.get("GCP_PROJECT", "").strip()
-GCP_BUCKET = os.environ.get("GCP_BUCKET", "mlops_iceberg_warehouse").strip()
-GCP_SA_EMAIL = os.environ.get("GCP_SA_EMAIL", "").strip()
-GCP_SERVICE_ACCOUNT_KEY = os.environ.get("GCP_SERVICE_ACCOUNT_KEY", "").strip()
-
-AZURE_STORAGE_ACCOUNT = os.environ.get("AZURE_STORAGE_ACCOUNT", "").strip()
-AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER", "iceberg").strip()
-AZURE_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID", "").strip()
-AZURE_TENANT_ID = os.environ.get("AZURE_TENANT_ID", "").strip()
-FLYTE_STORAGE_CUSTOM_YAML = os.environ.get("FLYTE_STORAGE_CUSTOM_YAML", "").strip()
+FLYTE_CONTROL_PLANE_ROLE_ARN = os.environ.get("FLYTE_CONTROL_PLANE_ROLE_ARN", "").strip()
+FLYTE_TASK_ROLE_ARN = os.environ.get("FLYTE_TASK_ROLE_ARN", "").strip()
 
 FLYTE_INGRESS_ENABLED = os.environ.get("FLYTE_INGRESS_ENABLED", "false")
 FLYTE_INGRESS_CLASS_NAME = os.environ.get("FLYTE_INGRESS_CLASS_NAME", "")
@@ -117,6 +114,9 @@ CLUSTER_MANAGED_RESOURCES = [
     "validatingwebhookconfigurations",
 ]
 
+VALID_CLUSTER_MODES = {"auto", "kind", "eks"}
+VALID_PROVIDERS = {"auto", "aws", "sandbox"}
+
 
 def ts() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -130,31 +130,7 @@ def fatal(msg: str) -> None:
     print(f"[{ts()}] [flyte][FATAL] {msg}", file=sys.stderr, flush=True)
     raise SystemExit(1)
 
-def wait_for_service_endpoints(namespace: str, svc_name: str, max_wait: int = 180) -> None:
-    elapsed = 0
-    while True:
-        cp = run(
-            [
-                "kubectl",
-                "-n",
-                namespace,
-                "get",
-                "endpoints",
-                svc_name,
-                "-o",
-                "jsonpath={.subsets[*].addresses[*].ip}",
-            ],
-            check=False,
-        )
-        if cp.returncode == 0 and cp.stdout.strip():
-            return
 
-        time.sleep(5)
-        elapsed += 5
-        if elapsed >= max_wait:
-            fatal(f"Service '{svc_name}' has no endpoints after {max_wait}s")
-
-            
 def require_bin(name: str) -> None:
     if shutil.which(name) is None:
         fatal(f"{name} required in PATH")
@@ -241,10 +217,7 @@ def ensure_namespace(namespace: str) -> None:
         {
             "apiVersion": "v1",
             "kind": "Namespace",
-            "metadata": {
-                "name": namespace,
-                "labels": {"app.kubernetes.io/part-of": "flyte"},
-            },
+            "metadata": {"name": namespace, "labels": {"app.kubernetes.io/part-of": "flyte"}},
         }
     )
 
@@ -315,126 +288,141 @@ def secret_value(namespace: str, secret_name: str, key: str) -> str:
         return ""
 
 
-def find_app_secret_name() -> str:
-    selector = f"cnpg.io/cluster={CNPG_CLUSTER},cnpg.io/userType=app"
-    cp = run(
-        ["kubectl", "-n", POSTGRES_NS, "get", "secret", "-l", selector, "-o", "jsonpath={.items[0].metadata.name}"],
-        check=False,
+def _jsonpath_value(cmd: list[str]) -> str:
+    cp = run(cmd, check=False)
+    if cp.returncode != 0:
+        return ""
+    return cp.stdout.strip()
+
+
+def _positive_int(text: str) -> bool:
+    try:
+        return int(text) > 0
+    except Exception:
+        return False
+
+
+def deployment_available(namespace: str, name: str) -> bool:
+    return _positive_int(
+        _jsonpath_value(["kubectl", "-n", namespace, "get", "deployment", name, "-o", "jsonpath={.status.availableReplicas}"])
     )
-    if cp.returncode == 0 and cp.stdout.strip():
-        return cp.stdout.strip()
-    fallback = f"{CNPG_CLUSTER}-app"
-    cp = run(["kubectl", "-n", POSTGRES_NS, "get", "secret", fallback], check=False)
-    return fallback if cp.returncode == 0 else ""
 
 
-def get_primary_pod() -> str:
-    selector = f"cnpg.io/cluster={CNPG_CLUSTER},cnpg.io/instanceRole=primary"
-    cp = run(["kubectl", "-n", POSTGRES_NS, "get", "pods", "-l", selector, "-o", "jsonpath={.items[0].metadata.name}"], check=False)
-    return cp.stdout.strip() if cp.returncode == 0 else ""
+def daemonset_ready(namespace: str, name: str) -> bool:
+    ready = _jsonpath_value(["kubectl", "-n", namespace, "get", "daemonset", name, "-o", "jsonpath={.status.numberReady}"])
+    return _positive_int(ready)
 
 
-def resolve_db_host() -> str:
-    global DB_HOST
-    if DB_HOST:
-        return DB_HOST
-    if DB_ACCESS_MODE == "rw":
-        DB_HOST = f"{CNPG_CLUSTER}-rw.{POSTGRES_NS}.svc.cluster.local"
-    elif DB_ACCESS_MODE == "pooler":
-        DB_HOST = f"{POOLER_SERVICE}.{POSTGRES_NS}.svc.cluster.local"
-    else:
-        fatal(f"unsupported DB_ACCESS_MODE={DB_ACCESS_MODE}")
-    return DB_HOST
+def service_has_endpoints(namespace: str, name: str) -> bool:
+    return bool(_jsonpath_value(["kubectl", "-n", namespace, "get", "endpoints", name, "-o", "jsonpath={.subsets[*].addresses[*].ip}"]))
 
 
-def ensure_database(db_name: str) -> None:
-    primary = get_primary_pod()
-    if not primary:
-        fatal(f"CNPG primary pod not found for {CNPG_CLUSTER}")
-
-    exists = run(
-        [
-            "kubectl",
-            "-n",
-            POSTGRES_NS,
-            "exec",
-            primary,
-            "--",
-            "sh",
-            "-lc",
-            f'psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname=\'{db_name}\';"',
-        ],
-        check=False,
-    ).stdout.strip()
-
-    if exists != "1":
-        log(f"creating database {db_name}")
-        run(
+def wait_for_service_endpoints(namespace: str, svc_name: str, max_wait: int = 180) -> None:
+    elapsed = 0
+    while True:
+        cp = run(
             [
                 "kubectl",
                 "-n",
-                POSTGRES_NS,
-                "exec",
-                primary,
-                "--",
-                "sh",
-                "-lc",
-                f'psql -U postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE {db_name} OWNER \\"{APP_DB_USER}\\";"',
+                namespace,
+                "get",
+                "endpoints",
+                svc_name,
+                "-o",
+                "jsonpath={.subsets[*].addresses[*].ip}",
             ],
             check=False,
         )
-    else:
-        log(f"database {db_name} already exists")
+        if cp.returncode == 0 and cp.stdout.strip():
+            return
+        time.sleep(5)
+        elapsed += 5
+        if elapsed >= max_wait:
+            fatal(f"Service '{svc_name}' has no endpoints after {max_wait}s")
 
-    run(
-        [
-            "kubectl",
-            "-n",
-            POSTGRES_NS,
-            "exec",
-            primary,
-            "--",
-            "sh",
-            "-lc",
-            f'psql -U postgres -v ON_ERROR_STOP=1 -c "ALTER DATABASE {db_name} OWNER TO \\"{APP_DB_USER}\\";"',
-        ],
-        check=False,
-    )
-    run(
-        [
-            "kubectl",
-            "-n",
-            POSTGRES_NS,
-            "exec",
-            primary,
-            "--",
-            "sh",
-            "-lc",
-            f'psql -U postgres -d "{db_name}" -v ON_ERROR_STOP=1 -c "ALTER SCHEMA public OWNER TO \\"{APP_DB_USER}\\";"',
-        ],
-        check=False,
-    )
+
+def ensure_dns_ready() -> None:
+    log("waiting for cluster DNS")
+    deadline = time.monotonic() + DNS_TIMEOUT
+    while time.monotonic() < deadline:
+        for name in ("coredns", "kube-dns"):
+            if deployment_available("kube-system", name) or daemonset_ready("kube-system", name):
+                log(f"cluster DNS ready via {name}")
+                return
+        for name in ("kube-dns", "coredns", "dns"):
+            if service_has_endpoints("kube-system", name):
+                log(f"cluster DNS ready via service/{name} endpoints")
+                return
+        time.sleep(2)
+    fatal(f"DNS not ready after {DNS_TIMEOUT}s")
+
+
+def normalize_cluster_mode() -> str:
+    if K8S_CLUSTER in VALID_CLUSTER_MODES and K8S_CLUSTER != "auto":
+        if K8S_CLUSTER == "kind" and USE_IAM:
+            fatal("USE_IAM=true is only valid on EKS, not kind")
+        return K8S_CLUSTER
+    if K8S_CLUSTER not in {"", "auto"}:
+        fatal(f"unsupported K8S_CLUSTER={K8S_CLUSTER}")
+    if USE_IAM or AWS_ROLE_ARN or FLYTE_CONTROL_PLANE_ROLE_ARN or FLYTE_TASK_ROLE_ARN:
+        return "eks"
+    return "kind"
+
+
+CLUSTER_MODE = normalize_cluster_mode()
+EKS = CLUSTER_MODE == "eks"
+KIND = CLUSTER_MODE == "kind"
+EFFECTIVE_USE_IRSA = EKS and USE_IAM
+
+if EFFECTIVE_USE_IRSA:
+    for _k in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_SESSION_TOKEN",
+    ):
+        os.environ.pop(_k, None)
+    AWS_ACCESS_KEY_ID = ""
+    AWS_SECRET_ACCESS_KEY = ""
+    AWS_SESSION_TOKEN = ""
+
+GENERAL_NODE_SELECTOR = {"node-type": "general"} if EKS else {}
+COMPUTE_NODE_SELECTOR = {"node-type": "compute"} if EKS else {}
+GENERAL_TOLERATIONS = (
+    [{"key": "node-type", "operator": "Equal", "value": "general", "effect": "NoSchedule"}] if EKS else []
+)
+COMPUTE_TOLERATIONS = (
+    [{"key": "node-type", "operator": "Equal", "value": "compute", "effect": "NoSchedule"}] if EKS else []
+)
 
 
 def detect_storage_provider() -> str:
-    if STORAGE_PROVIDER in {"aws", "gcs", "azure", "sandbox"}:
+    if STORAGE_PROVIDER in {"aws", "sandbox"}:
         return STORAGE_PROVIDER
-    if AZURE_STORAGE_ACCOUNT or AZURE_CLIENT_ID or AZURE_TENANT_ID:
-        return "azure"
-    if GCP_PROJECT or GCP_SA_EMAIL or GCP_SERVICE_ACCOUNT_KEY:
-        return "gcs"
+    if CLUSTER_MODE == "kind" and not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+        return "sandbox"
     return "aws"
 
 
+def resolve_role_arn(*, task: bool) -> str:
+    candidates = [
+        FLYTE_TASK_ROLE_ARN if task else FLYTE_CONTROL_PLANE_ROLE_ARN,
+        AWS_ROLE_ARN,
+        FLYTE_CONTROL_PLANE_ROLE_ARN if task else FLYTE_TASK_ROLE_ARN,
+    ]
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    return ""
+
+
 def detect_identity_annotation(provider: str) -> tuple[str, str]:
-    if provider == "aws" and USE_IAM:
-        if not AWS_ROLE_ARN:
-            fatal("AWS_ROLE_ARN is required when USE_IAM=true")
-        return "eks.amazonaws.com/role-arn", AWS_ROLE_ARN
-    if provider == "gcs" and GCP_SA_EMAIL:
-        return "iam.gke.io/gcp-service-account", GCP_SA_EMAIL
-    if provider == "azure" and AZURE_CLIENT_ID:
-        return "azure.workload.identity/client-id", AZURE_CLIENT_ID
+    if provider == "aws" and EFFECTIVE_USE_IRSA:
+        role_arn = resolve_role_arn(task=False)
+        if not role_arn:
+            fatal("FLYTE_CONTROL_PLANE_ROLE_ARN, FLYTE_TASK_ROLE_ARN, or AWS_ROLE_ARN is required when USE_IAM=true on EKS")
+        return "eks.amazonaws.com/role-arn", role_arn
     return "", ""
 
 
@@ -447,46 +435,11 @@ def build_storage_block(provider: str) -> dict[str, Any]:
             "s3": {
                 "endpoint": S3_ENDPOINT,
                 "region": AWS_REGION,
-                "authType": "iam" if USE_IAM else "accesskey",
-                "accessKey": "" if USE_IAM else AWS_ACCESS_KEY_ID,
-                "secretKey": "" if USE_IAM else AWS_SECRET_ACCESS_KEY,
+                "authType": "iam" if EFFECTIVE_USE_IRSA else "accesskey",
+                "accessKey": "" if EFFECTIVE_USE_IRSA else AWS_ACCESS_KEY_ID,
+                "secretKey": "" if EFFECTIVE_USE_IRSA else AWS_SECRET_ACCESS_KEY,
             },
-            "gcs": {"projectId": ""},
             "custom": {},
-            "enableMultiContainer": False,
-            "limits": {"maxDownloadMBs": 10},
-            "cache": {"maxSizeMBs": 0, "targetGCPercent": 70},
-        }
-    if provider == "gcs":
-        return {
-            "secretName": "",
-            "type": "gcs",
-            "bucketName": GCP_BUCKET,
-            "s3": {"endpoint": "", "region": AWS_REGION, "authType": "iam", "accessKey": "", "secretKey": ""},
-            "gcs": {"projectId": GCP_PROJECT, "serviceAccountKey": GCP_SERVICE_ACCOUNT_KEY},
-            "custom": {},
-            "enableMultiContainer": False,
-            "limits": {"maxDownloadMBs": 10},
-            "cache": {"maxSizeMBs": 0, "targetGCPercent": 70},
-        }
-    if provider == "azure":
-        if not FLYTE_STORAGE_CUSTOM_YAML:
-            fatal("FLYTE_STORAGE_CUSTOM_YAML is required for azure")
-        try:
-            custom = yaml.safe_load(FLYTE_STORAGE_CUSTOM_YAML)
-        except yaml.YAMLError as exc:
-            fatal(f"FLYTE_STORAGE_CUSTOM_YAML is invalid YAML: {exc}")
-        if custom is None:
-            custom = {}
-        if not isinstance(custom, dict):
-            fatal("FLYTE_STORAGE_CUSTOM_YAML must parse to a mapping/object")
-        return {
-            "secretName": "",
-            "type": "custom",
-            "bucketName": AZURE_CONTAINER,
-            "s3": {"endpoint": "", "region": AWS_REGION, "authType": "iam", "accessKey": "", "secretKey": ""},
-            "gcs": {"projectId": ""},
-            "custom": custom,
             "enableMultiContainer": False,
             "limits": {"maxDownloadMBs": 10},
             "cache": {"maxSizeMBs": 0, "targetGCPercent": 70},
@@ -497,7 +450,6 @@ def build_storage_block(provider: str) -> dict[str, Any]:
             "type": "sandbox",
             "bucketName": "",
             "s3": {"endpoint": "", "region": AWS_REGION, "authType": "iam", "accessKey": "", "secretKey": ""},
-            "gcs": {"projectId": ""},
             "custom": {},
             "enableMultiContainer": False,
             "limits": {"maxDownloadMBs": 10},
@@ -511,7 +463,7 @@ def build_k8s_block(provider: str) -> dict[str, Any]:
     default_env_vars: dict[str, str] = {}
     default_env_from_secrets: list[str] = []
 
-    if provider == "aws" and not USE_IAM:
+    if provider == "aws" and not EFFECTIVE_USE_IRSA:
         default_env_from_secrets = [TASK_AWS_SECRET_NAME]
         default_env_vars = {
             "AWS_ACCESS_KEY_ID": AWS_ACCESS_KEY_ID,
@@ -540,78 +492,83 @@ def build_k8s_block(provider: str) -> dict[str, Any]:
 
 
 def build_task_resource_defaults() -> dict[str, Any]:
-    return {
-        "task_resources": {
-            "defaults": {"cpu": "500m", "memory": "512Mi"},
-            "limits": {"cpu": "32", "memory": "32Gi"},
-        }
-    }
+    return {"task_resources": {"defaults": {"cpu": "500m", "memory": "512Mi"}, "limits": {"cpu": "32", "memory": "32Gi"}}}
+
+
+def component_block(
+    *,
+    enabled: bool = True,
+    service_type: str = "ClusterIP",
+    role: str = "general",
+    service_account: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    block: dict[str, Any] = {"enabled": enabled, "service": {"type": service_type}}
+    if service_account is not None:
+        block["serviceAccount"] = service_account
+    if EKS:
+        if role == "general":
+            block["nodeSelector"] = copy.deepcopy(GENERAL_NODE_SELECTOR)
+            block["tolerations"] = copy.deepcopy(GENERAL_TOLERATIONS)
+        elif role == "compute":
+            block["nodeSelector"] = copy.deepcopy(COMPUTE_NODE_SELECTOR)
+            block["tolerations"] = copy.deepcopy(COMPUTE_TOLERATIONS)
+    return block
 
 
 def build_values(provider: str) -> dict[str, Any]:
     identity_key, identity_value = detect_identity_annotation(provider)
-    service_account = {"create": True, "annotations": {}}
+    service_account: dict[str, Any] = {"create": True, "annotations": {}}
     if identity_key and identity_value:
         service_account["annotations"] = {identity_key: identity_value}
 
     if provider == "aws":
         raw_prefix = os.environ.get("FLYTE_RAWOUTPUT_PREFIX", join_uri_prefix("s3", S3_BUCKET, S3_PREFIX))
         remote_scheme = "s3"
-    elif provider == "gcs":
-        raw_prefix = os.environ.get("FLYTE_RAWOUTPUT_PREFIX", join_uri_prefix("gs", GCP_BUCKET, ""))
-        remote_scheme = "gs"
-    elif provider == "azure":
-        raw_prefix = os.environ.get(
-            "FLYTE_RAWOUTPUT_PREFIX",
-            join_uri_prefix("abfs", f"{AZURE_CONTAINER}@{AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net", ""),
-        )
-        remote_scheme = "abfs"
     else:
         raw_prefix = os.environ.get("FLYTE_RAWOUTPUT_PREFIX", "")
         remote_scheme = "local"
 
+    flyteadmin = component_block(service_account=copy.deepcopy(service_account), role="general")
+    flytescheduler = component_block(service_account=copy.deepcopy(service_account), role="general")
+    datacatalog = component_block(service_account=copy.deepcopy(service_account), role="general")
+    flytepropeller = component_block(service_account=copy.deepcopy(service_account), role="general")
+    flyteconsole = component_block(service_account={"create": True, "annotations": {}}, role="general")
+    webhook = component_block(service_account={"create": True, "annotations": {}}, role="general")
+
     return {
         "deployRedoc": False,
         "flyteadmin": {
-            "enabled": True,
+            **flyteadmin,
             "replicaCount": int(os.environ.get("FLYTEADMIN_REPLICAS", "1")),
-            "serviceAccount": copy.deepcopy(service_account),
-            "service": {"type": "ClusterIP"},
             "podEnv": {},
         },
         "flytescheduler": {
+            **flytescheduler,
             "runPrecheck": True,
-            "serviceAccount": copy.deepcopy(service_account),
             "service": {"enabled": False},
             "podEnv": {},
         },
         "datacatalog": {
-            "enabled": True,
+            **datacatalog,
             "replicaCount": int(os.environ.get("DATACATALOG_REPLICAS", "1")),
-            "serviceAccount": copy.deepcopy(service_account),
-            "service": {"type": "ClusterIP"},
             "podEnv": {},
         },
         "flyteconnector": {"enabled": yaml_bool(FLYTE_CONNECTOR_ENABLED)},
         "flytepropeller": {
-            "enabled": True,
+            **flytepropeller,
             "manager": False,
             "createCRDs": True,
             "replicaCount": int(os.environ.get("FLYTEPROPELLER_REPLICAS", "1")),
-            "serviceAccount": copy.deepcopy(service_account),
-            "service": {"enabled": False},
             "podEnv": {},
         },
         "flyteconsole": {
-            "enabled": True,
+            **flyteconsole,
             "replicaCount": int(os.environ.get("FLYTECONSOLE_REPLICAS", "1")),
-            "serviceAccount": {"create": True, "annotations": {}},
-            "service": {"type": "ClusterIP"},
+            "podEnv": {},
         },
         "webhook": {
-            "enabled": True,
-            "serviceAccount": {"create": True, "annotations": {}},
-            "service": {"type": "ClusterIP"},
+            **webhook,
+            "podEnv": {},
         },
         "common": {
             "databaseSecret": {"name": DB_SECRET_NAME, "secretManifest": {}},
@@ -767,84 +724,159 @@ def require_prereqs() -> None:
     run(["kubectl", "cluster-info"], check=True)
 
 
-def _jsonpath_value(cmd: list[str]) -> str:
-    cp = run(cmd, check=False)
-    if cp.returncode != 0:
-        return ""
-    return cp.stdout.strip()
+def find_app_secret_name() -> str:
+    selector = f"cnpg.io/cluster={CNPG_CLUSTER},cnpg.io/userType=app"
+    cp = run(
+        ["kubectl", "-n", POSTGRES_NS, "get", "secret", "-l", selector, "-o", "jsonpath={.items[0].metadata.name}"],
+        check=False,
+    )
+    if cp.returncode == 0 and cp.stdout.strip():
+        return cp.stdout.strip()
+    fallback = f"{CNPG_CLUSTER}-app"
+    cp = run(["kubectl", "-n", POSTGRES_NS, "get", "secret", fallback], check=False)
+    return fallback if cp.returncode == 0 else ""
 
 
-def _positive_int(text: str) -> bool:
-    try:
-        return int(text) > 0
-    except Exception:
-        return False
+def get_primary_pod() -> str:
+    selector = f"cnpg.io/cluster={CNPG_CLUSTER},cnpg.io/instanceRole=primary"
+    cp = run(["kubectl", "-n", POSTGRES_NS, "get", "pods", "-l", selector, "-o", "jsonpath={.items[0].metadata.name}"], check=False)
+    return cp.stdout.strip() if cp.returncode == 0 else ""
 
 
-def deployment_available(namespace: str, name: str) -> bool:
-    return _positive_int(_jsonpath_value(["kubectl", "-n", namespace, "get", "deployment", name, "-o", "jsonpath={.status.availableReplicas}"]))
-
-
-def daemonset_ready(namespace: str, name: str) -> bool:
-    ready = _jsonpath_value(["kubectl", "-n", namespace, "get", "daemonset", name, "-o", "jsonpath={.status.numberReady}"])
-    return _positive_int(ready)
-
-
-def service_has_endpoints(namespace: str, name: str) -> bool:
-    return bool(_jsonpath_value(["kubectl", "-n", namespace, "get", "endpoints", name, "-o", "jsonpath={.subsets[*].addresses[*].ip}"]))
-
-
-def ensure_dns_ready() -> None:
-    log("waiting for cluster DNS")
-    deadline = time.monotonic() + DNS_TIMEOUT
-    while time.monotonic() < deadline:
-        for name in ("coredns", "kube-dns"):
-            if deployment_available("kube-system", name) or daemonset_ready("kube-system", name):
-                log(f"cluster DNS ready via {name}")
-                return
-        for name in ("kube-dns", "coredns", "dns"):
-            if service_has_endpoints("kube-system", name):
-                log(f"cluster DNS ready via service/{name} endpoints")
-                return
-        time.sleep(2)
-    fatal(f"DNS not ready after {DNS_TIMEOUT}s")
-
-
-def wait_for_rollouts() -> None:
-    try:
-        deploys = run_text(["kubectl", "-n", TARGET_NS, "get", "deploy", "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}'])
-    except Exception:
-        deploys = ""
-
-    for dep in [line.strip() for line in deploys.splitlines() if line.strip()]:
-        log(f"waiting for deployment {dep}")
-        run(["kubectl", "-n", TARGET_NS, "rollout", "status", f"deployment/{dep}", f"--timeout={ROLLOUT_TIMEOUT}"], check=True)
-
-
-def resolve_service_name(component: str) -> str:
-    if component == "flyteadmin":
-        candidates = ["flyteadmin", f"{RELEASE_NAME}-flyteadmin", RELEASE_NAME]
-    elif component == "flyteconsole":
-        candidates = ["flyteconsole", f"{RELEASE_NAME}-flyteconsole", RELEASE_NAME]
-    elif component == "webhook":
-        candidates = ["flyte-pod-webhook", f"{RELEASE_NAME}-pod-webhook", "webhook"]
+def resolve_db_host() -> str:
+    global DB_HOST
+    if DB_HOST:
+        return DB_HOST
+    if DB_ACCESS_MODE == "rw":
+        DB_HOST = f"{CNPG_CLUSTER}-rw.{POSTGRES_NS}.svc.cluster.local"
+    elif DB_ACCESS_MODE == "pooler":
+        DB_HOST = f"{POOLER_SERVICE}.{POSTGRES_NS}.svc.cluster.local"
     else:
-        candidates = [component]
+        fatal(f"unsupported DB_ACCESS_MODE={DB_ACCESS_MODE}")
+    return DB_HOST
 
-    for name in candidates:
-        cp = run(["kubectl", "-n", TARGET_NS, "get", "svc", name], check=False)
-        if cp.returncode == 0:
-            return name
 
-    cp = run(["kubectl", "-n", TARGET_NS, "get", "svc", "-l", f"app.kubernetes.io/instance={RELEASE_NAME}", "-o", "jsonpath={.items[0].metadata.name}"], check=False)
-    return cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else component
+def ensure_database(db_name: str) -> None:
+    primary = get_primary_pod()
+    if not primary:
+        fatal(f"CNPG primary pod not found for {CNPG_CLUSTER}")
+
+    exists = run(
+        [
+            "kubectl",
+            "-n",
+            POSTGRES_NS,
+            "exec",
+            primary,
+            "--",
+            "sh",
+            "-lc",
+            f'psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname=\'{db_name}\';"',
+        ],
+        check=False,
+    ).stdout.strip()
+
+    if exists != "1":
+        log(f"creating database {db_name}")
+        run(
+            [
+                "kubectl",
+                "-n",
+                POSTGRES_NS,
+                "exec",
+                primary,
+                "--",
+                "sh",
+                "-lc",
+                f'psql -U postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE {db_name} OWNER \\\"{APP_DB_USER}\\\";"',
+            ],
+            check=False,
+        )
+    else:
+        log(f"database {db_name} already exists")
+
+    run(
+        [
+            "kubectl",
+            "-n",
+            POSTGRES_NS,
+            "exec",
+            primary,
+            "--",
+            "sh",
+            "-lc",
+            f'psql -U postgres -v ON_ERROR_STOP=1 -c "ALTER DATABASE {db_name} OWNER TO \\\"{APP_DB_USER}\\\";"',
+        ],
+        check=False,
+    )
+    run(
+        [
+            "kubectl",
+            "-n",
+            POSTGRES_NS,
+            "exec",
+            primary,
+            "--",
+            "sh",
+            "-lc",
+            f'psql -U postgres -d "{db_name}" -v ON_ERROR_STOP=1 -c "ALTER SCHEMA public OWNER TO \\\"{APP_DB_USER}\\\";"',
+        ],
+        check=False,
+    )
 
 
 def validate_static_aws_credentials(provider: str) -> None:
-    if provider != "aws" or USE_IAM:
+    if provider != "aws" or EFFECTIVE_USE_IRSA:
         return
     if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
         fatal("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required when STORAGE_PROVIDER=aws and USE_IAM=false")
+
+
+def find_deployment_name(component: str) -> str:
+    direct_candidates = [component, f"{RELEASE_NAME}-{component}", f"{RELEASE_NAME}_{component}"]
+    for name in direct_candidates:
+        cp = run(["kubectl", "-n", TARGET_NS, "get", "deploy", name], check=False)
+        if cp.returncode == 0:
+            return name
+
+    cp = run(
+        [
+            "kubectl",
+            "-n",
+            TARGET_NS,
+            "get",
+            "deploy",
+            "-l",
+            f"app.kubernetes.io/instance={RELEASE_NAME}",
+            "-o",
+            "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}",
+        ],
+        check=False,
+    )
+    if cp.returncode == 0 and cp.stdout.strip():
+        names = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
+        for name in names:
+            if component in name:
+                return name
+        if names:
+            return names[0]
+    return component
+
+
+def patch_deployment_scheduling(namespace: str, deployment: str, *, role: str) -> None:
+    if not EKS:
+        return
+    selector = GENERAL_NODE_SELECTOR if role == "general" else COMPUTE_NODE_SELECTOR
+    tolerations = GENERAL_TOLERATIONS if role == "general" else COMPUTE_TOLERATIONS
+    patch = {"spec": {"template": {"spec": {"nodeSelector": selector, "tolerations": tolerations}}}}
+    run(["kubectl", "-n", namespace, "patch", "deployment", deployment, "--type=merge", "-p", json.dumps(patch)], check=False)
+
+
+def apply_eks_runtime_patches() -> None:
+    if not EKS:
+        return
+    for component in ("flyteadmin", "flytescheduler", "datacatalog", "flytepropeller", "flyteconsole", "webhook"):
+        patch_deployment_scheduling(TARGET_NS, find_deployment_name(component), role="general")
 
 
 def print_summary(provider: str, spec_hash: str) -> None:
@@ -854,6 +886,7 @@ def print_summary(provider: str, spec_hash: str) -> None:
     run(["kubectl", "-n", TARGET_NS, "get", "deploy", "-o", "wide"], check=False)
     run(["kubectl", "-n", TARGET_NS, "get", "svc", "-o", "wide"], check=False)
     print()
+    print(f"Kubernetes cluster mode: {CLUSTER_MODE}")
     print(f"Flyte namespace: {TARGET_NS}")
     print(f"Postgres namespace: {POSTGRES_NS}")
     print(f"Database host: {DB_HOST}")
@@ -880,22 +913,35 @@ def build_secret_fingerprint(provider: str) -> dict[str, str]:
         "auth": hashlib.sha256(FLYTE_OAUTH_CLIENT_SECRET.encode("utf-8")).hexdigest(),
     }
     if provider == "aws":
-        if USE_IAM:
-            out["storage"] = hashlib.sha256("\n".join([AWS_REGION, S3_BUCKET, S3_PREFIX, S3_ENDPOINT, AWS_ROLE_ARN]).encode("utf-8")).hexdigest()
+        if EFFECTIVE_USE_IRSA:
+            out["storage"] = hashlib.sha256(
+                "\n".join([AWS_REGION, S3_BUCKET, S3_PREFIX, S3_ENDPOINT, resolve_role_arn(task=False)]).encode("utf-8")
+            ).hexdigest()
+            out["task_aws"] = hashlib.sha256(
+                "\n".join([AWS_REGION, S3_ENDPOINT, resolve_role_arn(task=True)]).encode("utf-8")
+            ).hexdigest()
         else:
-            out["storage"] = hashlib.sha256("\n".join([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET, S3_PREFIX, S3_ENDPOINT]).encode("utf-8")).hexdigest()
-        out["task_aws"] = hashlib.sha256("\n".join([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_ENDPOINT, AWS_SESSION_TOKEN]).encode("utf-8")).hexdigest()
-    elif provider == "gcs":
-        out["storage"] = hashlib.sha256("\n".join([GCP_PROJECT, GCP_BUCKET, GCP_SERVICE_ACCOUNT_KEY]).encode("utf-8")).hexdigest()
-    elif provider == "azure":
-        out["storage"] = hashlib.sha256("\n".join([AZURE_STORAGE_ACCOUNT, AZURE_CONTAINER, FLYTE_STORAGE_CUSTOM_YAML]).encode("utf-8")).hexdigest()
+            out["storage"] = hashlib.sha256(
+                "\n".join([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET, S3_PREFIX, S3_ENDPOINT]).encode("utf-8")
+            ).hexdigest()
+            out["task_aws"] = hashlib.sha256(
+                "\n".join([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_ENDPOINT, AWS_SESSION_TOKEN]).encode("utf-8")
+            ).hexdigest()
     return out
 
 
 def build_rollout_state(values: dict[str, Any], provider: str) -> dict[str, Any]:
     return {
         "chart": {"repo": CHART_REPO_NAME, "url": CHART_REPO_URL, "name": CHART_NAME, "version": CHART_VERSION, "release": RELEASE_NAME},
-        "cluster": {"target_ns": TARGET_NS, "postgres_ns": POSTGRES_NS, "cnpg_cluster": CNPG_CLUSTER, "db_access_mode": DB_ACCESS_MODE, "db_host": DB_HOST, "pooler_port": POOLER_PORT},
+        "cluster": {
+            "mode": CLUSTER_MODE,
+            "target_ns": TARGET_NS,
+            "postgres_ns": POSTGRES_NS,
+            "cnpg_cluster": CNPG_CLUSTER,
+            "db_access_mode": DB_ACCESS_MODE,
+            "db_host": DB_HOST,
+            "pooler_port": POOLER_PORT,
+        },
         "provider": provider,
         "values": values,
         "secrets": build_secret_fingerprint(provider),
@@ -936,14 +982,28 @@ def ensure_control_plane_secrets(_provider: str) -> None:
     ensure_secret(TARGET_NS, DB_SECRET_NAME, {"pass.txt": APP_DB_PASSWORD})
 
 
+def task_role_annotation(provider: str) -> tuple[str, str]:
+    if provider == "aws" and EFFECTIVE_USE_IRSA:
+        role_arn = resolve_role_arn(task=True)
+        if not role_arn:
+            fatal("FLYTE_TASK_ROLE_ARN, FLYTE_CONTROL_PLANE_ROLE_ARN, or AWS_ROLE_ARN is required when USE_IAM=true on EKS")
+        return "eks.amazonaws.com/role-arn", role_arn
+    return "", ""
+
+
 def ensure_task_namespace_ready(namespace: str, provider: str) -> None:
     ensure_namespace(namespace)
     ensure_default_serviceaccount(namespace)
-    if provider == "aws" and USE_IAM:
-        ensure_serviceaccount(namespace, TASK_SERVICE_ACCOUNT, {"eks.amazonaws.com/role-arn": AWS_ROLE_ARN})
-        patch_default_serviceaccount_annotation(namespace, "eks.amazonaws.com/role-arn", AWS_ROLE_ARN)
-        return
+
     if provider == "aws":
+        if EFFECTIVE_USE_IRSA:
+            key, value = task_role_annotation(provider)
+            if key and value:
+                ensure_serviceaccount(namespace, TASK_SERVICE_ACCOUNT, {key: value})
+                patch_default_serviceaccount_annotation(namespace, key, value)
+                return
+            fatal("IRSA is enabled but no task role annotation could be resolved")
+
         data = {
             "AWS_ACCESS_KEY_ID": AWS_ACCESS_KEY_ID,
             "AWS_SECRET_ACCESS_KEY": AWS_SECRET_ACCESS_KEY,
@@ -955,14 +1015,7 @@ def ensure_task_namespace_ready(namespace: str, provider: str) -> None:
         ensure_secret(namespace, TASK_AWS_SECRET_NAME, data)
         ensure_serviceaccount(namespace, TASK_SERVICE_ACCOUNT)
         return
-    if provider == "gcs" and GCP_SA_EMAIL:
-        patch_default_serviceaccount_annotation(namespace, "iam.gke.io/gcp-service-account", GCP_SA_EMAIL)
-        ensure_serviceaccount(namespace, TASK_SERVICE_ACCOUNT, {"iam.gke.io/gcp-service-account": GCP_SA_EMAIL})
-        return
-    if provider == "azure" and AZURE_CLIENT_ID:
-        patch_default_serviceaccount_annotation(namespace, "azure.workload.identity/client-id", AZURE_CLIENT_ID)
-        ensure_serviceaccount(namespace, TASK_SERVICE_ACCOUNT, {"azure.workload.identity/client-id": AZURE_CLIENT_ID})
-        return
+
     ensure_serviceaccount(namespace, TASK_SERVICE_ACCOUNT)
 
 
@@ -1001,8 +1054,42 @@ def install_or_upgrade(provider: str, values: dict[str, Any], spec_hash: str) ->
         helm_args.append("--atomic")
 
     run(helm_args, check=True)
+    apply_eks_runtime_patches()
     wait_for_rollouts()
     write_cluster_hash(spec_hash)
+
+
+def wait_for_rollouts() -> None:
+    try:
+        deploys = run_text(["kubectl", "-n", TARGET_NS, "get", "deploy", "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}'])
+    except Exception:
+        deploys = ""
+
+    for dep in [line.strip() for line in deploys.splitlines() if line.strip()]:
+        log(f"waiting for deployment {dep}")
+        run(["kubectl", "-n", TARGET_NS, "rollout", "status", f"deployment/{dep}", f"--timeout={ROLLOUT_TIMEOUT}"], check=True)
+
+
+def resolve_service_name(component: str) -> str:
+    if component == "flyteadmin":
+        candidates = ["flyteadmin", f"{RELEASE_NAME}-flyteadmin", RELEASE_NAME]
+    elif component == "flyteconsole":
+        candidates = ["flyteconsole", f"{RELEASE_NAME}-flyteconsole", RELEASE_NAME]
+    elif component == "webhook":
+        candidates = ["flyte-pod-webhook", f"{RELEASE_NAME}-pod-webhook", "webhook"]
+    else:
+        candidates = [component]
+
+    for name in candidates:
+        cp = run(["kubectl", "-n", TARGET_NS, "get", "svc", name], check=False)
+        if cp.returncode == 0:
+            return name
+
+    cp = run(
+        ["kubectl", "-n", TARGET_NS, "get", "svc", "-l", f"app.kubernetes.io/instance={RELEASE_NAME}", "-o", "jsonpath={.items[0].metadata.name}"],
+        check=False,
+    )
+    return cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else component
 
 
 def reconcile(provider: str) -> None:
@@ -1048,7 +1135,7 @@ def reconcile(provider: str) -> None:
 def api_resources(*, namespaced: bool) -> list[str]:
     flag = "--namespaced=true" if namespaced else "--namespaced=false"
     cp = run(["kubectl", "api-resources", "--verbs=list", flag, "-o", "name"], check=True)
-    out = []
+    out: list[str] = []
     for line in cp.stdout.splitlines():
         line = line.strip()
         if line:
@@ -1251,10 +1338,13 @@ def cli() -> int:
             print(
                 "Usage: flyte_setup.py [--rollout|--delete]\n\n"
                 "Environment variables:\n"
-                "  STORAGE_PROVIDER=auto|aws|gcs|azure|sandbox\n"
+                "  K8S_CLUSTER=auto|kind|eks\n"
+                "  STORAGE_PROVIDER=auto|aws|sandbox\n"
                 "  USE_IAM=true|false\n"
+                "  FLYTE_CONTROL_PLANE_ROLE_ARN=<role-arn>\n"
+                "  FLYTE_TASK_ROLE_ARN=<role-arn>\n"
                 "  FLYTE_TASK_NAMESPACES=flytesnacks-development[,other-namespace]\n"
-                "  TASK_SERVICE_ACCOUNT=default|spark|<other-sa>\n"
+                "  TASK_SERVICE_ACCOUNT=flyte-task|<other-sa>\n"
                 "  TASK_AWS_SECRET_NAME=flyte-aws-credentials\n"
                 "  STORAGE_SECRET_NAME=flyte-storage-config\n"
                 "  DB_ACCESS_MODE=rw|pooler\n"

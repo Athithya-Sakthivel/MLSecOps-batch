@@ -1,279 +1,419 @@
-# AgentOps-ServiceAutomation — Terraform / OpenTofu Infrastructure
+This repository defines AWS infrastructure using **OpenTofu (Terraform-compatible)**. It provisions a VPC, security boundaries, IAM, S3 storage, and a production-ready **EKS cluster** with strict workload isolation.
 
-## Purpose
-
-This repository contains the Infrastructure-as-Code used to provision the cloud infrastructure for the **AgentOps-ServiceAutomation** project.
-
-The infrastructure is defined using **OpenTofu (Terraform-compatible)** and deployed to **Amazon Web Services (AWS)**. It provisions networking, container registries, IAM roles, and a production-ready **Amazon EKS Kubernetes cluster**.
-
-Ingress traffic is routed from the edge through **Cloudflare**, with services running inside the Kubernetes cluster.
+Ingress is expected to be handled externally (Cloudflare). This layer only provisions the underlying platform.
 
 ---
 
-# What the infrastructure provisions
+# What this infrastructure provisions
 
-The repository provisions the following AWS resources:
+Single AWS account environment with:
 
-* Single AWS account environment
-* Dedicated **VPC networking layer**
-* Private subnets distributed across **two Availability Zones**
-* Internet access through a **single NAT Gateway**
-* **Amazon EKS cluster** with managed worker node groups
-* **Amazon ECR repositories** for container images
-* **IAM roles and policies** for Kubernetes workloads
-* **Remote Terraform/OpenTofu state storage**
-* Supporting security groups and routing infrastructure
+* VPC with configurable CIDR
+* Multi-AZ private networking
+* NAT gateway(s) for outbound access
+* EKS cluster with two isolated nodegroups
+* IAM roles (pre- and post-cluster)
+* S3 buckets for platform storage
+* ECR repositories
+* Security groups for cluster nodes
+* Remote state (S3 + DynamoDB via `run.sh`)
 
-The infrastructure is designed to be reproducible and environment-isolated.
-
----
-
-# Core components
-
-## VPC networking
-
-The infrastructure creates a dedicated Virtual Private Cloud with:
-
-* Configurable VPC CIDR block
-* Two private subnets (one per availability zone)
-* One public subnet used for the NAT Gateway
-* Internet Gateway for outbound traffic
-* Single NAT Gateway used by private workloads
-* Route tables connecting private workloads to the NAT gateway
-
-Kubernetes worker nodes run inside the private subnets.
+All resources are environment-scoped via `.tfvars`.
 
 ---
 
-## Amazon EKS cluster
+# Architecture
 
-The system provisions an **Amazon Elastic Kubernetes Service (EKS)** cluster with:
+## Networking (VPC)
 
-* Private worker nodes
-* Managed node groups
-* IAM roles for cluster and node operation
-* OIDC provider for Kubernetes service account IAM roles (IRSA)
+The VPC module creates:
 
-Two node groups are deployed:
+* VPC with configurable CIDR
+* Public + private subnets across `az_count`
+* Internet Gateway
+* NAT configuration:
 
-**System node group**
+  * **one NAT per AZ** (default)
+  * or **single NAT** (cost mode)
+* Route tables:
 
-Runs cluster-level services and stateful workloads such as:
+  * public → IGW
+  * private → NAT
 
-* Observability stack
-* Databases
-* Storage controllers
+Worker nodes run **only in private subnets**.
 
-**Inference node group**
-
-Runs stateless workloads such as:
-
-* inference services
-* API components
-* authentication services
+VPC endpoints were removed.
 
 ---
 
-## Amazon ECR repositories
+## EKS Cluster
 
-Container images are stored in dedicated ECR repositories.
+The EKS module provisions:
 
-Repositories created by the infrastructure include:
+* EKS control plane
+* OIDC provider (required for IRSA)
+* Managed nodegroups
+* Cluster security group
+* Secrets encryption (KMS)
 
-* `agentops-frontend`
-* `agentops-inference`
-* `agentops-auth`
-* `agentops-cloudnativepg`
-* `agentops-postgresql`
-* `agentops-cloudflared`
+### Nodegroups (strict contract)
 
-Each repository includes lifecycle policies for automatic cleanup of unused images.
+Two nodegroups exist:
+
+### 1. `system` (general)
+
+Purpose: long-running services
+
+Runs:
+
+* Flyte control plane
+* Postgres (CNPG)
+* MLflow
+* Iceberg REST
+* Operators (Ray, Spark, etc.)
+
+Characteristics:
+
+* On-demand instances
+* Stable capacity
+* No batch workloads
+
+Labels:
+
+```
+node-type=general
+```
+
+Taint:
+
+```
+node-type=general:NoSchedule
+```
 
 ---
 
-## IAM design
+### 2. `workloads` (compute)
 
-IAM configuration is split into two stages to respect resource dependencies.
+Purpose: execution layer
 
-### Pre-EKS IAM
+Runs:
 
-Created before the Kubernetes cluster:
+* Flyte tasks (ELT, training)
+* Spark jobs
+* Ray workers
+* batch jobs
 
-* EKS cluster IAM role
-* Worker node IAM role
+Characteristics:
+
+* autoscaling enabled
+* spot allowed
+* no long-running services
+
+Labels:
+
+```
+node-type=compute
+```
+
+Taint:
+
+```
+node-type=compute:NoSchedule
+```
+
+---
+
+## Scheduling Model (enforced by workloads, not Terraform)
+
+* Services → must target `general`
+* Jobs/workers → must target `compute`
+
+Terraform only sets labels/taints.
+Kubernetes manifests enforce placement.
+
+---
+
+## Security
+
+The security module creates:
+
+* Node security group
+* Required ingress/egress for:
+
+  * control plane ↔ nodes
+  * node ↔ node
+  * outbound internet
+
+No permissive 0.0.0.0/0 ingress is allowed.
+
+---
+
+## IAM Design
+
+Split into two phases:
+
+---
+
+### `iam_pre_eks`
+
+Created before cluster:
+
+* EKS cluster role
+* Nodegroup role
 * Cluster Autoscaler policy
-* CI image push policy for ECR
-* Reference to the EBS CSI managed policy
+* EBS CSI managed policy reference
 
-### Post-EKS IAM
-
-Created after the cluster exists:
-
-* IAM roles for Kubernetes service accounts
-* IRSA trust relationships using the cluster OIDC provider
-
-These roles enable Kubernetes workloads to access AWS services securely.
+These are required to create the cluster.
 
 ---
 
-## Remote Terraform / OpenTofu state
+### `iam_post_eks`
 
-Infrastructure state is stored remotely to support collaboration and safe deployments.
+Created after cluster:
 
-Resources created automatically:
+Uses:
 
-**S3 bucket**
+* OIDC provider from EKS
 
-```
-agentops-tf-state-<ACCOUNT_ID>
-```
+Creates:
 
-Features:
+### IRSA roles for workloads
 
-* Versioning enabled
-* Server-side encryption
-* Public access blocked
+Each role is mapped to:
 
-**DynamoDB table**
+* Kubernetes service account
+* specific S3 bucket access
 
-```
-agentops-tf-lock-<ACCOUNT_ID>
-```
+Roles include:
 
-Used for Terraform/OpenTofu state locking to prevent concurrent modifications.
+* CNPG backup role → `PG_BACKUPS_S3_BUCKET`
+* Flyte task role → `S3_BUCKET`
+* MLflow role → `MLFLOW_S3_BUCKET`
+* Ray inference role → `MLFLOW_S3_BUCKET`
+* Iceberg role → `S3_BUCKET`
+
+Each role has:
+
+* least-privilege S3 policy
+* OIDC trust bound to namespace + service account
+
+---
+
+### GitHub Actions roles
+
+Also created here:
+
+* `flyte-elt-task`
+* `flyte-train-task`
+* `tabular-inference-service`
+
+Used via OIDC (no static credentials).
+
+Permissions:
+
+* ECR push/pull (if ECR used)
+* optional AWS access if required
+
+---
+
+## S3
+
+The S3 module creates exactly three buckets:
+
+* `S3_BUCKET` → general platform data (Flyte, Iceberg)
+* `PG_BACKUPS_S3_BUCKET` → Postgres backups
+* `MLFLOW_S3_BUCKET` → MLflow artifacts
+
+Each bucket:
+
+* private
+* versioned
+* encrypted
+* no public access
+
+Names are provided via `.tfvars`.
+
+---
+
+## ECR
+
+The ECR module creates repositories dynamically.
+
+Used only if AWS ECR is required alongside GHCR.
+
+Repositories:
+
+* flyte-elt-task
+* flyte-train-task
+* tabular-inference-service
+
+Each repo:
+
+* immutable tags (default)
+* scan on push
+* lifecycle policy (retain N images)
 
 ---
 
 # Repository structure
 
 ```
-src/terraform/
-  versions.tf
-  providers.tf
-  variables.tf
+src/terraform/aws/
   main.tf
   outputs.tf
-  run.sh
-  staging.tfvars
+  variables.tf
+  providers.tf
+  versions.tf
+
   prod.tfvars
+  staging.tfvars
+
+  run.sh
 
   modules/
     vpc/
     security/
-    ecr/
     iam_pre_eks/
     eks/
+    s3/
     iam_post_eks/
+    ecr/
 ```
 
 ---
 
-# Module overview
+# Module responsibilities
 
-## VPC module
+## `vpc/`
 
-Creates:
+Creates all networking:
 
 * VPC
-* Subnets
-* Internet Gateway
-* NAT Gateway
-* Route tables
-* Subnet associations
+* subnets
+* IGW
+* NAT
+* route tables
 
 ---
 
-## Security module
+## `security/`
 
 Creates:
 
-* Kubernetes node security group
-* Security group rules required by the EKS control plane
+* node security group
+* required rules for EKS communication
 
 ---
 
-## ECR module
+## `iam_pre_eks/`
 
 Creates:
 
-* Application container repositories
-* Image lifecycle policies
+* cluster role
+* node role
+* autoscaler policy
 
 ---
 
-## IAM modules
-
-### `iam_pre_eks`
-
-Creates roles required before cluster creation.
-
-### `iam_post_eks`
-
-Creates IAM roles that depend on the EKS OIDC provider.
-
----
-
-## EKS module
+## `eks/`
 
 Creates:
 
 * EKS cluster
+* nodegroups (`system`, `workloads`)
 * OIDC provider
-* managed node groups
-* cluster security groups
+* KMS encryption
+
+---
+
+## `s3/`
+
+Creates:
+
+* 3 buckets (tfvars-driven)
+
+Exports:
+
+* name map
+* arn map
+
+---
+
+## `iam_post_eks/`
+
+Creates:
+
+* IRSA roles (S3-scoped)
+* GitHub OIDC roles
+
+Depends on:
+
+* EKS OIDC
+* S3 buckets
+
+---
+
+## `ecr/`
+
+Creates:
+
+* repositories (dynamic)
+* lifecycle policies
 
 ---
 
 # Outputs
 
-After deployment, the root module exposes key infrastructure values.
+Key outputs exposed:
 
-Examples:
+Networking:
 
 * `vpc_id`
 * `private_subnet_ids`
+* `public_subnet_ids`
 * `availability_zones`
-* `node_security_group_id`
-* `ecr_repository_urls`
-* `ecr_repository_arns`
-* `iam_cluster_role_arn`
-* `iam_node_role_arn`
+
+EKS:
+
 * `eks_cluster_name`
 * `eks_cluster_endpoint`
 * `eks_cluster_ca_data`
 * `eks_oidc_provider_arn`
 
-Retrieve outputs using:
+IAM:
 
-```
-tofu output <name>
-```
+* `iam_cluster_role_arn`
+* `iam_node_role_arn`
+* `irsa_role_arns`
 
-Example:
+S3:
 
-```
-tofu output vpc_id
-```
+* `s3_bucket_names`
+* `s3_bucket_arns`
 
----
+ECR:
 
-# Deployment workflow
-
-## Bootstrap infrastructure state
-
-```
-bash src/terraform/run.sh --create --env staging
-```
-
-This script:
-
-1. Creates the S3 backend bucket if it does not exist
-2. Creates the DynamoDB state lock table
-3. Runs `tofu init` with backend configuration
+* `ecr_repository_urls`
 
 ---
 
-## Validate configuration
+# Deployment
+
+## 1. Bootstrap state
+
+```
+bash src/terraform/aws/run.sh --create --env staging
+```
+
+Creates:
+
+* S3 state bucket
+* DynamoDB lock table
+* runs `tofu init`
+
+---
+
+## 2. Validate
 
 ```
 tofu validate
@@ -281,76 +421,68 @@ tofu validate
 
 ---
 
-## Plan infrastructure
+## 3. Plan
 
 ```
-tofu plan -var-file=src/terraform/staging.tfvars
-```
-
----
-
-## Apply infrastructure
-
-```
-tofu apply -var-file=src/terraform/staging.tfvars
+tofu plan -var-file=src/terraform/aws/staging.tfvars
 ```
 
 ---
 
-# Configuration management
+## 4. Apply
 
-Environment configuration is stored in:
+```
+tofu apply -var-file=src/terraform/aws/staging.tfvars
+```
+
+---
+
+# Configuration
+
+Environment-specific config:
 
 ```
 staging.tfvars
 prod.tfvars
 ```
 
-These files contain **non-secret environment parameters**.
+Defines:
 
-Secrets must be injected through:
+* region
+* cluster name
+* VPC CIDR
+* subnet CIDRs
+* nodegroup sizes/types
+* S3 bucket names
+* IRSA role mappings
 
-* CI/CD environment variables
-* external secret management systems
-
-Sensitive values must not be committed to the repository.
-
----
-
-# Change management
-
-Infrastructure changes should follow these guidelines:
-
-* All modifications must be made through Terraform/OpenTofu
-* Environment variables must remain isolated per environment
-* Module outputs serve as the public interface between components
-* Internal module implementations may change as long as root outputs remain stable
+No secrets are stored here.
 
 ---
 
-# Operational reference
+# State management
 
-Key implementation locations:
+Handled by `run.sh`:
 
-* VPC networking
-  `src/terraform/modules/vpc/main.tf`
+* S3 bucket (versioned, encrypted)
+* DynamoDB locking
 
-* Security groups
-  `src/terraform/modules/security/main.tf`
-
-* ECR repositories
-  `src/terraform/modules/ecr/main.tf`
-
-* IAM roles
-  `src/terraform/modules/iam_pre_eks/main.tf`
-  `src/terraform/modules/iam_post_eks/main.tf`
-
-* Kubernetes cluster
-  `src/terraform/modules/eks/main.tf`
-
-* State bootstrap script
-  `src/terraform/run.sh`
+No local state is used.
 
 ---
 
-This document describes the infrastructure implemented in the repository and the operational workflow used to deploy and maintain it.
+# Invariants
+
+These must not be violated:
+
+* only 2 nodegroups: `system`, `workloads`
+* node isolation via labels + taints
+* no workloads in public subnets
+* no static AWS credentials inside cluster
+* all AWS access via IRSA or OIDC
+* S3 access is least-privilege per service
+* modules communicate only via outputs
+
+---
+
+This document reflects the current infrastructure exactly as defined in the repository.

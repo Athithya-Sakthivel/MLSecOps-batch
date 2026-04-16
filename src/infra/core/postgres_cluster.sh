@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # CloudNativePG lifecycle script (idempotent, declarative, restore-safe)
+# Works for both kind and EKS.
+#
+# Commands:
 #   deploy
 #   backup --wait
 #   deploy --restore latest --force-recreate
@@ -12,7 +15,14 @@
 #   PG_SERVER_NAME             Stable backup lineage name
 #   RESTORE_SOURCE_SERVER_NAME Source lineage for restore (defaults to PG_SERVER_NAME)
 #
-# The restore target lineage is generated internally when omitted.
+# When K8S_CLUSTER=eks:
+#   - cluster and pooler pods are pinned to the general nodegroup
+#   - the cluster gets an IRSA-backed serviceAccountTemplate when IRSA_ROLE_ARN is set
+#   - a PodDisruptionBudget is rendered for the CNPG cluster
+#
+# When K8S_CLUSTER=kind:
+#   - no hard node scheduling is injected by default
+#   - AWS access keys are required for S3 backup/restore access
 
 IFS=$'\n\t'
 
@@ -42,6 +52,7 @@ CLUSTER_NAME="${CLUSTER_NAME:-postgres-cluster}"
 POOLER_NAME="${POOLER_NAME:-postgres-pooler}"
 CLUSTER_FILE="${CLUSTER_FILE:-${MANIFEST_DIR}/postgres_cluster.yaml}"
 POOLER_FILE="${POOLER_FILE:-${MANIFEST_DIR}/postgres_pooler.yaml}"
+PDB_FILE="${PDB_FILE:-${MANIFEST_DIR}/postgres_pdb.yaml}"
 SCHEDULED_BACKUP_FILE="${SCHEDULED_BACKUP_FILE:-${MANIFEST_DIR}/postgres_scheduled_backup.yaml}"
 MANUAL_BACKUP_FILE="${MANUAL_BACKUP_FILE:-${MANIFEST_DIR}/postgres_backup.yaml}"
 
@@ -65,7 +76,7 @@ POD_TIMEOUT="${POD_TIMEOUT:-900}"
 SECRET_TIMEOUT="${SECRET_TIMEOUT:-180}"
 BACKUP_TIMEOUT="${BACKUP_TIMEOUT:-1800}"
 
-STORAGE_CLASS_NAME="${STORAGE_CLASS_NAME:-default-storage-class}"
+STORAGE_CLASS_NAME="${STORAGE_CLASS_NAME:-}"
 INITDB_DB="${INITDB_DB:-flyte_admin}"
 ADDITIONAL_DBS_RAW="${ADDITIONAL_DBS_RAW:-datacatalog mlflow iceberg}"
 
@@ -75,7 +86,7 @@ BACKUP_ENDPOINT_URL="${BACKUP_ENDPOINT_URL:-}"
 BACKUP_RETENTION_POLICY="${BACKUP_RETENTION_POLICY:-30d}"
 BACKUP_SCHEDULE="${BACKUP_SCHEDULE:-0 0 0 * * *}"
 
-IRSA_ROLE_ARN="${IRSA_ROLE_ARN:-}"
+IRSA_ROLE_ARN="${PG_IRSA_ROLE_ARN:-}"
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
 AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}"
@@ -85,7 +96,10 @@ RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 BACKUP_ACTIVE_SERVER_NAME=""
 RESTORE_ACTIVE_SERVER_NAME=""
 
-if [[ "$K8S_CLUSTER" == kind* ]]; then
+is_kind_cluster() { [[ "$K8S_CLUSTER" == kind* ]]; }
+is_eks_cluster() { [[ "$K8S_CLUSTER" == eks* ]]; }
+
+if is_kind_cluster; then
   INSTANCES="${INSTANCES:-1}"
   CPU_REQUEST="${CPU_REQUEST:-250m}"
   CPU_LIMIT="${CPU_LIMIT:-1000m}"
@@ -217,13 +231,40 @@ ensure_cnpg_operator() {
   install_cnpg_operator
 }
 
+detect_default_storage_class() {
+  if [[ -n "$STORAGE_CLASS_NAME" ]]; then
+    return 0
+  fi
+
+  local sc
+  sc="$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}|{.metadata.annotations.kubernetes\.io/is-default-class}|{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null | awk -F'|' '$2=="true" || $3=="true" {print $1; exit}')"
+
+  if [[ -n "$sc" ]]; then
+    STORAGE_CLASS_NAME="$sc"
+    return 0
+  fi
+
+  if kubectl get sc standard >/dev/null 2>&1; then
+    STORAGE_CLASS_NAME="standard"
+    return 0
+  fi
+
+  fatal "no default storage class found; set STORAGE_CLASS_NAME explicitly"
+}
+
 validate_backup_inputs() {
   compose_backup_destination_path
+
+  if is_kind_cluster && [[ -n "$IRSA_ROLE_ARN" ]]; then
+    fatal "IRSA_ROLE_ARN is not supported on kind; use AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+  fi
+
   if [[ -n "$IRSA_ROLE_ARN" && -n "$AWS_ACCESS_KEY_ID" ]]; then
     fatal "use either IRSA_ROLE_ARN or AWS access keys, not both"
   fi
+
   if [[ -z "$IRSA_ROLE_ARN" ]]; then
-    [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" ]] || fatal "for non-EKS clusters set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+    [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" ]] || fatal "set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY when not using IRSA"
   fi
 }
 
@@ -244,6 +285,39 @@ ensure_aws_secret() {
     --from-literal=ACCESS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
     ${AWS_SESSION_TOKEN:+--from-literal=ACCESS_SESSION_TOKEN="$AWS_SESSION_TOKEN"} \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+}
+
+cluster_scheduling_block() {
+  if ! is_eks_cluster; then
+    return 0
+  fi
+  cat <<EOF
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    nodeSelector:
+      node-type: general
+    tolerations:
+      - key: node-type
+        operator: Equal
+        value: general
+        effect: NoSchedule
+EOF
+}
+
+pooler_scheduling_block() {
+  if ! is_eks_cluster; then
+    return 0
+  fi
+  cat <<EOF
+      nodeSelector:
+        node-type: general
+      tolerations:
+        - key: node-type
+          operator: Equal
+          value: general
+          effect: NoSchedule
+EOF
 }
 
 emit_irsa_block() {
@@ -286,10 +360,16 @@ emit_backup_store_block() {
   printf '%s    compression: gzip\n' "$indent"
 }
 
+cluster_pdb_min_available() {
+  if (( INSTANCES <= 1 )); then
+    printf '1'
+    return 0
+  fi
+  printf '%s' "$((INSTANCES - 1))"
+}
+
 render_cluster_manifest() {
-  local file="$1" mode="$2" restore_target_time="${3:-}"
-  local source_server_name="${4:-}"
-  local target_server_name="${5:-}"
+  local file="$1" mode="$2" restore_target_time="${3:-}" source_server_name="${4:-}" target_server_name="${5:-}"
   mkdir -p "$(dirname "$file")"
 
   {
@@ -309,6 +389,7 @@ EOF
     retentionPolicy: ${BACKUP_RETENTION_POLICY}
 EOF
     emit_backup_store_block "    " "${target_server_name}"
+    cluster_scheduling_block
 
     if [[ "$mode" == "fresh" ]]; then
       cat <<EOF
@@ -403,10 +484,29 @@ EOF
   log "wrote $file"
 }
 
-render_pooler_manifest() {
+render_cluster_pdb_manifest() {
   local file="$1" cluster_name="$2"
   mkdir -p "$(dirname "$file")"
   cat > "$file" <<EOF
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ${cluster_name}-pdb
+  namespace: ${TARGET_NS}
+spec:
+  minAvailable: $(cluster_pdb_min_available)
+  selector:
+    matchLabels:
+      cnpg.io/cluster: ${cluster_name}
+EOF
+  log "wrote $file"
+}
+
+render_pooler_manifest() {
+  local file="$1" cluster_name="$2"
+  mkdir -p "$(dirname "$file")"
+  {
+    cat <<EOF
 apiVersion: postgresql.cnpg.io/v1
 kind: Pooler
 metadata:
@@ -429,6 +529,9 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
+EOF
+    pooler_scheduling_block
+    cat <<EOF
       containers:
         - name: pgbouncer
           securityContext:
@@ -442,6 +545,7 @@ spec:
               cpu: ${POOLER_CPU_LIMIT}
               memory: ${POOLER_MEM_LIMIT}
 EOF
+  } > "$file"
   log "wrote $file"
 }
 
@@ -693,6 +797,11 @@ create_initial_backup() {
   wait_for_backup_completed "$backup_name"
 }
 
+render_cluster_pdb_and_apply() {
+  render_cluster_pdb_manifest "$PDB_FILE" "$CLUSTER_NAME"
+  apply_if_changed "$PDB_FILE" poddisruptionbudget "${CLUSTER_NAME}-pdb" "mlsecops.cnpg.pdb-checksum"
+}
+
 deploy_pooler_and_wait() {
   local cluster_name="$1" pooler_name="$2"
   render_pooler_manifest "$POOLER_FILE" "$cluster_name"
@@ -729,6 +838,11 @@ show_runtime_context() {
   log "  cluster_id=${PG_CLUSTER_ID}"
   log "  source_server_name=$(source_lineage_server_name)"
   log "  backup_destination_path=${BACKUP_DESTINATION_PATH}"
+  log "  storage_class=${STORAGE_CLASS_NAME}"
+  if is_eks_cluster; then
+    log "  scheduling=node-type=general"
+    log "  irsa=${IRSA_ROLE_ARN:-<none>}"
+  fi
   if [[ "$mode" == "restore" ]]; then
     log "  restore_target_server_name=${RESTORE_ACTIVE_SERVER_NAME}"
     log "  restore_target_time=${RESTORE_TARGET_TIME:-<none>}"
@@ -755,12 +869,14 @@ print_next_steps() {
 persist_artifacts() {
   cp "$CLUSTER_FILE" "${MANIFEST_DIR}/postgres_cluster.yaml" 2>/dev/null || true
   cp "$POOLER_FILE" "${MANIFEST_DIR}/postgres_pooler.yaml" 2>/dev/null || true
+  cp "$PDB_FILE" "${MANIFEST_DIR}/postgres_pdb.yaml" 2>/dev/null || true
   cp "$SCHEDULED_BACKUP_FILE" "${MANIFEST_DIR}/postgres_scheduled_backup.yaml" 2>/dev/null || true
   log "artifacts persisted to ${MANIFEST_DIR}"
 }
 
 deploy_fresh() {
   ensure_cnpg_operator
+  detect_default_storage_class
   validate_backup_inputs
   ensure_aws_secret
   ensure_fresh_lineage
@@ -769,10 +885,11 @@ deploy_fresh() {
 
   render_cluster_manifest "$CLUSTER_FILE" "fresh" "" "" "$BACKUP_ACTIVE_SERVER_NAME"
   apply_if_changed "$CLUSTER_FILE" cluster "$CLUSTER_NAME" "mlsecops.cnpg.cluster-checksum"
+  render_cluster_pdb_and_apply
   wait_for_cluster_ready "$CLUSTER_NAME"
   wait_for_continuous_archiving "$CLUSTER_NAME"
   wait_for_app_secret "$CLUSTER_NAME"
-  ensure_database_exists "${ALL_DBS[@]}"
+  ensure_database_exists
   fix_database_schema_ownership
   create_initial_backup
   render_scheduled_backup_manifest "$SCHEDULED_BACKUP_FILE" "$CLUSTER_NAME"
@@ -788,6 +905,7 @@ deploy_fresh() {
 
 deploy_restore() {
   ensure_cnpg_operator
+  detect_default_storage_class
   validate_backup_inputs
   ensure_aws_secret
   validate_restore_inputs
@@ -800,6 +918,7 @@ deploy_restore() {
     kubectl -n "$TARGET_NS" delete scheduledbackup "${CLUSTER_NAME}-backup" --ignore-not-found >/dev/null 2>&1 || true
     kubectl -n "$TARGET_NS" delete backup -l "cnpg.io/cluster=${CLUSTER_NAME}" --ignore-not-found >/dev/null 2>&1 || true
     kubectl -n "$TARGET_NS" delete pooler "$POOLER_NAME" --ignore-not-found >/dev/null 2>&1 || true
+    kubectl -n "$TARGET_NS" delete poddisruptionbudget "${CLUSTER_NAME}-pdb" --ignore-not-found >/dev/null 2>&1 || true
     kubectl -n "$TARGET_NS" delete cluster "$CLUSTER_NAME" --ignore-not-found >/dev/null 2>&1 || true
   fi
 
@@ -810,6 +929,7 @@ deploy_restore() {
   fi
 
   apply_if_changed "$CLUSTER_FILE" cluster "$CLUSTER_NAME" "mlsecops.cnpg.cluster-checksum"
+  render_cluster_pdb_and_apply
   wait_for_cluster_ready "$CLUSTER_NAME"
   wait_for_continuous_archiving "$CLUSTER_NAME"
   wait_for_app_secret "$CLUSTER_NAME"
@@ -826,6 +946,7 @@ deploy_restore() {
 
 cmd_backup() {
   ensure_cnpg_operator
+  detect_default_storage_class
   validate_backup_inputs
   ensure_aws_secret
   if cluster_exists; then
@@ -858,6 +979,7 @@ cmd_destroy() {
   kubectl -n "$TARGET_NS" delete scheduledbackup "${CLUSTER_NAME}-backup" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "$TARGET_NS" delete backup -l "cnpg.io/cluster=${CLUSTER_NAME}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "$TARGET_NS" delete pooler "$POOLER_NAME" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "$TARGET_NS" delete poddisruptionbudget "${CLUSTER_NAME}-pdb" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "$TARGET_NS" delete cluster "$CLUSTER_NAME" --ignore-not-found >/dev/null 2>&1 || true
   log "deleted CNPG resources for ${CLUSTER_NAME}"
   log "preserved PV data and S3 backups"

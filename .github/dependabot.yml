@@ -1,0 +1,123 @@
+version: 2
+
+multi-ecosystem-groups:
+  infra:
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "03:00"
+      timezone: "Asia/Kolkata"
+
+updates:
+  - package-ecosystem: "docker"
+    directories:
+      - "/.devcontainer"
+      - "/src/infra/deploy"
+      - "/src/infra/elt"
+      - "/src/infra/train"
+      - "/src/workflows/ELT"
+      - "/src/workflows/deploy"
+      - "/src/workflows/train"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "03:00"
+      timezone: "Asia/Kolkata"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "docker"
+      - "infra"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      docker-patch-minor:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+          - "minor"
+    multi-ecosystem-group: "infra"
+
+  - package-ecosystem: "terraform"
+    directory: "/src/terraform/aws"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "03:00"
+      timezone: "Asia/Kolkata"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "terraform"
+      - "infra"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      terraform-patch-minor:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+          - "minor"
+    multi-ecosystem-group: "infra"
+
+  - package-ecosystem: "pip"
+    directories:
+      - "/src/workflows/deploy"
+      - "/src/workflows/train"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "03:30"
+      timezone: "Asia/Kolkata"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      python-patch-minor:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+          - "minor"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "04:00"
+      timezone: "Asia/Kolkata"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      actions-patch-minor:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+          - "minor"

@@ -1,54 +1,82 @@
-// src/terraform/modules/iam_pre_eks/main.tf
-// Pre-EKS IAM: cluster & node roles, cluster-autoscaler policy, CI ECR push policy.
-// Stable, deterministic outputs consumed by eks and iam_post_eks.
+// src/terraform/aws/modules/iam_pre_eks/main.tf
+// Pre-EKS IAM for the platform.
+//
+// Responsibilities:
+// - EKS control plane role
+// - EKS node role
+// - Cluster Autoscaler policy
+// - CI ECR push policy (kept here only for legacy/backward compatibility)
+// - EBS CSI managed policy ARN output
+//
+// Node bootstrap fix:
+// - the worker node role now includes AmazonEC2ContainerRegistryPullOnly,
+//   which is required for managed EKS nodes to pull images and complete bootstrap.
 
 variable "name_prefix" {
-  type    = string
-  default = "agentops"
+  description = "Prefix used for IAM role and policy names."
+  type        = string
+  default     = "mlops"
 }
 
 variable "tags" {
-  type    = map(string)
-  default = {}
+  description = "Tags applied to all resources created by this module."
+  type        = map(string)
+  default     = {}
 }
 
 locals {
-  name_prefix = var.name_prefix
-  common_tags = merge({ ManagedBy = "agentops-serviceautomation" }, var.tags)
+  env_tag = lookup(var.tags, "Environment", "prod")
+
+  common_tags = merge(
+    {
+      ManagedBy   = "opentofu"
+      Platform    = "mlops"
+      Environment = local.env_tag
+    },
+    var.tags
+  )
 }
 
 resource "aws_iam_role" "cluster" {
-  name = "${local.name_prefix}-eks-cluster-role"
+  name = "${var.name_prefix}-eks-cluster-role"
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Effect    = "Allow"
-        Principal = { Service = "eks.amazonaws.com" }
-        Action    = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "eks.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
       }
     ]
   })
+
   tags = local.common_tags
 }
 
-resource "aws_iam_role_policy_attachment" "cluster_attach" {
+resource "aws_iam_role_policy_attachment" "cluster_attach_eks_cluster" {
   role       = aws_iam_role.cluster.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
 
 resource "aws_iam_role" "node" {
-  name = "${local.name_prefix}-eks-node-role"
+  name = "${var.name_prefix}-eks-node-role"
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Effect    = "Allow"
-        Principal = { Service = "ec2.amazonaws.com" }
-        Action    = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
       }
     ]
   })
+
   tags = local.common_tags
 }
 
@@ -57,9 +85,9 @@ resource "aws_iam_role_policy_attachment" "node_attach_eks_worker" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
 }
 
-resource "aws_iam_role_policy_attachment" "node_attach_ecr_readonly" {
+resource "aws_iam_role_policy_attachment" "node_attach_ecr_pull" {
   role       = aws_iam_role.node.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
 }
 
 resource "aws_iam_role_policy_attachment" "node_attach_cni" {
@@ -68,7 +96,7 @@ resource "aws_iam_role_policy_attachment" "node_attach_cni" {
 }
 
 resource "aws_iam_policy" "cluster_autoscaler" {
-  name = "${local.name_prefix}-cluster-autoscaler-policy"
+  name = "${var.name_prefix}-cluster-autoscaler-policy"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -103,7 +131,7 @@ resource "aws_iam_policy" "cluster_autoscaler" {
 }
 
 resource "aws_iam_policy" "ci_ecr_push" {
-  name = "${local.name_prefix}-ci-ecr-push-policy"
+  name = "${var.name_prefix}-ci-ecr-push-policy"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -117,8 +145,7 @@ resource "aws_iam_policy" "ci_ecr_push" {
           "ecr:UploadLayerPart",
           "ecr:CompleteLayerUpload",
           "ecr:PutImage",
-          "ecr:BatchGetImage",
-          "ecr:DescribeRepositories"
+          "ecr:BatchGetImage"
         ]
         Resource = ["*"]
       }
@@ -129,26 +156,26 @@ resource "aws_iam_policy" "ci_ecr_push" {
 }
 
 output "cluster_role_arn" {
-  description = "ARN of EKS cluster IAM role"
+  description = "ARN of the EKS control plane IAM role."
   value       = aws_iam_role.cluster.arn
 }
 
 output "node_role_arn" {
-  description = "ARN of EC2 node IAM role"
+  description = "ARN of the EKS worker node IAM role."
   value       = aws_iam_role.node.arn
 }
 
 output "cluster_autoscaler_policy_arn" {
-  description = "ARN of the Cluster Autoscaler policy"
+  description = "ARN of the Cluster Autoscaler policy."
   value       = aws_iam_policy.cluster_autoscaler.arn
 }
 
 output "ci_ecr_push_policy_arn" {
-  description = "ARN of the CI ECR push policy"
+  description = "ARN of the CI ECR push policy."
   value       = aws_iam_policy.ci_ecr_push.arn
 }
 
 output "ebs_csi_managed_policy_arn" {
-  description = "Recommended managed policy ARN for EBS CSI"
+  description = "AWS-managed EBS CSI driver policy ARN."
   value       = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
 }

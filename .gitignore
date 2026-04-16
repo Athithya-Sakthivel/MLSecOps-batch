@@ -3,6 +3,8 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+
+
 # C extensions
 *.so
 .venv_train
@@ -35,13 +37,15 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
-
+.terraform
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
 src/scripts/archive/cnpg-1.28.2.yaml
 src/scripts/archive/plans/
 tmp.md
+src/terraform/aws/.plans
+src/terraform/aws/.plans
 # Unit test / coverage reports
 htmlcov/
 .tox/

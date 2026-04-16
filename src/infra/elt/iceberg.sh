@@ -3,7 +3,13 @@ set -Eeuo pipefail
 
 # =============================================================================
 # Iceberg REST Catalog Deployment Orchestrator
-# Usage: ./iceberg.sh [--rollout [--validate]] | --delete | --help
+# Supports:
+#   - K8S_CLUSTER=kind
+#   - K8S_CLUSTER=eks
+#
+# Auth modes:
+#   - USE_IAM=false -> static AWS credentials in a Kubernetes Secret
+#   - USE_IAM=true  -> EKS IRSA via ServiceAccount annotation
 # =============================================================================
 
 TARGET_NS="${TARGET_NS:-default}"
@@ -13,7 +19,51 @@ DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-iceberg-rest}"
 SERVICE_NAME="${SERVICE_NAME:-iceberg-rest}"
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-iceberg-rest-sa}"
 SECRET_NAME="${SECRET_NAME:-iceberg-storage-credentials}"
+PDB_NAME="${PDB_NAME:-iceberg-rest-pdb}"
 ANNOTATION_KEY="${ANNOTATION_KEY:-mlsecops.iceberg.checksum}"
+
+K8S_CLUSTER="${K8S_CLUSTER:-kind}"
+USE_IAM_RAW="${USE_IAM:-}"
+
+# Default to IRSA on EKS, static secret on kind.
+if [[ -z "${USE_IAM_RAW}" ]]; then
+  if [[ "${K8S_CLUSTER}" == "eks" ]]; then
+    USE_IAM="true"
+  else
+    USE_IAM="false"
+  fi
+else
+  USE_IAM="${USE_IAM_RAW}"
+fi
+
+bool_true() {
+  case "${1:-}" in
+    1|true|TRUE|True|yes|YES|Yes|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if bool_true "${USE_IAM}"; then
+  USE_IAM="true"
+else
+  USE_IAM="false"
+fi
+
+if [[ "${K8S_CLUSTER}" != "kind" && "${K8S_CLUSTER}" != "eks" ]]; then
+  printf '[%s] [iceberg][FATAL] unsupported K8S_CLUSTER=%s (expected kind or eks)\n' \
+    "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${K8S_CLUSTER}" >&2
+  exit 1
+fi
+
+if [[ "${K8S_CLUSTER}" == "kind" && "${USE_IAM}" == "true" ]]; then
+  printf '[%s] [iceberg][FATAL] USE_IAM=true requires K8S_CLUSTER=eks\n' \
+    "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >&2
+  exit 1
+fi
+
+if [[ "${USE_IAM}" == "true" ]]; then
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN || true
+fi
 
 # Pinned working image that already includes the PostgreSQL JDBC driver.
 IMAGE="${IMAGE:-ghcr.io/athithya-sakthivel/iceberg-rest:2026-04-03-20-08--861d47a@sha256:0fde6e09b4dd16c0f08165517a604d59dc0538d1b868275a46c1bf5d9b5f1bcc}"
@@ -26,9 +76,14 @@ S3_BUCKET="${S3_BUCKET:-e2e-mlops-data-681802563986}"
 S3_PREFIX="${S3_PREFIX:-iceberg/warehouse}"
 S3_ENDPOINT="${S3_ENDPOINT:-}"
 S3_PATH_STYLE_ACCESS="${S3_PATH_STYLE_ACCESS:-false}"
+
+# Static AWS credentials are required only when USE_IAM=false.
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
 AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}"
+
+# EKS IAM role required only when USE_IAM=true.
+IAM_ROLE_ARN="${IAM_ROLE_ARN:-}"
 
 # PostgreSQL / CNPG defaults
 POSTGRES_NAMESPACE="${POSTGRES_NAMESPACE:-default}"
@@ -41,6 +96,7 @@ POSTGRES_PASSWORD_KEY="${POSTGRES_PASSWORD_KEY:-password}"
 
 READY_TIMEOUT="${READY_TIMEOUT:-600}"
 VALIDATE_SCRIPT="${VALIDATE_SCRIPT:-src/tests/elt/iceberg_server_validate.sh}"
+ENABLE_PDB="${ENABLE_PDB:-true}"
 
 log() {
   printf '[%s] [iceberg] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
@@ -49,6 +105,14 @@ log() {
 fatal() {
   printf '[%s] [iceberg][FATAL] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
   exit 1
+}
+
+is_iam_mode() {
+  [[ "${USE_IAM}" == "true" ]]
+}
+
+is_static_mode() {
+  [[ "${USE_IAM}" == "false" ]]
 }
 
 # --- Prerequisites ------------------------------------------------------------
@@ -160,32 +224,24 @@ require_postgres_secret() {
   [[ -n "${password_b64}" ]] || fatal "secret ${POSTGRES_SECRET_NAME} missing key ${POSTGRES_PASSWORD_KEY}"
 }
 
-# --- K8s Resource Management --------------------------------------------------
-
-apply_secret() {
-  if [[ -z "${AWS_ACCESS_KEY_ID}" || -z "${AWS_SECRET_ACCESS_KEY}" ]]; then
-    fatal "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required"
+render_scheduling_block() {
+  if [[ "${K8S_CLUSTER}" == "eks" ]]; then
+    cat <<'EOF'
+      nodeSelector:
+        node-type: general
+      tolerations:
+      - key: node-type
+        operator: Equal
+        value: general
+        effect: NoSchedule
+EOF
   fi
-
-  log "creating/updating AWS storage secret ${SECRET_NAME}"
-
-  local args=(
-    kubectl -n "${TARGET_NS}" create secret generic "${SECRET_NAME}"
-    --dry-run=client
-    -o yaml
-    --from-literal=AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
-    --from-literal=AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
-  )
-
-  if [[ -n "${AWS_SESSION_TOKEN}" ]]; then
-    args+=(--from-literal=AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN}")
-  fi
-
-  "${args[@]}" | kubectl -n "${TARGET_NS}" apply -f - >/dev/null
 }
 
 render_serviceaccount() {
-  cat > "${MANIFEST_DIR}/serviceaccount.yaml" <<EOF
+  if is_iam_mode; then
+    [[ -n "${IAM_ROLE_ARN}" ]] || fatal "IAM_ROLE_ARN is required when USE_IAM=true"
+    cat > "${MANIFEST_DIR}/serviceaccount.yaml" <<EOF
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -193,15 +249,76 @@ metadata:
   namespace: ${TARGET_NS}
   labels:
     app.kubernetes.io/name: iceberg-rest
+  annotations:
+    eks.amazonaws.com/role-arn: ${IAM_ROLE_ARN}
 automountServiceAccountToken: true
 EOF
+  else
+    cat > "${MANIFEST_DIR}/serviceaccount.yaml" <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${SERVICE_ACCOUNT_NAME}
+  namespace: ${TARGET_NS}
+  labels:
+    app.kubernetes.io/name: iceberg-rest
+automountServiceAccountToken: false
+EOF
+  fi
+}
+
+render_static_aws_env() {
+  local lines=""
+  lines+=$'        - name: AWS_ACCESS_KEY_ID\n'
+  lines+=$'          valueFrom:\n'
+  lines+=$'            secretKeyRef:\n'
+  lines+=$"              name: ${SECRET_NAME}\n"
+  lines+=$'              key: AWS_ACCESS_KEY_ID\n'
+  lines+=$'        - name: AWS_SECRET_ACCESS_KEY\n'
+  lines+=$'          valueFrom:\n'
+  lines+=$'            secretKeyRef:\n'
+  lines+=$"              name: ${SECRET_NAME}\n"
+  lines+=$'              key: AWS_SECRET_ACCESS_KEY\n'
+  if [[ -n "${AWS_SESSION_TOKEN}" ]]; then
+    lines+=$'        - name: AWS_SESSION_TOKEN\n'
+    lines+=$'          valueFrom:\n'
+    lines+=$'            secretKeyRef:\n'
+    lines+=$"              name: ${SECRET_NAME}\n"
+    lines+=$'              key: AWS_SESSION_TOKEN\n'
+  fi
+  printf '%s' "${lines}"
+}
+
+render_secret() {
+  if is_static_mode; then
+    [[ -n "${AWS_ACCESS_KEY_ID}" ]] || fatal "AWS_ACCESS_KEY_ID is required when USE_IAM=false"
+    [[ -n "${AWS_SECRET_ACCESS_KEY}" ]] || fatal "AWS_SECRET_ACCESS_KEY is required when USE_IAM=false"
+
+    log "creating/updating AWS storage secret ${SECRET_NAME}"
+
+    local args=(
+      kubectl -n "${TARGET_NS}" create secret generic "${SECRET_NAME}"
+      --dry-run=client
+      -o yaml
+      --from-literal=AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
+      --from-literal=AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+    )
+
+    if [[ -n "${AWS_SESSION_TOKEN}" ]]; then
+      args+=(--from-literal=AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN}")
+    fi
+
+    "${args[@]}" | kubectl -n "${TARGET_NS}" apply -f - >/dev/null
+  fi
 }
 
 render_deployment() {
-  local warehouse s3_endpoint jdbc_uri
+  local warehouse s3_endpoint jdbc_uri aws_env scheduling_block
   warehouse="$(warehouse_uri)"
   s3_endpoint="$(normalized_s3_endpoint)"
   jdbc_uri="$(postgres_jdbc_uri)"
+  aws_env="$(render_static_aws_env)"
+  scheduling_block="$(render_scheduling_block)"
 
   cat > "${MANIFEST_DIR}/deployment.yaml" <<EOF
 apiVersion: apps/v1
@@ -227,6 +344,7 @@ spec:
         ${ANNOTATION_KEY}: "pending"
     spec:
       serviceAccountName: ${SERVICE_ACCOUNT_NAME}
+$(printf '%s\n' "${scheduling_block}")
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -251,22 +369,6 @@ spec:
           value: "${AWS_REGION}"
         - name: AWS_EC2_METADATA_DISABLED
           value: "true"
-        - name: AWS_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef:
-              name: ${SECRET_NAME}
-              key: AWS_ACCESS_KEY_ID
-        - name: AWS_SECRET_ACCESS_KEY
-          valueFrom:
-            secretKeyRef:
-              name: ${SECRET_NAME}
-              key: AWS_SECRET_ACCESS_KEY
-        - name: AWS_SESSION_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: ${SECRET_NAME}
-              key: AWS_SESSION_TOKEN
-              optional: true
         - name: CATALOG_URI
           value: "${jdbc_uri}"
         - name: CATALOG_JDBC_USER
@@ -293,6 +395,7 @@ spec:
           value: "/tmp"
         - name: TMPDIR
           value: "/tmp"
+$(if is_static_mode; then printf '%s\n' "${aws_env}"; fi)
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -355,15 +458,48 @@ spec:
 EOF
 }
 
+render_pdb() {
+  if bool_true "${ENABLE_PDB}"; then
+    cat > "${MANIFEST_DIR}/pdb.yaml" <<EOF
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ${PDB_NAME}
+  namespace: ${TARGET_NS}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ${DEPLOYMENT_NAME}
+EOF
+  else
+    rm -f "${MANIFEST_DIR}/pdb.yaml" || true
+  fi
+}
+
 compute_manifests_hash() {
-  local tmp
+  local tmp files=()
   tmp="$(mktemp)"
-  cat \
-    "${MANIFEST_DIR}/serviceaccount.yaml" \
-    "${MANIFEST_DIR}/deployment.yaml" \
-    "${MANIFEST_DIR}/service.yaml" > "${tmp}"
-  printf '%s\n' "$(secret_fingerprint)" >> "${tmp}"
+  files+=("${MANIFEST_DIR}/serviceaccount.yaml")
+  files+=("${MANIFEST_DIR}/deployment.yaml")
+  files+=("${MANIFEST_DIR}/service.yaml")
+  if [[ -f "${MANIFEST_DIR}/pdb.yaml" ]]; then
+    files+=("${MANIFEST_DIR}/pdb.yaml")
+  fi
+  cat "${files[@]}" > "${tmp}"
+
+  printf '\nK8S_CLUSTER=%s\nUSE_IAM=%s\n' "${K8S_CLUSTER}" "${USE_IAM}" >> "${tmp}"
+  printf 'AWS_REGION=%s\nS3_BUCKET=%s\nS3_PREFIX=%s\nS3_ENDPOINT=%s\nS3_PATH_STYLE_ACCESS=%s\n' \
+    "${AWS_REGION}" "${S3_BUCKET}" "${S3_PREFIX}" "${S3_ENDPOINT}" "${S3_PATH_STYLE_ACCESS}" >> "${tmp}"
+
+  if is_static_mode; then
+    printf '%s\n' "$(secret_fingerprint)" >> "${tmp}"
+  fi
   printf '%s\n' "$(postgres_secret_fingerprint)" >> "${tmp}"
+  if is_iam_mode; then
+    printf 'IAM_ROLE_ARN=%s\n' "${IAM_ROLE_ARN}" >> "${tmp}"
+  fi
+
   sha256sum "${tmp}" | awk '{print $1}'
   rm -f "${tmp}"
 }
@@ -385,6 +521,9 @@ apply_manifests() {
   kubectl -n "${TARGET_NS}" apply -f "${MANIFEST_DIR}/serviceaccount.yaml" >/dev/null
   kubectl -n "${TARGET_NS}" apply -f "${MANIFEST_DIR}/deployment.yaml" >/dev/null
   kubectl -n "${TARGET_NS}" apply -f "${MANIFEST_DIR}/service.yaml" >/dev/null
+  if [[ -f "${MANIFEST_DIR}/pdb.yaml" ]]; then
+    kubectl -n "${TARGET_NS}" apply -f "${MANIFEST_DIR}/pdb.yaml" >/dev/null
+  fi
 
   kubectl -n "${TARGET_NS}" patch deployment "${DEPLOYMENT_NAME}" --type=merge \
     -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"${ANNOTATION_KEY}\":\"${hash}\"}}}}}" >/dev/null
@@ -439,6 +578,8 @@ rollout() {
 
   log "starting iceberg rollout"
   log "namespace=${TARGET_NS}"
+  log "cluster=${K8S_CLUSTER}"
+  log "use_iam=${USE_IAM}"
   log "image=${IMAGE}"
   log "rest_url=$(rest_base_url)"
   log "warehouse=$(warehouse_uri)"
@@ -453,10 +594,11 @@ rollout() {
   log "postgres_secret_name=${POSTGRES_SECRET_NAME}"
   log "validate=${run_validate}"
 
-  apply_secret
   render_serviceaccount
+  render_secret
   render_deployment
   render_service
+  render_pdb
   apply_manifests
   wait_for_deployment_ready
 
@@ -483,10 +625,12 @@ delete_all() {
   kubectl -n "${TARGET_NS}" delete svc "${SERVICE_NAME}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "${TARGET_NS}" delete sa "${SERVICE_ACCOUNT_NAME}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "${TARGET_NS}" delete secret "${SECRET_NAME}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "${TARGET_NS}" delete pdb "${PDB_NAME}" --ignore-not-found >/dev/null 2>&1 || true
   rm -f \
     "${MANIFEST_DIR}/serviceaccount.yaml" \
     "${MANIFEST_DIR}/deployment.yaml" \
-    "${MANIFEST_DIR}/service.yaml" || true
+    "${MANIFEST_DIR}/service.yaml" \
+    "${MANIFEST_DIR}/pdb.yaml" || true
   log "deleted iceberg resources; data in object storage preserved"
 }
 
@@ -499,10 +643,15 @@ Options:
   --delete                 Remove all Iceberg resources
   --help, -h               Show this help message
 
+Environment:
+  K8S_CLUSTER=kind|eks
+  USE_IAM=true|false
+  IAM_ROLE_ARN=<arn>      Required when USE_IAM=true
+  ENABLE_PDB=true|false
+
 Examples:
-  $0 --rollout                    # Deploy without validation
-  $0 --rollout --validate         # Deploy and run validation
-  $0 --delete                     # Clean up resources
+  K8S_CLUSTER=kind USE_IAM=false $0 --rollout
+  K8S_CLUSTER=eks USE_IAM=true IAM_ROLE_ARN=arn:aws:iam::123456789012:role/iceberg-s3 $0 --rollout --validate
 EOF
 }
 
