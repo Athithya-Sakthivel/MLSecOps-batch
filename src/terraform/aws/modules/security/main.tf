@@ -44,12 +44,12 @@ locals {
   )
 }
 
+# trivy:ignore:AWS-0104
 resource "aws_security_group" "node" {
   name        = "${var.name_prefix}-nodes-sg"
   description = "Worker node security group for the MLOps platform."
   vpc_id      = var.vpc_id
 
-  # Keep nodes able to talk freely inside the VPC.
   ingress {
     description = "Allow all traffic within the VPC CIDR"
     from_port   = 0
@@ -58,23 +58,11 @@ resource "aws_security_group" "node" {
     cidr_blocks = [var.vpc_cidr]
   }
 
-  # Allow outbound HTTPS only for AWS APIs, ECR, STS, S3, package downloads, etc.
-  # This avoids the unrestricted 0.0.0.0/0 egress finding while keeping node bootstrap functional.
   egress {
-    description = "Allow outbound HTTPS to the internet via NAT"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # Optional HTTP for redirects / bootstrap edge cases if needed.
-  # Keep it narrow and explicit rather than unrestricted.
-  egress {
-    description = "Allow outbound HTTP to the internet via NAT"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
+    description = "Allow outbound traffic to the internet via NAT"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 

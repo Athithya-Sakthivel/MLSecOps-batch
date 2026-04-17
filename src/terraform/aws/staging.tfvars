@@ -162,11 +162,11 @@ ecr_repositories = {
 }
 
 cluster_autoscaler = {
-  enabled                    = true
-  scan_interval_seconds      = 10
-  max_node_provision_time    = 600
-  expander                   = "least-waste"
-  balance_similar_nodegroups = true
+  enabled                     = true
+  scan_interval_seconds       = 10
+  max_node_provision_time     = 600
+  expander                    = "least-waste"
+  balance_similar_nodegroups  = true
 }
 
 tags = {
