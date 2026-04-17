@@ -23,3 +23,4 @@ CVE-2024-47561 # shaded Avro in Hadoop; only relevant if untrusted schema/data i
 CVE-2019-10172 # Jackson 1.x (Codehaus) XXE/deserialization; no usage with untrusted XML/inputs
 CVE-2019-10202 # Jackson 1.x deserialization issue; no untrusted data binding path
 CVE-2022-46337 # Apache Derby LDAP auth issue; not applicable (Derby/LDAP auth not used)
+AWS-0132 # Ignores the “bucket does not encrypt data with a customer managed key” rule.
