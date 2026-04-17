@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Predict</title>
+
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-50 min-h-screen">
+
+  <!-- Header -->
+  <div class="bg-white border-b px-6 py-3 flex justify-between items-center">
+    <h1 class="text-lg font-semibold">Prediction</h1>
+
+    <a href="https://auth.api.example.com/logout"
+       class="text-sm text-red-600 hover:underline">
+      Logout
+    </a>
+  </div>
+
+  <!-- Main -->
+  <div class="max-w-3xl mx-auto p-6 space-y-6">
+
+    <!-- Input -->
+    <div class="bg-white p-4 rounded shadow-sm">
+      <h2 class="text-sm font-medium mb-2 text-gray-700">Input JSON</h2>
+
+      <form
+        hx-post="https://predict.api.example.com/predict"
+        hx-target="#result"
+        hx-swap="innerHTML">
+
+        <textarea name="instances"
+          class="w-full border rounded p-3 font-mono text-sm"
+          rows="10"
+          placeholder='[{"feature1": 1.2, "feature2": 3.4}]'></textarea>
+
+        <button
+          type="submit"
+          class="mt-3 bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700">
+          Predict
+        </button>
+      </form>
+    </div>
+
+    <!-- Result -->
+    <div class="bg-white p-4 rounded shadow-sm">
+      <h2 class="text-sm font-medium mb-2 text-gray-700">Result</h2>
+      <div id="result" class="font-mono text-sm text-gray-800 whitespace-pre-wrap"></div>
+    </div>
+
+  </div>
+
+</body>
+</html>

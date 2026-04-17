@@ -9,6 +9,7 @@ terraform {
 module "vpc" {
   source = "./modules/vpc"
 
+  cluster_name         = var.cluster_name
   vpc_cidr             = var.vpc_cidr
   az_count             = var.az_count
   private_subnet_cidrs = var.private_subnet_cidrs
@@ -41,6 +42,13 @@ module "iam_pre_eks" {
   tags        = var.tags
 }
 
+module "s3" {
+  source = "./modules/s3"
+
+  buckets = var.s3_buckets
+  tags    = var.tags
+}
+
 module "eks" {
   source = "./modules/eks"
 
@@ -50,9 +58,8 @@ module "eks" {
   vpc_id                 = module.vpc.vpc_id
   subnet_ids             = module.vpc.private_subnet_ids
   node_security_group_id = module.security.node_security_group_id
-
-  cluster_role_arn = module.iam_pre_eks.cluster_role_arn
-  node_role_arn    = module.iam_pre_eks.node_role_arn
+  cluster_role_arn       = module.iam_pre_eks.cluster_role_arn
+  node_role_arn          = module.iam_pre_eks.node_role_arn
 
   system_nodegroup      = var.system_nodegroup
   workloads_nodegroup   = var.workloads_nodegroup
@@ -69,16 +76,8 @@ module "eks" {
   depends_on = [
     module.vpc,
     module.security,
-    module.ecr,
     module.iam_pre_eks
   ]
-}
-
-module "s3" {
-  source = "./modules/s3"
-
-  buckets = var.s3_buckets
-  tags    = var.tags
 }
 
 module "iam_post_eks" {

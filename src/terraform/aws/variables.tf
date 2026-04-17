@@ -1,8 +1,6 @@
 // src/terraform/aws/variables.tf
 // Root-level contract for the MLOps platform.
 // Finalized for OpenTofu/Terraform 1.x compatibility.
-// Includes fixes for undeclared tfvars warnings (cluster_autoscaler)
-// and stronger validations without introducing provider-specific bugs.
 
 variable "region" {
   description = "AWS region where resources will be created."
@@ -52,7 +50,7 @@ variable "az_count" {
 variable "private_subnet_cidrs" {
   description = "Private subnet CIDRs. Must match az_count."
   type        = list(string)
-  default     = [
+  default = [
     "10.0.32.0/20",
     "10.0.48.0/20"
   ]
@@ -66,7 +64,7 @@ variable "private_subnet_cidrs" {
 variable "public_subnet_cidrs" {
   description = "Public subnet CIDRs. Must match az_count."
   type        = list(string)
-  default     = [
+  default = [
     "10.0.0.0/24",
     "10.0.1.0/24"
   ]
@@ -202,17 +200,37 @@ variable "workloads_node_taints" {
 }
 
 ###############################################################################
-# AUTOSCALER (FIXES WARNING FROM staging.tfvars)
+# AUTOSCALER
 ###############################################################################
 
 variable "cluster_autoscaler" {
   description = "Cluster Autoscaler feature configuration."
   type = object({
-    enabled = optional(bool, true)
+    enabled                    = bool
+    scan_interval_seconds      = number
+    max_node_provision_time    = number
+    expander                   = string
+    balance_similar_nodegroups = bool
   })
 
   default = {
-    enabled = true
+    enabled                    = true
+    scan_interval_seconds      = 10
+    max_node_provision_time    = 600
+    expander                   = "least-waste"
+    balance_similar_nodegroups = true
+  }
+
+  validation {
+    condition = (
+      var.cluster_autoscaler.scan_interval_seconds > 0 &&
+      var.cluster_autoscaler.max_node_provision_time > 0 &&
+      contains(
+        ["least-waste", "most-pods", "random"],
+        var.cluster_autoscaler.expander
+      )
+    )
+    error_message = "cluster_autoscaler must use positive timing values and a valid expander."
   }
 }
 
@@ -301,7 +319,7 @@ variable "irsa_roles" {
 
   validation {
     condition = alltrue([
-      for k, v in var.irsa_roles :
+      for _, v in var.irsa_roles :
       length(trimspace(v.namespace)) > 0 &&
       length(trimspace(v.service_account)) > 0 &&
       length(trimspace(v.bucket_key)) > 0 &&
@@ -345,12 +363,13 @@ variable "github_actions_roles" {
 
   validation {
     condition = alltrue([
-      for k, v in var.github_actions_roles :
+      for _, v in var.github_actions_roles :
       length(trimspace(v.repository)) > 0 &&
       length(trimspace(v.branch)) > 0 &&
-      length(trimspace(v.role_name)) > 0
+      length(trimspace(v.role_name)) > 0 &&
+      can(regex("^[a-z0-9._-]+/[a-z0-9._-]+$", v.repository))
     ])
-    error_message = "github_actions_roles entries must define repository, branch, and role_name."
+    error_message = "github_actions_roles entries must define lowercase repository as owner/repo, branch, and role_name."
   }
 }
 
@@ -384,11 +403,13 @@ variable "ecr_repositories" {
 
   validation {
     condition = alltrue([
-      for k, v in var.ecr_repositories :
+      for _, v in var.ecr_repositories :
       length(trimspace(v.name)) > 0 &&
-      v.retain_last_images > 0
+      v.retain_last_images > 0 &&
+      contains(["IMMUTABLE"], upper(v.image_tag_mutability)) &&
+      contains(["AES256"], upper(v.encryption_type))
     ])
-    error_message = "Each ecr_repositories entry must define name and retain_last_images > 0."
+    error_message = "Each ecr_repositories entry must define name, immutable tags, AES256 encryption, and retain_last_images > 0."
   }
 }
 

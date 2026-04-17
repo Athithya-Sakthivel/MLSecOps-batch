@@ -85,9 +85,7 @@ variable "github_actions_roles" {
 }
 
 data "aws_partition" "current" {}
-
 data "aws_caller_identity" "current" {}
-
 data "aws_region" "current" {}
 
 locals {
@@ -122,8 +120,6 @@ locals {
     k => "${v.role_name}-policy"
   }
 
-  // Explicit ECR repository names for the CI identities.
-  // This avoids deriving the ECR repo name from the GitHub repo path.
   github_ecr_repository_names = {
     flyte_elt_task            = "flyte-elt-task"
     flyte_train_task          = "flyte-train-task"
@@ -287,7 +283,7 @@ data "aws_iam_policy_document" "github_ecr_push" {
     ]
 
     resources = [
-      "arn:${data.aws_partition.current.partition}:ecr:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:repository/${local.github_ecr_repository_names[each.key]}"
+      "arn:${data.aws_partition.current.partition}:ecr:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:repository/${local.github_ecr_repository_names[each.key]}"
     ]
   }
 }

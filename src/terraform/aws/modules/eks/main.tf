@@ -12,12 +12,6 @@
 // - EKS cluster security group
 // - worker node security group attached through launch template
 // - nodegroup -> control-plane ingress rule on TCP/443
-//
-// References from current provider/docs:
-// - EKS managed node groups are always deployed with a launch template.
-// - If you specify custom security groups in the launch template, EKS does
-//   not add the cluster security group automatically.
-// - Launch templates can specify vpc_security_group_ids.
 
 variable "cluster_name" {
   description = "EKS cluster name."
@@ -180,7 +174,7 @@ data "aws_iam_policy_document" "eks_secrets_encryption" {
     actions = ["kms:*"]
 
     principals {
-      type        = "AWS"
+      type = "AWS"
       identifiers = [
         "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"
       ]
@@ -287,10 +281,19 @@ resource "aws_security_group_rule" "allow_nodes_to_control_plane" {
 }
 
 resource "aws_launch_template" "nodes" {
-  name_prefix   = "${var.cluster_name}-nodes-"
-  update_default_version = true
+  name_prefix             = "${var.cluster_name}-nodes-"
+  update_default_version  = true
+  disable_api_termination = false
 
-  vpc_security_group_ids = [var.node_security_group_id]
+  network_interfaces {
+    associate_public_ip_address = false
+    delete_on_termination       = true
+    device_index                = 0
+    security_groups = [
+      var.node_security_group_id,
+      aws_eks_cluster.this.vpc_config[0].cluster_security_group_id
+    ]
+  }
 
   metadata_options {
     http_endpoint               = "enabled"

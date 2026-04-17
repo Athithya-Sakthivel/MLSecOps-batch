@@ -1,3 +1,4 @@
+# src/terraform/aws/staging.tfvars
 environment  = "staging"
 region       = "ap-south-1"
 cluster_name = "mlsecops-eks-staging"
@@ -59,19 +60,19 @@ workloads_node_labels = {
 
 s3_buckets = {
   S3_BUCKET = {
-    name          = "mlops-staging-data"
+    name          = "mlops-staging-data-681802563986"
     versioning    = true
     force_destroy = false
   }
 
   PG_BACKUPS_S3_BUCKET = {
-    name          = "mlops-staging-pg-backups"
+    name          = "mlops-staging-pg-backups-681802563986"
     versioning    = true
     force_destroy = false
   }
 
   MLFLOW_S3_BUCKET = {
-    name          = "mlops-staging-mlflow"
+    name          = "mlops-staging-mlflow-681802563986"
     versioning    = true
     force_destroy = false
   }

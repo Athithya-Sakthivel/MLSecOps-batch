@@ -5,20 +5,21 @@
 #  - --create    : init backend, fmt/validate (auto-fix), plan, then apply -auto-approve (fully automated)
 #  - --destroy   : init backend, then destroy (destructive; requires --yes-delete)
 #  - --validate  : init backend and validate backend / prereqs
-#  - --find-version / --rollback-state <versionId> : state management helpers
+#  - --find-version / --rollback-state <versionId> : state management helpers. VersionID is created only if a create is successful e2e. 
 #
 # Usage:
 #   bash src/terraform/aws/run.sh --plan  --env staging
 #   bash src/terraform/aws/run.sh --create --env staging
 #   bash src/terraform/aws/run.sh --destroy --env staging --yes-delete
-#
+#   bash src/terraform/aws/run.sh --env staging --find-version
+# 
 # Notes / invariants:
 #  - AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION is used (fallback ap-south-1).
 #  - Script does NOT commit formatted changes to git; it only auto-formats files in-place.
 #  - State bucket is versioned (ENABLED) and encrypted (AES256).
 #  - DynamoDB lock table exists and is ACTIVE.
 #  - Script exits non-zero on any infrastructure mutation failure.
-#
+
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
@@ -312,33 +313,49 @@ destroy_auto() {
   fi
 }
 
+
 list_state_versions() {
   local bucket="$1"
   local key="$2"
-  aws s3api list-object-versions --bucket "$bucket" --prefix "$key" --output json 2>/dev/null | \
-    python3 - "$key" <<'PY'
-import json,sys
-data=sys.stdin.read()
-key=sys.argv[1]
+
+  local json
+  if ! json="$(aws s3api list-object-versions \
+      --bucket "$bucket" \
+      --prefix "$key" \
+      --output json 2>/dev/null)"; then
+    echo "ERROR: unable to list versions for key: $key in bucket: $bucket" >&2
+    return 1
+  fi
+
+  python3 -c '
+import json
+import sys
+
+key = sys.argv[1]
+
 try:
-  r=json.loads(data or "{}")
+    data = json.load(sys.stdin)
 except Exception:
-  print("No versions found or error listing versions for:", key)
-  sys.exit(0)
-rows=[]
-for v in r.get("Versions",[]):
-  if v.get("Key")==key:
-    rows.append((v.get("VersionId"), v.get("LastModified"), "Version"))
-for d in r.get("DeleteMarkers",[]):
-  if d.get("Key")==key:
-    rows.append((d.get("VersionId"), d.get("LastModified"), "DeleteMarker"))
+    print(f"No versions found or error listing versions for: {key}")
+    sys.exit(0)
+
+rows = []
+for v in data.get("Versions", []):
+    if v.get("Key") == key:
+        rows.append((v.get("VersionId"), v.get("LastModified"), "Version"))
+
+for d in data.get("DeleteMarkers", []):
+    if d.get("Key") == key:
+        rows.append((d.get("VersionId"), d.get("LastModified"), "DeleteMarker"))
+
 if not rows:
-  print("No versions found for key:", key)
-  sys.exit(0)
-print(f"{'VersionId':<36}  {'LastModified':<30}  {'info'}")
-for ver,lm,info in rows:
-  print(f"{ver:<36}  {lm:<30}  {info}")
-PY
+    print(f"No versions found for key: {key}")
+    sys.exit(0)
+
+print("{:<36}  {:<30}  {}".format("VersionId", "LastModified", "info"))
+for ver, lm, info in rows:
+    print("{:<36}  {:<30}  {}".format(ver or "", str(lm or ""), info))
+' "$key" <<<"$json"
 }
 
 rollback_state_version() {

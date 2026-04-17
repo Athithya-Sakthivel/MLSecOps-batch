@@ -3,13 +3,12 @@
 //
 // Responsibilities:
 // - create repositories from root-provided input
-// - enforce immutable tags by default
+// - enforce immutable tags
 // - enable scan-on-push by default
 // - enforce AES256 encryption by default
 // - attach exactly one lifecycle policy per repository
 //
-// This module is production-owned, not optional, and must remain tfvars-driven.
-// It must not contain AgentOps-specific names.
+// This module is production-owned, tfvars-driven, and contains no AgentOps names.
 
 variable "repositories" {
   description = "Map of logical repository key -> repository configuration."
@@ -23,11 +22,14 @@ variable "repositories" {
 
   validation {
     condition = alltrue([
-      for k, v in var.repositories :
-      length(v.name) > 0 &&
-      v.retain_last_images > 0
+      for _, v in var.repositories :
+      length(trimspace(v.name)) > 0 &&
+      v.retain_last_images > 0 &&
+      try(upper(v.image_tag_mutability), "IMMUTABLE") == "IMMUTABLE" &&
+      try(v.scan_on_push, true) == true &&
+      try(upper(v.encryption_type), "AES256") == "AES256"
     ])
-    error_message = "Each repositories entry must define a non-empty name and retain_last_images > 0."
+    error_message = "Each repositories entry must define a non-empty name, retain_last_images > 0, immutable tags, scan_on_push = true, and AES256 encryption."
   }
 }
 
@@ -52,15 +54,17 @@ locals {
 resource "aws_ecr_repository" "this" {
   for_each = var.repositories
 
-  name                 = each.value.name
-  image_tag_mutability = each.value.image_tag_mutability
+  name = each.value.name
+
+  # Hard-enforced for supply-chain security.
+  image_tag_mutability = "IMMUTABLE"
 
   image_scanning_configuration {
-    scan_on_push = each.value.scan_on_push
+    scan_on_push = try(each.value.scan_on_push, true)
   }
 
   encryption_configuration {
-    encryption_type = each.value.encryption_type
+    encryption_type = try(each.value.encryption_type, "AES256")
   }
 
   tags = merge(local.common_tags, {

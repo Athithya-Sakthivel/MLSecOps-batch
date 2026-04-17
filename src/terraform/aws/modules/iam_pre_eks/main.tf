@@ -5,12 +5,11 @@
 // - EKS control plane role
 // - EKS node role
 // - Cluster Autoscaler policy
-// - CI ECR push policy (kept here only for legacy/backward compatibility)
+// - CI ECR push policy (legacy/backward compatibility)
 // - EBS CSI managed policy ARN output
 //
-// Node bootstrap fix:
-// - the worker node role now includes AmazonEC2ContainerRegistryPullOnly,
-//   which is required for managed EKS nodes to pull images and complete bootstrap.
+// The worker node role includes AmazonEC2ContainerRegistryPullOnly so managed
+// nodes can bootstrap and pull images successfully.
 
 variable "name_prefix" {
   description = "Prefix used for IAM role and policy names."

@@ -1,11 +1,18 @@
 // src/terraform/aws/modules/vpc/main.tf
 // Multi-AZ VPC module for the MLOps platform.
-// Design goals:
+//
+// Goals:
 // - private subnets for worker nodes
 // - public subnets only for NAT gateways
 // - one NAT gateway per AZ by default
 // - deterministic AZ selection
+// - subnet tags required by EKS
 // - no IPv6, no VPC endpoints, no public worker exposure
+
+variable "cluster_name" {
+  description = "EKS cluster name used for Kubernetes subnet discovery tags."
+  type        = string
+}
 
 variable "vpc_cidr" {
   description = "Primary IPv4 CIDR for the VPC."
@@ -80,6 +87,10 @@ locals {
 
   use_nat_per_az = var.enable_nat_per_az && !var.single_nat_gateway
   nat_count      = local.use_nat_per_az ? var.az_count : 1
+
+  eks_subnet_cluster_tag = {
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+  }
 }
 
 resource "aws_vpc" "this" {
@@ -107,11 +118,16 @@ resource "aws_subnet" "public" {
 
   map_public_ip_on_launch = false
 
-  tags = merge(local.common_tags, {
-    Name = "mlops-public-${local.azs[count.index]}"
-    Tier = "public"
-    AZ   = local.azs[count.index]
-  })
+  tags = merge(
+    local.common_tags,
+    local.eks_subnet_cluster_tag,
+    {
+      Name                     = "mlops-public-${local.azs[count.index]}"
+      Tier                     = "public"
+      AZ                       = local.azs[count.index]
+      "kubernetes.io/role/elb" = "1"
+    }
+  )
 }
 
 resource "aws_subnet" "private" {
@@ -123,11 +139,16 @@ resource "aws_subnet" "private" {
 
   map_public_ip_on_launch = false
 
-  tags = merge(local.common_tags, {
-    Name = "mlops-private-${local.azs[count.index]}"
-    Tier = "private"
-    AZ   = local.azs[count.index]
-  })
+  tags = merge(
+    local.common_tags,
+    local.eks_subnet_cluster_tag,
+    {
+      Name                              = "mlops-private-${local.azs[count.index]}"
+      Tier                              = "private"
+      AZ                                = local.azs[count.index]
+      "kubernetes.io/role/internal-elb" = "1"
+    }
+  )
 }
 
 resource "aws_route_table" "public" {
