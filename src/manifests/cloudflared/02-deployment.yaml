@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: cloudflared
+    app.kubernetes.io/component: tunnel
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflared
+      app.kubernetes.io/component: tunnel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudflared
+        app.kubernetes.io/component: tunnel
+      annotations:
+        cloudflared/config-checksum: 02c41345c72df6e09aa714439e4af40afa5299e4b024f03ff0d269d1302886b0
+    spec:
+      serviceAccountName: cloudflared-sa
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        sysctls:
+        - name: net.ipv4.ping_group_range
+          value: 65532 65532
+      containers:
+      - name: cloudflared
+        image: cloudflare/cloudflared:2026.3.0
+        imagePullPolicy: IfNotPresent
+        command:
+        - cloudflared
+        args:
+        - tunnel
+        - --no-autoupdate
+        - --loglevel
+        - info
+        - --protocol
+        - http2
+        - --metrics
+        - 0.0.0.0:2000
+        - run
+        env:
+        - name: TUNNEL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: cloudflared-token
+              key: token
+        ports:
+        - name: metrics
+          containerPort: 2000
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 2000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: 2000
+          initialDelaySeconds: 15
+          periodSeconds: 15
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          capabilities:
+            drop:
+            - ALL

@@ -24,6 +24,12 @@ variable "domain" {
   type = string
 }
 
+variable "tunnel_name" {
+  description = "Cloudflare Tunnel name used by the downstream tunneling agent"
+  type        = string
+  default     = "tabular-api-tunnel"
+}
+
 variable "pages_project_name" {
   type    = string
   default = "tabular-ui"
@@ -74,7 +80,7 @@ variable "rate_limit_action" {
 
 variable "rate_limit_requests" {
   type    = number
-  default = 60
+  default = 10
 
   validation {
     condition     = var.rate_limit_requests > 0
@@ -143,8 +149,6 @@ resource "cloudflare_dns_record" "frontend_cname" {
   content = cloudflare_pages_project.frontend.subdomain
   proxied = true
   ttl     = 1
-
-  depends_on = [cloudflare_pages_project.frontend]
 }
 
 resource "cloudflare_pages_domain" "frontend_domain" {
@@ -198,6 +202,20 @@ resource "cloudflare_ruleset" "zone_rate_limit" {
   ]
 }
 
+data "cloudflare_zero_trust_tunnel_cloudflared" "api" {
+  account_id = var.account_id
+
+  filter = {
+    name       = var.tunnel_name
+    is_deleted = false
+  }
+}
+
+data "cloudflare_zero_trust_tunnel_cloudflared_token" "api" {
+  account_id = var.account_id
+  tunnel_id  = data.cloudflare_zero_trust_tunnel_cloudflared.api.id
+}
+
 output "frontend_url" {
   value = "https://${local.app_hostname}"
 }
@@ -212,4 +230,17 @@ output "predict_url" {
 
 output "pages_project_name" {
   value = cloudflare_pages_project.frontend.name
+}
+
+output "cloudflare_tunnel_id" {
+  value = data.cloudflare_zero_trust_tunnel_cloudflared.api.id
+}
+
+output "cloudflare_tunnel_name" {
+  value = data.cloudflare_zero_trust_tunnel_cloudflared.api.name
+}
+
+output "cloudflare_tunnel_token" {
+  value     = data.cloudflare_zero_trust_tunnel_cloudflared_token.api.token
+  sensitive = true
 }

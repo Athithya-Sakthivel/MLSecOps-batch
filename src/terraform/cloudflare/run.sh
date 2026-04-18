@@ -227,7 +227,7 @@ import_if_exists() {
   local addr="$1"
   local import_id="$2"
 
-  if state_has "${addr}"; then
+  if "$TF_BIN" -chdir="${STACK_DIR}" state show "${addr}" >/dev/null 2>&1; then
     return 0
   fi
 
@@ -262,15 +262,35 @@ import_frontend_dns_if_exists() {
   fi
 }
 
+
 import_ruleset_if_exists() {
   local addr="$1"
   local name="$2"
   local phase="$3"
-  local rulesets_json ruleset_id
-  rulesets_json="$(cf_curl "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/rulesets")"
-  ruleset_id="$(jq -r --arg name "${name}" --arg phase "${phase}" '.result[] | select(.name == $name and .phase == $phase) | .id' <<<"${rulesets_json}" | head -n1)"
-  if [[ -n "${ruleset_id}" ]]; then
-    import_if_exists "${addr}" "${ruleset_id}"
+
+  local rulesets_json ruleset_id import_id
+
+  rulesets_json="$(
+    cf_curl "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/rulesets"
+  )"
+
+  ruleset_id="$(
+    jq -r \
+      --arg name "${name}" \
+      --arg phase "${phase}" \
+      '
+      .result[]
+      | select(.name == $name and .phase == $phase)
+      | .id
+      ' <<<"${rulesets_json}" | head -n1
+  )"
+
+  if [[ -n "${ruleset_id}" && "${ruleset_id}" != "null" ]]; then
+    # Cloudflare provider expects:
+    # zones/<zone_id>/<ruleset_id>
+    import_id="zones/${TF_VAR_zone_id}/${ruleset_id}"
+
+    import_if_exists "${addr}" "${import_id}"
   fi
 }
 

@@ -1,167 +1,413 @@
-# Cloudflare + OpenTofu Setup
+# Cloudflare Infrastructure Stack — Deployment Guide
 
-This repository uses three separate pieces:
+## Overview
 
-1. **OpenTofu** for Cloudflare Pages, DNS, WAF, and rate limiting.
-2. **`cloudflare_tunnel.sh`** for tunnel creation and tunnel DNS bindings.
-3. **Environment variables** as the single source of truth for credentials and IDs.
+This repository uses **OpenTofu** to provision and manage Cloudflare infrastructure as code. The stack is designed for repeatable deployments, Kubernetes tunnel integration, and minimal manual dashboard operations.
 
-Cloudflare’s current Terraform docs treat Pages projects, WAF custom rules, managed rules, and rate limiting as separate configurable features, and Cloudflare Tunnel is an outbound-only connection model via `cloudflared`. ([Cloudflare Docs][1])
+It manages four primary layers:
 
-## 1) Prerequisites
+1. **Frontend Delivery** via Cloudflare Pages
+2. **Backend Exposure** via Cloudflare Tunnel
+3. **Edge Security** via Firewall Rules + Rate Limiting
+4. **Automation Outputs** for downstream workloads
 
-You need:
+---
 
-* a domain you control,
-* permission to change nameservers at your registrar,
-* a Cloudflare account,
-* a GitHub repository for the frontend.
+# Architecture
 
-Example domain used in this stack:
+## Public Endpoints
+
+After deployment:
+
+| Service     | URL                                 | Purpose                 |
+| ----------- | ----------------------------------- | ----------------------- |
+| Frontend    | `https://app.athithya.site`         | Static web UI           |
+| Auth API    | `https://auth.api.athithya.site`    | Authentication backend  |
+| Predict API | `https://predict.api.athithya.site` | Inference / API backend |
+
+---
+
+## Traffic Flow
 
 ```text
-athithya.site
+Users
+  ↓
+Cloudflare Edge
+  ├── Pages → app.athithya.site
+  ├── Tunnel → auth.api.athithya.site
+  └── Tunnel → predict.api.athithya.site
 ```
 
-## 2) Add the domain to Cloudflare
+No inbound ports need to be opened on servers or Kubernetes nodes.
 
-1. Open the Cloudflare dashboard.
-2. Add your domain.
-3. Choose the plan you want to use.
-4. Cloudflare will assign two nameservers.
-5. Replace the registrar nameservers with Cloudflare’s nameservers.
-6. Wait until the zone becomes active.
+---
 
-## 3) Collect the required IDs
+# Why This Design
 
-You need:
+## Cloudflare Pages
 
-* **Account ID**: Cloudflare dashboard, visible in the account area.
-* **Zone ID**: Cloudflare dashboard → your zone → Overview.
-* **GitHub repository ID**: GitHub API lookup for the repository.
+Used for:
 
-## 4) Export environment variables
+* Static frontend hosting
+* Automatic HTTPS
+* CDN acceleration
+* GitHub-based deployments
+* Global edge delivery
 
-Use **one authentication method only**. This README uses the **Global API Key** path as the default bootstrap method.
+## Cloudflare Tunnel
+
+Used for:
+
+* Private origin services
+* Outbound-only connectivity
+* No public ingress exposure
+* Kubernetes-friendly backend publishing
+
+## OpenTofu
+
+Used for:
+
+* Infrastructure as code
+* Versioned deployments
+* Drift detection
+* Reproducible rebuilds
+* CI/CD automation
+
+---
+
+# Required Inputs
+
+| Input             | Example Value              |
+| ----------------- | ------------------ |
+| Domain            | `athithya.site`    |
+| Pages Project     | `tabular-ui`       |
+| GitHub Repository | `MLSecOps-tabular` |
+| Branch            | `main`             |
+
+---
+
+# Authentication Model
+
+Use **Cloudflare Global API Key** bootstrap authentication.
+
+Required:
+
+* Cloudflare Account ID
+* Cloudflare Email
+* Global API Key
+
+Used for:
+
+* Zone discovery
+* DNS management
+* Pages provisioning
+* Ruleset provisioning
+
+---
+
+# Canonical Environment Configuration
+
+Use one consistent export block.
 
 ```bash
 unset CLOUDFLARE_API_TOKEN
-export CLOUDFLARE_ACCOUNT_ID="4f75c52006dba7aa4096a71f1ed30223"
-export CLOUDFLARE_GLOBAL_API_KEY="your_real_global_api_key"
-export CLOUDFLARE_EMAIL="athithya651@gmail.com"
+unset CLOUDFLARE_API_KEY
+
+export CLOUDFLARE_ACCOUNT_ID="YOUR_ACCOUNT_ID"
+export CLOUDFLARE_GLOBAL_API_KEY="YOUR_GLOBAL_API_KEY"
+export CLOUDFLARE_EMAIL="YOUR_EMAIL"
 
 export TF_VAR_account_id="$CLOUDFLARE_ACCOUNT_ID"
 export TF_VAR_domain="athithya.site"
-export TF_VAR_zone_id="your_real_zone_id"
-
-export TF_VAR_tunnel_name="tabular-api-tunnel"
-
-export TF_VAR_pages_project_name="tabular-ui"
-export TF_VAR_pages_branch="main"
-export TF_VAR_pages_repo_owner="Athithya-Sakthivel"
-export TF_VAR_pages_repo_name="MLSecOps-tabular"
-export TF_VAR_pages_repo_id="1187963457"
-export TF_VAR_pages_root_dir="."
-export TF_VAR_pages_destination_dir="dist"
-
-export TF_VAR_rate_limit_enabled="true"
-export TF_VAR_rate_limit_requests="60"
-export TF_VAR_rate_limit_period="60"
-export TF_VAR_rate_limit_block_seconds="300"
-export TF_VAR_rate_limit_action="block"
-
-export GITHUB_OWNER="$TF_VAR_pages_repo_owner"
-export GITHUB_REPO="$TF_VAR_pages_repo_name"
 ```
 
-If you prefer to auto-fetch the IDs instead of setting them manually:
+---
+
+# Resolve Zone ID Automatically
 
 ```bash
-export TF_VAR_zone_id=$(curl -s \
+export TF_VAR_zone_id="$(
+curl -s \
   -H "X-Auth-Key: $CLOUDFLARE_GLOBAL_API_KEY" \
   -H "X-Auth-Email: $CLOUDFLARE_EMAIL" \
-  "https://api.cloudflare.com/client/v4/zones?name=${TF_VAR_domain}" \
-  | jq -r '.result[0].id')
+  "https://api.cloudflare.com/client/v4/zones?name=$TF_VAR_domain" \
+| jq -r '.result[0].id'
+)"
+```
 
-export TF_VAR_pages_repo_id=$(curl -s \
+---
+
+# Pages Configuration
+
+```bash
+export TF_VAR_pages_project_name="tabular-ui"
+export TF_VAR_pages_branch="main"
+export TF_VAR_pages_repo_owner="YOUR_GITHUB_OWNER"
+export TF_VAR_pages_repo_name="MLSecOps-tabular"
+export TF_VAR_pages_root_dir="."
+export TF_VAR_pages_destination_dir="dist"
+```
+
+---
+
+# Resolve GitHub Repository ID
+
+```bash
+export TF_VAR_pages_repo_id="$(
+curl -s \
   -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}" \
-  | jq -r '.id')
+  "https://api.github.com/repos/$TF_VAR_pages_repo_owner/$TF_VAR_pages_repo_name" \
+| jq -r '.id'
+)"
 ```
 
-## 5) Rate limiting variables
+---
 
-These are the rate limiting inputs used by the Terraform stack:
-
-* `TF_VAR_rate_limit_enabled`
-* `TF_VAR_rate_limit_requests`
-* `TF_VAR_rate_limit_period`
-* `TF_VAR_rate_limit_block_seconds`
-* `TF_VAR_rate_limit_action`
-
-Cloudflare’s rate limiting docs use `requests_per_period`, `period`, `action`, and `mitigation_timeout` as the core rule parameters. ([Cloudflare Docs][2])
-
-Recommended starter values:
+# Rate Limiting Configuration
 
 ```bash
+export TF_VAR_rate_limit_enabled="true"
+export TF_VAR_rate_limit_action="block"
 export TF_VAR_rate_limit_requests="60"
-export TF_VAR_rate_limit_period="60"
-export TF_VAR_rate_limit_block_seconds="300"
-export TF_VAR_rate_limit_action="block"
+export TF_VAR_rate_limit_period="10"
+export TF_VAR_rate_limit_mitigation_timeout="10"
 ```
 
-For a stricter public API:
+## Meaning
+
+| Variable           | Description       |
+| ------------------ | ----------------- |
+| requests           | Allowed requests  |
+| period             | Window in seconds |
+| action             | Response action   |
+| mitigation_timeout | Block duration    |
+
+---
+
+# Provision Infrastructure
+
+## Apply
 
 ```bash
-export TF_VAR_rate_limit_requests="30"
-export TF_VAR_rate_limit_period="60"
-export TF_VAR_rate_limit_block_seconds="600"
-export TF_VAR_rate_limit_action="block"
-```
-
-## 6) Tunnel setup
-
-The tunnel logic lives in `src/infra/security/cloudflare_tunnel.sh`. That script is responsible for:
-
-* creating or reusing the tunnel,
-* binding DNS for `auth.api.<domain>` and `predict.api.<domain>`,
-* verifying the DNS targets,
-* exporting `TUNNEL_ID` and `TUNNEL_TOKEN`.
-
-Cloudflare Tunnel uses outbound-only connections from `cloudflared`, and the local-management docs explicitly note that the CLI is useful for single-service flows while configuration files are more appropriate when you connect multiple services. ([Cloudflare Docs][3])
-
-## 7) Run provisioning
-
-```bash
-bash src/infra/security/cloudflare_tunnel.sh
-bash src/terraform/cloudflare/run.sh --plan
 bash src/terraform/cloudflare/run.sh --apply
 ```
 
-## 8) Expected result
+This performs:
 
-After a successful apply, you should have:
+1. Resolve zone / repo IDs
+2. Reuse or create tunnel
+3. Bind API DNS records
+4. Initialize OpenTofu
+5. Import existing resources if needed
+6. Apply infrastructure changes
+7. Print outputs
 
-* `app.athithya.site` pointing to Cloudflare Pages,
-* `auth.api.athithya.site` routed through the tunnel,
-* `predict.api.athithya.site` routed through the tunnel,
-* DNS managed in Cloudflare,
-* basic rate limiting enabled,
-* a deterministic OpenTofu workflow.
+---
 
-## 9) Notes on the Terraform layout
+# Resources Created
 
-The Terraform stack should keep these responsibilities separate:
+## Pages
 
-* `pages.tf` for Pages and frontend DNS,
-* `waf.tf` for WAF custom rules,
-* `rate_limit.tf` for rate limiting,
-* `providers.tf` for provider setup only,
-* `variables.tf` for inputs only,
-* `outputs.tf` for outputs only.
+* Project `tabular-ui`
+* Domain `app.athithya.site`
 
-Cloudflare’s current Pages project schema still supports `build_config` and `source.config`, and the docs mark `deployments_enabled` as deprecated in favor of `production_deployments_enabled` plus `preview_deployment_setting`. ([Cloudflare Docs][1])
+## DNS
 
-[1]: https://developers.cloudflare.com/api/terraform/resources/pages/subresources/projects/ "Projects | Cloudflare API"
-[2]: https://developers.cloudflare.com/waf/rate-limiting-rules/parameters/ "Rate limiting parameters · Cloudflare Web Application Firewall (WAF) docs"
-[3]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/ "Cloudflare Tunnel · Cloudflare One docs"
+* `app` → Pages
+* `auth.api` → Tunnel
+* `predict.api` → Tunnel
+
+## Security
+
+* Firewall rules
+* Rate limiting ruleset
+
+## Outputs
+
+* Tunnel ID
+* Tunnel Name
+* Tunnel Token
+* Frontend URL
+* API URLs
+
+---
+
+# Terraform Outputs
+
+Show outputs:
+
+```bash
+tofu -chdir=src/terraform/cloudflare output
+```
+
+Expected:
+
+```text
+frontend_url
+auth_url
+predict_url
+pages_project_name
+cloudflare_tunnel_id
+cloudflare_tunnel_name
+cloudflare_tunnel_token
+```
+
+---
+
+# Export Runtime Tunnel Variables
+
+Use the exact same variable names everywhere.
+
+```bash
+export CLOUDFLARE_TUNNEL_TOKEN="$(
+tofu -chdir=src/terraform/cloudflare output -raw cloudflare_tunnel_token
+)"
+
+export CLOUDFLARE_TUNNEL_NAME="$(
+tofu -chdir=src/terraform/cloudflare output -raw cloudflare_tunnel_name
+)"
+
+export CLOUDFLARE_SECRET_NAME="cloudflared-token"
+export CLOUDFLARE_SECRET_KEY="token"
+```
+
+---
+
+# Idempotent Operations
+
+Safe to rerun:
+
+```bash
+bash src/terraform/cloudflare/run.sh --apply
+```
+
+Behavior:
+
+* Existing resources imported if unmanaged
+* Managed resources updated only when drift exists
+* Existing tunnel reused
+* DNS corrected automatically
+
+---
+
+# Destroy Infrastructure
+
+```bash
+bash src/terraform/cloudflare/run.sh --destroy
+```
+
+Removes:
+
+* Pages project
+* Custom domain
+* DNS records
+* Firewall rules
+* Rate limits
+* Tunnel
+* Tunnel DNS routes
+
+---
+
+# Operational Best Practices
+
+## Secrets
+
+Never commit:
+
+* API keys
+* Tunnel tokens
+* Terraform state with secrets
+
+Use:
+
+* CI secret stores
+* Kubernetes Secrets
+* Vault / secret managers
+
+---
+
+# CI/CD Model
+
+```text
+git push
+  → Cloudflare Pages build
+  → OpenTofu apply
+  → Kubernetes deploy
+  → cloudflared consumes token
+```
+
+---
+
+# Drift Detection
+
+Run periodically:
+
+```bash
+bash src/terraform/cloudflare/run.sh --plan
+```
+
+Detects:
+
+* DNS changes
+* Dashboard edits
+* Ruleset drift
+* Pages config drift
+
+---
+
+# Troubleshooting
+
+## Pages Domain Pending
+
+```bash
+dig app.athithya.site
+```
+
+Usually DNS propagation.
+
+---
+
+## Tunnel Not Routing
+
+```bash
+cloudflared tunnel list
+kubectl logs <pod>
+```
+
+---
+
+## Rate Limit Validation Errors
+
+Use supported values:
+
+```bash
+period=10
+mitigation_timeout=10
+```
+
+---
+
+# Security Posture
+
+This architecture is stronger than exposing public LoadBalancers because:
+
+* No inbound ports exposed
+* TLS terminates at Cloudflare edge
+* Rate limiting at edge
+* Bot / WAF controls available
+* Private cluster services remain internal
+
+---
+
+# Summary
+
+This stack provides:
+
+* Production frontend CDN
+* Private backend exposure
+* Infrastructure as code
+* Kubernetes-ready tunnel auth
+* Deterministic rebuilds
+* Cloudflare-native security controls
+
+Suitable for production deployments and automated CI/CD workflows.
