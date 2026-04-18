@@ -44,7 +44,9 @@ updates:
     multi-ecosystem-group: "infra"
 
   - package-ecosystem: "terraform"
-    directory: "/src/terraform/aws"
+    directories:
+    - "/src/terraform/aws"
+    - "/src/terraform/cloudflare"
     schedule:
       interval: weekly
       day: tuesday

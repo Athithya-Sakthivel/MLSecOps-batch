@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 import uuid
@@ -10,11 +11,12 @@ from datetime import UTC, datetime
 from json import JSONDecodeError
 from typing import Any, ClassVar
 
+import httpx
 import numpy as np
 from config import get_settings
 from model_store import LoadedModel, load_loaded_model
 from opentelemetry import metrics, trace
-from opentelemetry.propagate import extract
+from opentelemetry.propagate import extract, inject
 from opentelemetry.trace import SpanKind, Status, StatusCode, get_current_span
 from ray import serve
 from ray.serve.handle import DeploymentHandle
@@ -31,10 +33,13 @@ INGRESS_DEPLOYMENT_NAME = SETTINGS.serve_deployment_name
 INGRESS_NUM_CPUS = 0.0
 BACKEND_NUM_CPUS = float(SETTINGS.replica_num_cpus)
 
-INGRESS_MAX_ONGOING_REQUESTS = max(SETTINGS.max_ongoing_requests, 32)
-BACKEND_MAX_ONGOING_REQUESTS = max(SETTINGS.max_ongoing_requests, SETTINGS.batch_max_size)
+INGRESS_MAX_ONGOING_REQUESTS = max(int(SETTINGS.max_ongoing_requests), 32)
+BACKEND_MAX_ONGOING_REQUESTS = max(int(SETTINGS.max_ongoing_requests), int(SETTINGS.batch_max_size))
 
 REQUEST_ID_HEADER = "X-Request-Id"
+DEFAULT_AUTH_VALIDATE_URL = "http://auth-svc.inference.svc.cluster.local:8000/me"
+AUTH_VALIDATE_URL = os.getenv("AUTH_VALIDATE_URL", DEFAULT_AUTH_VALIDATE_URL).strip() or DEFAULT_AUTH_VALIDATE_URL
+AUTH_TIMEOUT_SECONDS = float(os.getenv("AUTH_TIMEOUT_SECONDS", "2.0"))
 
 logger = logging.getLogger("tabular-inference")
 BASE_LOG_FIELDS: dict[str, Any] = {
@@ -46,7 +51,6 @@ BASE_LOG_FIELDS: dict[str, Any] = {
     "service.instance.id": SETTINGS.instance_id,
     "model.uri": SETTINGS.model_uri,
 }
-
 
 class JsonFormatter(logging.Formatter):
     _standard_attrs: ClassVar[set[str]] = {
@@ -187,6 +191,81 @@ def _autoscaling_config() -> dict[str, Any]:
         "upscale_delay_s": SETTINGS.upscale_delay_s,
         "downscale_delay_s": SETTINGS.downscale_delay_s,
     }
+
+
+def _first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text
+            continue
+        if value != "":
+            return value
+    return None
+
+
+def _merge_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    if isinstance(payload, dict):
+        merged.update(payload)
+        for key in ("user", "identity", "session"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                merged.update(nested)
+    return merged
+
+
+def _coerce_auth_context(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("authentication response must be a JSON object")
+
+    merged = _merge_auth_payload(payload)
+
+    user_id = _first_non_empty(
+        merged.get("user_id"),
+        merged.get("id"),
+        merged.get("sub"),
+        merged.get("userId"),
+    )
+    if not user_id:
+        raise ValueError("authentication response is missing a user identifier")
+
+    context = {
+        "user_id": str(user_id),
+        "session_id": _first_non_empty(
+            merged.get("session_id"),
+            merged.get("sid"),
+            merged.get("sessionId"),
+            merged.get("id"),
+        ),
+        "provider": _first_non_empty(merged.get("provider"), merged.get("auth_provider")),
+        "email": _first_non_empty(
+            merged.get("email"),
+            merged.get("primary_email"),
+            merged.get("user_email"),
+        ),
+        "name": _first_non_empty(
+            merged.get("name"),
+            merged.get("display_name"),
+            merged.get("user_name"),
+        ),
+        "expires_at": _first_non_empty(
+            merged.get("expires_at"),
+            merged.get("session_expires_at"),
+        ),
+        "raw": merged,
+    }
+    return context
+
+
+class AuthValidationError(Exception):
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
 
 
 class InferenceBackend:
@@ -401,6 +480,10 @@ class TabularInferenceApp:
         self.meter = metrics.get_meter("tabular-inference-http")
         self._telemetry = initialize_telemetry(self.settings)
         self._backend_info_cache: dict[str, Any] | None = None
+        self._auth_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(AUTH_TIMEOUT_SECONDS),
+            follow_redirects=False,
+        )
 
         self.http_request_counter = self.meter.create_counter(
             name="http.server.request_count",
@@ -433,6 +516,153 @@ class TabularInferenceApp:
 
         self._backend_info_cache = raw
         return raw
+
+    def _build_auth_headers(self, request: Request, request_id: str) -> dict[str, str]:
+        headers: dict[str, str] = {
+            "Accept": "application/json",
+            "X-Request-Id": request_id,
+        }
+        cookie = request.headers.get("cookie")
+        if cookie:
+            headers["Cookie"] = cookie
+        authorization = request.headers.get("authorization")
+        if authorization:
+            headers["Authorization"] = authorization
+        inject(headers)
+        return headers
+
+    async def _validate_auth(self, request: Request, request_id: str) -> dict[str, Any]:
+        cookie = request.headers.get("cookie")
+        authorization = request.headers.get("authorization")
+        if not cookie and not authorization:
+            raise AuthValidationError(401, "Unauthorized")
+
+        headers = self._build_auth_headers(request, request_id)
+        auth_started = time.perf_counter()
+
+        with self.tracer.start_as_current_span("auth_validation") as span:
+            span.set_attribute("http.route", _route_key(request.url.path))
+            span.set_attribute("http.method", request.method.upper())
+            span.set_attribute("request.id", request_id)
+            span.set_attribute("auth.upstream", AUTH_VALIDATE_URL)
+
+            try:
+                response = await self._auth_client.get(AUTH_VALIDATE_URL, headers=headers)
+            except asyncio.CancelledError:
+                raise
+            except httpx.TimeoutException as exc:
+                _span_error(
+                    exc,
+                    **{
+                        "request.id": request_id,
+                        "auth.upstream": AUTH_VALIDATE_URL,
+                        "error.type": "timeout",
+                    },
+                )
+                _log_exception(
+                    self.logger,
+                    "predict_auth_timeout",
+                    request_id=request_id,
+                    auth_upstream=AUTH_VALIDATE_URL,
+                )
+                raise AuthValidationError(503, "Authentication service timeout") from exc
+            except httpx.RequestError as exc:
+                _span_error(
+                    exc,
+                    **{
+                        "request.id": request_id,
+                        "auth.upstream": AUTH_VALIDATE_URL,
+                        "error.type": exc.__class__.__name__,
+                    },
+                )
+                _log_exception(
+                    self.logger,
+                    "predict_auth_unreachable",
+                    request_id=request_id,
+                    auth_upstream=AUTH_VALIDATE_URL,
+                    error_type=exc.__class__.__name__,
+                )
+                raise AuthValidationError(503, "Authentication service unavailable") from exc
+
+            elapsed_ms = (time.perf_counter() - auth_started) * 1000.0
+            span.set_attribute("auth.latency_ms", round(elapsed_ms, 3))
+            span.set_attribute("auth.status_code", response.status_code)
+
+            if response.status_code == 401 or response.status_code == 403:
+                _span_event(
+                    "predict_auth_unauthorized",
+                    request_id=request_id,
+                    auth_upstream=AUTH_VALIDATE_URL,
+                    auth_status_code=response.status_code,
+                )
+                raise AuthValidationError(401, "Unauthorized")
+
+            if response.status_code < 200 or response.status_code >= 300:
+                _span_error(
+                    RuntimeError(f"auth upstream returned {response.status_code}"),
+                    **{
+                        "request.id": request_id,
+                        "auth.upstream": AUTH_VALIDATE_URL,
+                        "auth.status_code": response.status_code,
+                        "error.type": "bad_gateway",
+                    },
+                )
+                _log(
+                    self.logger,
+                    logging.WARNING,
+                    "predict_auth_bad_gateway",
+                    request_id=request_id,
+                    auth_upstream=AUTH_VALIDATE_URL,
+                    auth_status_code=response.status_code,
+                )
+                raise AuthValidationError(502, "Authentication service returned an unexpected response")
+
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                _span_error(
+                    exc,
+                    **{
+                        "request.id": request_id,
+                        "auth.upstream": AUTH_VALIDATE_URL,
+                        "auth.status_code": response.status_code,
+                        "error.type": "invalid_json",
+                    },
+                )
+                _log_exception(
+                    self.logger,
+                    "predict_auth_invalid_json",
+                    request_id=request_id,
+                    auth_upstream=AUTH_VALIDATE_URL,
+                )
+                raise AuthValidationError(502, "Authentication service returned invalid JSON") from exc
+
+            try:
+                context = _coerce_auth_context(payload)
+            except ValueError as exc:
+                _span_error(
+                    exc,
+                    **{
+                        "request.id": request_id,
+                        "auth.upstream": AUTH_VALIDATE_URL,
+                        "error.type": "invalid_auth_payload",
+                    },
+                )
+                _log_exception(
+                    self.logger,
+                    "predict_auth_invalid_payload",
+                    request_id=request_id,
+                    auth_upstream=AUTH_VALIDATE_URL,
+                )
+                raise AuthValidationError(502, "Authentication service returned an invalid payload") from exc
+
+            span.set_attribute("user.id", context["user_id"])
+            if context.get("provider"):
+                span.set_attribute("auth.provider", context["provider"])
+            if context.get("session_id"):
+                span.set_attribute("auth.session_id", context["session_id"])
+
+            return context
 
     async def _handle_ready(self, request_id: str) -> JSONResponse:
         try:
@@ -468,16 +698,19 @@ class TabularInferenceApp:
         request_start: float,
     ) -> JSONResponse:
         try:
+            auth_context = await self._validate_auth(request, request_id)
+        except AuthValidationError as exc:
+            return _json_response({"detail": exc.detail}, exc.status_code, request_id=request_id)
+
+        try:
             payload = await request.json()
         except (JSONDecodeError, ValueError) as exc:
             _span_event(
                 "predict_invalid_json",
-                **{
-                    "http.route": "/predict",
-                    "http.method": "POST",
-                    "request.id": request_id,
-                    "error.type": exc.__class__.__name__,
-                },
+                http_route="/predict",
+                request_id=request_id,
+                error_type=exc.__class__.__name__,
+                user_id=auth_context["user_id"],
             )
             _log(
                 self.logger,
@@ -486,6 +719,7 @@ class TabularInferenceApp:
                 route="/predict",
                 request_id=request_id,
                 error_type=exc.__class__.__name__,
+                user_id=auth_context["user_id"],
             )
             return _json_response({"detail": "Invalid JSON body"}, 400, request_id=request_id)
 
@@ -505,11 +739,10 @@ class TabularInferenceApp:
             except Exception as exc:
                 _span_event(
                     "backend_unavailable",
-                    **{
-                        "http.route": "/predict",
-                        "request.id": request_id,
-                        "error.type": exc.__class__.__name__,
-                    },
+                    http_route="/predict",
+                    request_id=request_id,
+                    error_type=exc.__class__.__name__,
+                    user_id=auth_context["user_id"],
                 )
                 return _json_response(
                     {"detail": f"Backend unavailable: {exc}"},
@@ -523,6 +756,7 @@ class TabularInferenceApp:
                 span.set_attribute("model.version", backend_info["model_version"])
                 span.set_attribute("feature.count", len(backend_info["feature_order"]))
                 span.set_attribute("request.id", request_id)
+                span.set_attribute("user.id", auth_context["user_id"])
 
             feature_matrix = build_feature_matrix(
                 rows,
@@ -543,6 +777,7 @@ class TabularInferenceApp:
                         "model.name": backend_info["model_name"],
                         "model.version": backend_info["model_version"],
                         "error.type": exc.__class__.__name__,
+                        "user.id": auth_context["user_id"],
                     },
                 )
                 _log_exception(
@@ -553,6 +788,7 @@ class TabularInferenceApp:
                     model_name=backend_info["model_name"],
                     model_version=backend_info["model_version"],
                     error_type=exc.__class__.__name__,
+                    user_id=auth_context["user_id"],
                 )
                 return _json_response({"detail": "Inference failed"}, 500, request_id=request_id)
 
@@ -561,13 +797,14 @@ class TabularInferenceApp:
                 _span_event(
                     "predict_slow_request",
                     **{
-                        "http.route": "/predict",
-                        "request.id": request_id,
-                        "model.name": backend_info["model_name"],
-                        "model.version": backend_info["model_version"],
+                        "http_route": "/predict",
+                        "request_id": request_id,
+                        "model_name": backend_info["model_name"],
+                        "model_version": backend_info["model_version"],
                         "batch.size": n_instances,
                         "latency_ms": round(total_ms, 3),
                         "slow_request_threshold_ms": self.settings.slow_request_ms,
+                        "user_id": auth_context["user_id"],
                     },
                 )
                 _log(
@@ -581,6 +818,7 @@ class TabularInferenceApp:
                     n_instances=n_instances,
                     latency_ms=round(total_ms, 3),
                     slow_request_threshold_ms=self.settings.slow_request_ms,
+                    user_id=auth_context["user_id"],
                 )
 
             return _json_response(
@@ -606,12 +844,13 @@ class TabularInferenceApp:
             _span_event(
                 "predict_validation_failed",
                 **{
-                    "http.route": "/predict",
-                    "request.id": request_id,
+                    "http_route": "/predict",
+                    "request_id": request_id,
                     "model.name": model_name,
                     "model.version": model_version,
-                    "error.type": "validation_error",
-                    "error.message": str(exc),
+                    "error_type": "validation_error",
+                    "error_message": str(exc),
+                    "user_id": auth_context["user_id"],
                 },
             )
             _log(
@@ -624,6 +863,7 @@ class TabularInferenceApp:
                 model_version=model_version,
                 error_type="validation_error",
                 error_message=str(exc),
+                user_id=auth_context["user_id"],
             )
             return _json_response({"detail": str(exc)}, 422, request_id=request_id)
 
@@ -634,6 +874,7 @@ class TabularInferenceApp:
                     "http.route": "/predict",
                     "request.id": request_id,
                     "error.type": exc.__class__.__name__,
+                    "user.id": auth_context["user_id"],
                 },
             )
             _log_exception(
@@ -642,6 +883,7 @@ class TabularInferenceApp:
                 route="/predict",
                 request_id=request_id,
                 error_type=exc.__class__.__name__,
+                user_id=auth_context["user_id"],
             )
             return _json_response({"detail": "Inference failed"}, 500, request_id=request_id)
 

@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import atexit
@@ -182,12 +183,20 @@ def _require_positive_int(name: str, value: object) -> int:
 
 
 def _normalize_sampler_name(raw: str | None) -> str:
-    return (_clean_str(raw) or "parentbased_always_on").strip().lower()
+    return (_clean_str(raw) or "parentbased_traceidratio").strip().lower()
+
+
+def _trace_sample_ratio(settings: Settings) -> float:
+    if hasattr(settings, "trace_sample_ratio"):
+        return _require_ratio("trace_sample_ratio", settings.trace_sample_ratio)
+    if hasattr(settings, "otel_traces_sampler_arg"):
+        return _require_ratio("otel_traces_sampler_arg", settings.otel_traces_sampler_arg)
+    return 0.1
 
 
 def _build_sampler(settings: Settings):
-    sampler = _normalize_sampler_name(settings.otel_traces_sampler)
-    ratio = _require_ratio("trace_sample_ratio", settings.trace_sample_ratio)
+    sampler = _normalize_sampler_name(getattr(settings, "otel_traces_sampler", None))
+    ratio = _trace_sample_ratio(settings)
 
     if sampler == "always_on":
         return ALWAYS_ON
@@ -204,7 +213,7 @@ def _build_sampler(settings: Settings):
 
     raise ValueError(
         "unsupported OTEL_TRACES_SAMPLER value: "
-        f"{settings.otel_traces_sampler!r}. Supported values: "
+        f"{getattr(settings, 'otel_traces_sampler', None)!r}. Supported values: "
         "'always_on', 'always_off', 'traceidratio', "
         "'parentbased_always_on', 'parentbased_always_off', 'parentbased_traceidratio'"
     )
@@ -221,15 +230,11 @@ def _config_key(
         endpoint,
         insecure,
         tuple(sorted(resource_attrs.items())),
-        _normalize_sampler_name(settings.otel_traces_sampler),
-        _require_ratio("trace_sample_ratio", settings.trace_sample_ratio),
+        _normalize_sampler_name(getattr(settings, "otel_traces_sampler", None)),
+        _trace_sample_ratio(settings),
         _require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
-        _require_positive_int(
-            "otel_metric_export_interval_ms", settings.otel_metric_export_interval_ms
-        ),
-        _require_positive_int(
-            "otel_metric_export_timeout_ms", settings.otel_metric_export_timeout_ms
-        ),
+        _require_positive_int("otel_metric_export_interval_ms", settings.otel_metric_export_interval_ms),
+        _require_positive_int("otel_metric_export_timeout_ms", settings.otel_metric_export_timeout_ms),
         log_level_name,
     )
 
@@ -361,7 +366,7 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
     global _HANDLE, _STATE_KEY, _ATEEXIT_REGISTERED
 
     with _STATE_LOCK:
-        log_level_name = _normalize_level_name(settings.log_level)
+        log_level_name = _normalize_level_name(getattr(settings, "log_level", None))
         endpoint, insecure = _grpc_endpoint(settings.otel_endpoint)
         resource = _resource(settings)
         resource_attrs = {
@@ -397,25 +402,24 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
             endpoint=endpoint,
             insecure=insecure,
             log_level=log_level_name,
-            trace_sample_ratio=float(settings.trace_sample_ratio),
+            trace_sample_ratio=_trace_sample_ratio(settings),
             otel_timeout_seconds=float(settings.otel_timeout_seconds),
             otel_metric_export_interval_ms=int(settings.otel_metric_export_interval_ms),
             otel_metric_export_timeout_ms=int(settings.otel_metric_export_timeout_ms),
         )
 
+        tracer_provider: TracerProvider | None = None
+        meter_provider: MeterProvider | None = None
+        logger_provider: LoggerProvider | None = None
+
         try:
-            tracer_provider = TracerProvider(
-                resource=resource,
-                sampler=_build_sampler(settings),
-            )
+            tracer_provider = TracerProvider(resource=resource, sampler=_build_sampler(settings))
             tracer_provider.add_span_processor(
                 BatchSpanProcessor(
                     OTLPSpanExporter(
                         endpoint=endpoint,
                         insecure=insecure,
-                        timeout=_require_positive_number(
-                            "otel_timeout_seconds", settings.otel_timeout_seconds
-                        ),
+                        timeout=_require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
                     )
                 )
             )
@@ -430,9 +434,7 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
             metric_exporter = OTLPMetricExporter(
                 endpoint=endpoint,
                 insecure=insecure,
-                timeout=_require_positive_number(
-                    "otel_timeout_seconds", settings.otel_timeout_seconds
-                ),
+                timeout=_require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
             )
             meter_provider = MeterProvider(
                 resource=resource,
@@ -440,12 +442,10 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                     PeriodicExportingMetricReader(
                         metric_exporter,
                         export_interval_millis=_require_positive_int(
-                            "otel_metric_export_interval_ms",
-                            settings.otel_metric_export_interval_ms,
+                            "otel_metric_export_interval_ms", settings.otel_metric_export_interval_ms
                         ),
                         export_timeout_millis=_require_positive_int(
-                            "otel_metric_export_timeout_ms",
-                            settings.otel_metric_export_timeout_ms,
+                            "otel_metric_export_timeout_ms", settings.otel_metric_export_timeout_ms
                         ),
                     )
                 ],
@@ -464,9 +464,7 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                     OTLPLogExporter(
                         endpoint=endpoint,
                         insecure=insecure,
-                        timeout=_require_positive_number(
-                            "otel_timeout_seconds", settings.otel_timeout_seconds
-                        ),
+                        timeout=_require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
                     )
                 )
             )
@@ -482,11 +480,7 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
             root_logger.setLevel(_level_to_int(log_level_name))
 
             existing_handler = next(
-                (
-                    handler
-                    for handler in root_logger.handlers
-                    if getattr(handler, "_otel_handler", False)
-                ),
+                (handler for handler in root_logger.handlers if getattr(handler, "_otel_handler", False)),
                 None,
             )
             if existing_handler is None:
@@ -520,7 +514,6 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                 insecure=insecure,
                 previous_log_record_factory=previous_factory,
             )
-
             _HANDLE = handle
             _STATE_KEY = config_key
 
@@ -550,11 +543,7 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                 logging.setLogRecordFactory(previous_factory)
             except Exception:
                 pass
-            for provider in (
-                locals().get("logger_provider"),
-                locals().get("meter_provider"),
-                locals().get("tracer_provider"),
-            ):
+            for provider in (logger_provider, meter_provider, tracer_provider):
                 try:
                     if provider is not None:
                         provider.shutdown()
