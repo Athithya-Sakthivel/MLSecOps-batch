@@ -1,5 +1,111 @@
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = ">= 5.18.0, < 6.0.0"
+    }
+  }
+}
+
+provider "cloudflare" {}
+
+variable "account_id" {
+  type = string
+}
+
+variable "zone_id" {
+  type    = string
+  default = null
+}
+
+variable "domain" {
+  type = string
+}
+
+variable "pages_project_name" {
+  type    = string
+  default = "tabular-ui"
+}
+
+variable "pages_branch" {
+  type    = string
+  default = "main"
+}
+
+variable "pages_repo_owner" {
+  type = string
+}
+
+variable "pages_repo_name" {
+  type = string
+}
+
+variable "pages_repo_id" {
+  type    = string
+  default = null
+}
+
+variable "pages_root_dir" {
+  type    = string
+  default = "."
+}
+
+variable "pages_destination_dir" {
+  type    = string
+  default = "dist"
+}
+
+variable "rate_limit_enabled" {
+  type    = bool
+  default = true
+}
+
+variable "rate_limit_action" {
+  type    = string
+  default = "block"
+
+  validation {
+    condition     = contains(["block", "js_challenge", "managed_challenge", "challenge", "log"], var.rate_limit_action)
+    error_message = "rate_limit_action must be one of: block, js_challenge, managed_challenge, challenge, log."
+  }
+}
+
+variable "rate_limit_requests" {
+  type    = number
+  default = 60
+
+  validation {
+    condition     = var.rate_limit_requests > 0
+    error_message = "rate_limit_requests must be greater than 0."
+  }
+}
+
+variable "rate_limit_period" {
+  type    = number
+  default = 10
+
+  validation {
+    condition     = contains([10, 60, 120, 300, 600, 3600], var.rate_limit_period)
+    error_message = "rate_limit_period must be one of: 10, 60, 120, 300, 600, 3600."
+  }
+}
+
+variable "rate_limit_mitigation_timeout" {
+  type    = number
+  default = 10
+
+  validation {
+    condition     = contains([0, 10, 60, 120, 300, 600, 3600, 86400], var.rate_limit_mitigation_timeout)
+    error_message = "rate_limit_mitigation_timeout must be one of: 0, 10, 60, 120, 300, 600, 3600, 86400."
+  }
+}
+
 locals {
-  app_hostname = "app.${var.domain}"
+  app_hostname     = "app.${var.domain}"
+  auth_hostname    = "auth.api.${var.domain}"
+  predict_hostname = "predict.api.${var.domain}"
 }
 
 resource "cloudflare_pages_project" "frontend" {
@@ -21,19 +127,13 @@ resource "cloudflare_pages_project" "frontend" {
       owner                          = var.pages_repo_owner
       repo_id                        = var.pages_repo_id
       repo_name                      = var.pages_repo_name
+      path_includes                  = ["*"]
+      preview_deployment_setting     = "all"
       production_branch              = var.pages_branch
       production_deployments_enabled = true
       pr_comments_enabled            = true
     }
   }
-}
-
-resource "cloudflare_pages_domain" "frontend_domain" {
-  account_id   = var.account_id
-  project_name = cloudflare_pages_project.frontend.name
-  name         = local.app_hostname
-
-  depends_on = [cloudflare_pages_project.frontend]
 }
 
 resource "cloudflare_dns_record" "frontend_cname" {
@@ -44,11 +144,70 @@ resource "cloudflare_dns_record" "frontend_cname" {
   proxied = true
   ttl     = 1
 
-  depends_on = [cloudflare_pages_domain.frontend_domain]
+  depends_on = [cloudflare_pages_project.frontend]
+}
+
+resource "cloudflare_pages_domain" "frontend_domain" {
+  account_id   = var.account_id
+  project_name = cloudflare_pages_project.frontend.name
+  name         = local.app_hostname
+
+  depends_on = [cloudflare_dns_record.frontend_cname]
+}
+
+resource "cloudflare_ruleset" "zone_custom_firewall" {
+  zone_id     = var.zone_id
+  name        = "zone-custom-firewall"
+  description = "Basic zone firewall rule for non-standard HTTP(S) ports"
+  kind        = "zone"
+  phase       = "http_request_firewall_custom"
+
+  rules = [
+    {
+      ref         = "block_non_default_ports"
+      description = "Block ports other than 80 and 443"
+      enabled     = true
+      expression  = "not (cf.edge.server_port in {80 443})"
+      action      = "block"
+    }
+  ]
+}
+
+resource "cloudflare_ruleset" "zone_rate_limit" {
+  count       = var.rate_limit_enabled ? 1 : 0
+  zone_id     = var.zone_id
+  name        = "zone-rate-limit"
+  description = "Basic rate limiting for API hosts"
+  kind        = "zone"
+  phase       = "http_ratelimit"
+
+  rules = [
+    {
+      ref         = "rate_limit_api_hosts"
+      description = "Rate limit auth and predict API hosts by IP"
+      enabled     = true
+      expression  = "(http.host in {\"${local.auth_hostname}\" \"${local.predict_hostname}\"})"
+      action      = var.rate_limit_action
+      ratelimit = {
+        characteristics     = ["cf.colo.id", "ip.src"]
+        period              = var.rate_limit_period
+        requests_per_period = var.rate_limit_requests
+        mitigation_timeout  = var.rate_limit_mitigation_timeout
+      }
+    }
+  ]
 }
 
 output "frontend_url" {
   value = "https://${local.app_hostname}"
+}
+
+output "auth_url" {
+  value = "https://${local.auth_hostname}"
+}
+
+output "predict_url" {
+  value = "https://${local.predict_hostname}"
 }
 
 output "pages_project_name" {

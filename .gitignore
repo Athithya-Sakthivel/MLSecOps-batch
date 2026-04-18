@@ -36,7 +36,7 @@ src/terraform/cloudflare/tfplan
 src/terraform/cloudflare/terraform.tfstate
 src/terraform/cloudflare/terraform.tfstate.backup
 src/terraform/cloudflare/tfplan
-
+src/terraform/cloudflare/.terraform.tfstate.lock.info
 
 
 # PyInstaller

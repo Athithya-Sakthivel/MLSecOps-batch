@@ -4,7 +4,6 @@ IFS=$'\n\t'
 
 STACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TF_BIN="${TF_BIN:-tofu}"
-TUNNEL_ENV_FILE="${TUNNEL_ENV_FILE:-${STACK_DIR}/.tunnel.env}"
 
 usage() {
   cat <<'USAGE'
@@ -42,12 +41,12 @@ export TF_VAR_pages_project_name="${TF_VAR_pages_project_name:-tabular-ui}"
 export TF_VAR_pages_branch="${TF_VAR_pages_branch:-main}"
 export TF_VAR_pages_root_dir="${TF_VAR_pages_root_dir:-.}"
 export TF_VAR_pages_destination_dir="${TF_VAR_pages_destination_dir:-dist}"
-export TF_VAR_tunnel_name="${TF_VAR_tunnel_name:-tabular-api-tunnel}"
 export TF_VAR_rate_limit_enabled="${TF_VAR_rate_limit_enabled:-true}"
-export TF_VAR_rate_limit_action="${TF_VAR_rate_limit_action:-managed_challenge}"
+export TF_VAR_rate_limit_action="${TF_VAR_rate_limit_action:-block}"
 export TF_VAR_rate_limit_requests="${TF_VAR_rate_limit_requests:-60}"
-export TF_VAR_rate_limit_period="${TF_VAR_rate_limit_period:-60}"
-export TF_VAR_rate_limit_mitigation_timeout="${TF_VAR_rate_limit_mitigation_timeout:-0}"
+export TF_VAR_rate_limit_period="${TF_VAR_rate_limit_period:-10}"
+export TF_VAR_rate_limit_mitigation_timeout="${TF_VAR_rate_limit_mitigation_timeout:-10}"
+export TUNNEL_NAME="${TUNNEL_NAME:-tabular-api-tunnel}"
 
 : "${TF_VAR_account_id:?TF_VAR_account_id or CLOUDFLARE_ACCOUNT_ID is required}"
 : "${TF_VAR_domain:?TF_VAR_domain or CLOUDFLARE_ZONE is required}"
@@ -55,7 +54,7 @@ export TF_VAR_rate_limit_mitigation_timeout="${TF_VAR_rate_limit_mitigation_time
 : "${TF_VAR_pages_repo_name:?TF_VAR_pages_repo_name or GITHUB_REPO is required}"
 
 if [[ -n "${CLOUDFLARE_API_TOKEN:-}" && ( -n "${CLOUDFLARE_API_KEY:-}" || -n "${CLOUDFLARE_GLOBAL_API_KEY:-}" ) ]]; then
-  echo "ERROR: set either CLOUDFLARE_API_TOKEN or CLOUDFLARE_API_KEY/CLOUDFLARE_GLOBAL_API_KEY, not both" >&2
+  echo "ERROR: set either CLOUDFLARE_API_TOKEN or CLOUDFLARE_GLOBAL_API_KEY/CLOUDFLARE_API_KEY, not both" >&2
   exit 2
 fi
 
@@ -73,20 +72,6 @@ else
   unset CLOUDFLARE_API_TOKEN
 fi
 
-placeholder_values=(
-  "your_zone_id"
-  "your_real_zone_id"
-  "your_repo_id"
-  "replace-me"
-  "your_real_global_api_key"
-)
-for v in "${placeholder_values[@]}"; do
-  if [[ "${TF_VAR_zone_id:-}" == "$v" || "${TF_VAR_pages_repo_id:-}" == "$v" || "${CLOUDFLARE_GLOBAL_API_KEY:-}" == "$v" ]]; then
-    echo "ERROR: placeholder value still present: $v" >&2
-    exit 3
-  fi
-done
-
 cf_headers() {
   if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
     printf '%s\n' -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
@@ -95,49 +80,63 @@ cf_headers() {
   fi
 }
 
-cf_request() {
-  local method="$1"
-  shift
+cf_curl() {
   local -a args=()
   while IFS= read -r line; do
     args+=("$line")
   done < <(cf_headers)
-  curl -fsS -X "$method" "${args[@]}" "$@"
+  curl -fsS "${args[@]}" "$@"
+}
+
+cf_status() {
+  local -a args=()
+  while IFS= read -r line; do
+    args+=("$line")
+  done < <(cf_headers)
+  curl -sS -o /dev/null -w '%{http_code}' "${args[@]}" "$1"
+}
+
+state_has() {
+  local addr="$1"
+  "$TF_BIN" -chdir="${STACK_DIR}" state list 2>/dev/null | grep -qx "${addr}"
 }
 
 resolve_zone_id() {
-  if [[ -n "${TF_VAR_zone_id:-}" ]]; then
+  if [[ -n "${TF_VAR_zone_id:-}" && "${TF_VAR_zone_id}" != "your_zone_id" && "${TF_VAR_zone_id}" != "your_real_zone_id" && "${TF_VAR_zone_id}" != "replace-me" && "${TF_VAR_zone_id}" != "null" ]]; then
     return 0
   fi
+
   echo "[INFO] resolving zone_id for ${TF_VAR_domain}" >&2
-  zone_json="$(
-    cf_request GET "https://api.cloudflare.com/client/v4/zones?name=${TF_VAR_domain}&status=active&per_page=1"
-  )"
+  local zone_json
+  zone_json="$(cf_curl "https://api.cloudflare.com/client/v4/zones?name=${TF_VAR_domain}&status=active&per_page=1")"
   TF_VAR_zone_id="$(jq -r '.result[0].id // empty' <<<"${zone_json}")"
   if [[ -z "${TF_VAR_zone_id}" ]]; then
     echo "ERROR: failed to resolve zone_id for ${TF_VAR_domain}" >&2
-    exit 4
+    exit 3
   fi
   export TF_VAR_zone_id
   echo "[INFO] zone_id=${TF_VAR_zone_id}" >&2
 }
 
 resolve_repo_id() {
-  if [[ -n "${TF_VAR_pages_repo_id:-}" ]]; then
+  if [[ -n "${TF_VAR_pages_repo_id:-}" && "${TF_VAR_pages_repo_id}" != "replace-me" && "${TF_VAR_pages_repo_id}" != "your_repo_id" && "${TF_VAR_pages_repo_id}" != "null" ]]; then
     return 0
   fi
+
   echo "[INFO] resolving GitHub repo ID for ${TF_VAR_pages_repo_owner}/${TF_VAR_pages_repo_name}" >&2
-  gh_auth=()
+  local gh_auth=()
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     gh_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
   elif [[ -n "${GH_TOKEN:-}" ]]; then
     gh_auth=(-H "Authorization: Bearer ${GH_TOKEN}")
   fi
+
+  local repo_json
   repo_json="$(curl -fsS -H "Accept: application/vnd.github+json" "${gh_auth[@]}" "https://api.github.com/repos/${TF_VAR_pages_repo_owner}/${TF_VAR_pages_repo_name}")"
   TF_VAR_pages_repo_id="$(jq -r '.id // empty' <<<"${repo_json}")"
   if [[ -z "${TF_VAR_pages_repo_id}" ]]; then
     echo "ERROR: failed to resolve GitHub repo ID" >&2
-    exit 5
+    exit 4
   fi
   export TF_VAR_pages_repo_id
   echo "[INFO] pages_repo_id=${TF_VAR_pages_repo_id}" >&2
@@ -152,112 +151,158 @@ ensure_cloudflared_login() {
 
 get_tunnel_id() {
   cloudflared tunnel list --output json \
-    | jq -r --arg n "${TF_VAR_tunnel_name}" '.[] | select(.name == $n) | .id' \
+    | jq -r --arg n "${TUNNEL_NAME}" '.[] | select(.name == $n) | .id' \
     | head -n1
 }
 
 ensure_tunnel() {
+  ensure_cloudflared_login
+
   local tunnel_id
   tunnel_id="$(get_tunnel_id || true)"
 
   if [[ -z "${tunnel_id}" || "${tunnel_id}" == "null" ]]; then
-    echo "[INFO] creating tunnel ${TF_VAR_tunnel_name}" >&2
-    cloudflared tunnel create "${TF_VAR_tunnel_name}" >/dev/null
+    echo "[INFO] creating tunnel ${TUNNEL_NAME}" >&2
+    cloudflared tunnel create "${TUNNEL_NAME}" >&2
     tunnel_id="$(get_tunnel_id || true)"
   else
-    echo "[INFO] reusing tunnel ${TF_VAR_tunnel_name} (${tunnel_id})" >&2
+    echo "[INFO] reusing tunnel ${TUNNEL_NAME} (${tunnel_id})" >&2
   fi
 
   if [[ -z "${tunnel_id}" || "${tunnel_id}" == "null" ]]; then
     echo "ERROR: could not resolve tunnel ID" >&2
-    exit 6
+    exit 5
   fi
 
-  printf '%s\n' "${tunnel_id}"
+  echo "${tunnel_id}"
 }
 
-upsert_cname() {
-  local record_name="$1"
-  local record_target="$2"
+delete_dns_records_for_host() {
+  local zone_id="$1"
+  local host="$2"
 
-  local existing_json
-  existing_json="$(
-    cf_request GET "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/dns_records?type=CNAME&name=${record_name}"
+  local record_ids
+  record_ids="$(
+    cf_curl "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${host}&type=CNAME" \
+      | jq -r '.result[]?.id'
   )"
 
-  local existing_id existing_content
-  existing_id="$(jq -r '.result[0].id // empty' <<<"${existing_json}")"
-  existing_content="$(jq -r '.result[0].content // empty' <<<"${existing_json}")"
-
-  if [[ -n "${existing_id}" && "${existing_content}" == "${record_target}" ]]; then
-    echo "[INFO] DNS already correct for ${record_name}" >&2
+  if [[ -z "${record_ids}" ]]; then
     return 0
   fi
 
-  local payload
-  payload="$(jq -n --arg type "CNAME" --arg name "${record_name}" --arg content "${record_target}" '{type:$type,name:$name,content:$content,proxied:true,ttl:1}')"
+  while IFS= read -r rid; do
+    [[ -z "${rid}" ]] && continue
+    echo "[INFO] deleting existing DNS record ${rid} for ${host}" >&2
+    cf_curl -X DELETE "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${rid}" >/dev/null
+  done <<< "${record_ids}"
+}
 
-  if [[ -n "${existing_id}" ]]; then
-    echo "[INFO] updating DNS ${record_name} -> ${record_target}" >&2
-    cf_request PUT "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/dns_records/${existing_id}" --json "${payload}" >/dev/null
-  else
-    echo "[INFO] creating DNS ${record_name} -> ${record_target}" >&2
-    cf_request POST "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/dns_records" --json "${payload}" >/dev/null
+bind_tunnel_dns() {
+  local tunnel_id="$1"
+  local expected="${tunnel_id}.cfargotunnel.com"
+
+  for host in "auth.api.${TF_VAR_domain}" "predict.api.${TF_VAR_domain}"; do
+    delete_dns_records_for_host "${TF_VAR_zone_id}" "${host}"
+    echo "[INFO] binding ${host} -> ${expected}" >&2
+    cloudflared tunnel route dns "${tunnel_id}" "${host}" >&2
+  done
+}
+
+cleanup_tunnel() {
+  local tunnel_id
+  tunnel_id="$(get_tunnel_id || true)"
+
+  for host in "auth.api.${TF_VAR_domain}" "predict.api.${TF_VAR_domain}"; do
+    delete_dns_records_for_host "${TF_VAR_zone_id}" "${host}"
+  done
+
+  if [[ -n "${tunnel_id}" && "${tunnel_id}" != "null" ]]; then
+    echo "[INFO] deleting tunnel ${TUNNEL_NAME} (${tunnel_id})" >&2
+    cloudflared tunnel delete -f "${tunnel_id}" >/dev/null || true
   fi
 }
 
-fetch_tunnel_token() {
-  local tunnel_id="$1"
-  local token_json token_value
-  token_json="$(
-    cf_request GET "https://api.cloudflare.com/client/v4/accounts/${TF_VAR_account_id}/cfd_tunnel/${tunnel_id}/token"
-  )"
-  token_value="$(jq -r 'if type=="object" and has("result") then .result elif type=="string" then . else empty end' <<<"${token_json}")"
-  if [[ -z "${token_value}" ]]; then
-    echo "ERROR: failed to fetch tunnel token for ${tunnel_id}" >&2
-    exit 7
+import_if_exists() {
+  local addr="$1"
+  local import_id="$2"
+
+  if state_has "${addr}"; then
+    return 0
   fi
-  printf '%s\n' "${token_value}"
+
+  echo "[INFO] importing ${addr}" >&2
+  "$TF_BIN" -chdir="${STACK_DIR}" import -input=false "${addr}" "${import_id}"
 }
 
-write_tunnel_env_file() {
-  local tunnel_id="$1"
-  local tunnel_token="$2"
-  cat >"${TUNNEL_ENV_FILE}" <<EOF
-export TUNNEL_ID="${tunnel_id}"
-export TUNNEL_TOKEN="${tunnel_token}"
-EOF
-  chmod 600 "${TUNNEL_ENV_FILE}"
-  echo "[INFO] wrote ${TUNNEL_ENV_FILE}" >&2
+import_cloudflare_pages_project_if_exists() {
+  local status
+  status="$(cf_status "https://api.cloudflare.com/client/v4/accounts/${TF_VAR_account_id}/pages/projects/${TF_VAR_pages_project_name}")"
+  if [[ "${status}" == "200" ]]; then
+    import_if_exists "cloudflare_pages_project.frontend" "${TF_VAR_account_id}/${TF_VAR_pages_project_name}"
+  fi
+}
+
+import_cloudflare_pages_domain_if_exists() {
+  local domain_name="app.${TF_VAR_domain}"
+  local status
+  status="$(cf_status "https://api.cloudflare.com/client/v4/accounts/${TF_VAR_account_id}/pages/projects/${TF_VAR_pages_project_name}/domains/${domain_name}")"
+  if [[ "${status}" == "200" ]]; then
+    import_if_exists "cloudflare_pages_domain.frontend_domain" "${TF_VAR_account_id}/${TF_VAR_pages_project_name}/${domain_name}"
+  fi
+}
+
+import_frontend_dns_if_exists() {
+  local domain_name="app.${TF_VAR_domain}"
+  local record_json record_id
+  record_json="$(cf_curl "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/dns_records?name=${domain_name}&type=CNAME")"
+  record_id="$(jq -r '.result[0].id // empty' <<<"${record_json}")"
+  if [[ -n "${record_id}" ]]; then
+    import_if_exists "cloudflare_dns_record.frontend_cname" "${TF_VAR_zone_id}/${record_id}"
+  fi
+}
+
+import_ruleset_if_exists() {
+  local addr="$1"
+  local name="$2"
+  local phase="$3"
+  local rulesets_json ruleset_id
+  rulesets_json="$(cf_curl "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/rulesets")"
+  ruleset_id="$(jq -r --arg name "${name}" --arg phase "${phase}" '.result[] | select(.name == $name and .phase == $phase) | .id' <<<"${rulesets_json}" | head -n1)"
+  if [[ -n "${ruleset_id}" ]]; then
+    import_if_exists "${addr}" "${ruleset_id}"
+  fi
 }
 
 resolve_zone_id
 resolve_repo_id
 
 if [[ "${MODE}" != "--destroy" ]]; then
-  ensure_cloudflared_login
   TUNNEL_ID="$(ensure_tunnel)"
-  upsert_cname "auth.api.${TF_VAR_domain}" "${TUNNEL_ID}.cfargotunnel.com"
-  upsert_cname "predict.api.${TF_VAR_domain}" "${TUNNEL_ID}.cfargotunnel.com"
-  TUNNEL_TOKEN="$(fetch_tunnel_token "${TUNNEL_ID}")"
-  write_tunnel_env_file "${TUNNEL_ID}" "${TUNNEL_TOKEN}"
+  bind_tunnel_dns "${TUNNEL_ID}"
 fi
 
-"${TF_BIN}" -chdir="${STACK_DIR}" init -input=false -upgrade
-"${TF_BIN}" -chdir="${STACK_DIR}" validate
+"$TF_BIN" -chdir="${STACK_DIR}" init -input=false -upgrade
+"$TF_BIN" -chdir="${STACK_DIR}" validate
+
+if [[ "${MODE}" != "--destroy" ]]; then
+  import_cloudflare_pages_project_if_exists
+  import_cloudflare_pages_domain_if_exists
+  import_frontend_dns_if_exists
+  import_ruleset_if_exists "cloudflare_ruleset.zone_custom_firewall" "zone-custom-firewall" "http_request_firewall_custom"
+  import_ruleset_if_exists "cloudflare_ruleset.zone_rate_limit[0]" "zone-rate-limit" "http_ratelimit"
+fi
 
 case "${MODE}" in
   --plan)
-    "${TF_BIN}" -chdir="${STACK_DIR}" plan -input=false -out=tfplan
+    "$TF_BIN" -chdir="${STACK_DIR}" plan -input=false -out=tfplan
     ;;
   --apply)
-    "${TF_BIN}" -chdir="${STACK_DIR}" apply -input=false -auto-approve
-    "${TF_BIN}" -chdir="${STACK_DIR}" output
-    if [[ -f "${TUNNEL_ENV_FILE}" ]]; then
-      echo "[INFO] source ${TUNNEL_ENV_FILE} to load TUNNEL_ID and TUNNEL_TOKEN" >&2
-    fi
+    "$TF_BIN" -chdir="${STACK_DIR}" apply -input=false -auto-approve
+    "$TF_BIN" -chdir="${STACK_DIR}" output
     ;;
   --destroy)
-    "${TF_BIN}" -chdir="${STACK_DIR}" destroy -input=false -auto-approve
+    "$TF_BIN" -chdir="${STACK_DIR}" destroy -input=false -auto-approve
+    cleanup_tunnel
     ;;
 esac

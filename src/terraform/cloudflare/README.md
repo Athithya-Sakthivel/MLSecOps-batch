@@ -101,16 +101,18 @@ These are the rate limiting inputs used by the Terraform stack:
 
 Cloudflare’s rate limiting docs use `requests_per_period`, `period`, `action`, and `mitigation_timeout` as the core rule parameters. ([Cloudflare Docs][2])
 
+Recommended starter values:
+
 ```bash
-# Baseline limits for inference API
-export TF_VAR_rate_limit_enabled="true"
 export TF_VAR_rate_limit_requests="60"
 export TF_VAR_rate_limit_period="60"
 export TF_VAR_rate_limit_block_seconds="300"
 export TF_VAR_rate_limit_action="block"
+```
 
-# Stricter limits for public API
-export TF_VAR_rate_limit_enabled="true"
+For a stricter public API:
+
+```bash
 export TF_VAR_rate_limit_requests="30"
 export TF_VAR_rate_limit_period="60"
 export TF_VAR_rate_limit_block_seconds="600"
