@@ -2,7 +2,7 @@
 
 ### When this is needed
 
-Use GitHub OIDC roles **only if your workflows interact with AWS** (e.g., pushing images to ECR).
+Use GitHub OIDC roles **only if workflows interact with AWS** (e.g., pushing images to ECR).
 
 * If workflows only build/test locally → no AWS role needed
 * If workflows push to **Amazon ECR** → OIDC role required

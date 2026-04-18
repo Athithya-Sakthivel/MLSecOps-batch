@@ -3,8 +3,8 @@ locals {
 }
 
 resource "cloudflare_pages_project" "frontend" {
-  account_id        = var.account_id
-  name              = var.pages_project_name
+  account_id       = var.account_id
+  name             = var.pages_project_name
   production_branch = var.pages_branch
 
   build_config = {
@@ -45,12 +45,4 @@ resource "cloudflare_dns_record" "frontend_cname" {
   ttl     = 1
 
   depends_on = [cloudflare_pages_domain.frontend_domain]
-}
-
-output "frontend_url" {
-  value = "https://${local.app_hostname}"
-}
-
-output "pages_project_name" {
-  value = cloudflare_pages_project.frontend.name
 }

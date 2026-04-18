@@ -150,6 +150,14 @@ python3 -m venv .venv_train
 .venv_train/bin/python -m pip install boto3==1.42.70 flytekit==1.16.16 mlflow==3.10.1 numpy==2.4.4 pandas==2.3.3 \
  lightgbm==4.6.0 onnx==1.21.0 onnxruntime==1.24.4 onnxmltools==1.16.0 pyiceberg==0.11.0 scikit-learn==1.8.0 polars==1.39.3
 
+CLOUDFLARED_VERSION="2026.3.0"
+
+curl -fsSL \
+  "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
+  -o /usr/local/bin/cloudflared
+
+chmod +x /usr/local/bin/cloudflared
+
 
 # local testing requries all packages
 python3 -m venv .venv_deploy
@@ -175,6 +183,7 @@ aws --version
 ruff version
 pre-commit --version
 kubectl version --client
+cloudflared --version
 tofu version
 flytectl version
 

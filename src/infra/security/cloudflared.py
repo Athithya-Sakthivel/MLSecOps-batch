@@ -1,56 +1,58 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import hashlib
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+# ==========================================================
+# Paths
+# ==========================================================
 ROOT = Path.cwd()
-DEFAULT_OUT_DIR = ROOT / "src" / "manifests" / "cloudflared"
+OUT_DIR = ROOT / "src" / "manifests" / "cloudflared"
 
-DEFAULT_NAMESPACE = "inference"
-DEFAULT_IMAGE = "cloudflare/cloudflared:2026.2.0"
-DEFAULT_REPLICAS = 2
-DEFAULT_METRICS_PORT = 2000
+# ==========================================================
+# Environment
+# ==========================================================
+NAMESPACE = os.getenv("NAMESPACE", "inference")
+IMAGE = os.getenv("IMAGE", "cloudflare/cloudflared:2026.3.0")
+REPLICAS = int(os.getenv("REPLICAS", "2"))
+METRICS_PORT = int(os.getenv("METRICS_PORT", "2000"))
 
-DEFAULT_TUNNEL_NAME = "tabular-api-tunnel"
-DEFAULT_AUTH_UPSTREAM = "http://auth-svc.inference.svc.cluster.local:8000"
-DEFAULT_PREDICT_UPSTREAM = "http://tabular-inference-serve-svc.inference.svc.cluster.local:8000"
-
-def die(msg: str) -> None:
-    print(f"ERROR: {msg}", file=sys.stderr)
+DOMAIN = os.getenv("DOMAIN")
+if not DOMAIN:
+    print("ERROR: DOMAIN is required", file=sys.stderr)
     sys.exit(2)
 
+TUNNEL_NAME = os.getenv("CLOUDFLARE_TUNNEL_NAME", "tabular-api-tunnel")
+SECRET_NAME = os.getenv("CLOUDFLARE_SECRET_NAME", "cloudflared-token")
+SECRET_KEY = os.getenv("CLOUDFLARE_SECRET_KEY", "token")
 
-def info(msg: str) -> None:
-    print(f"INFO: {msg}")
+AUTH_UPSTREAM = os.getenv(
+    "AUTH_UPSTREAM",
+    "http://auth-svc.inference.svc.cluster.local:8000",
+)
 
+PREDICT_UPSTREAM = os.getenv(
+    "PREDICT_UPSTREAM",
+    "http://tabular-inference-serve-svc.inference.svc.cluster.local:8000",
+)
 
-def env(name: str, default: str | None = None, required: bool = False) -> str:
-    value = os.getenv(name, default or "").strip()
-    if required and not value:
-        die(f"{name} is required")
-    return value
+TOKEN = os.getenv("CLOUDFLARE_TUNNEL_TOKEN")
 
+WRITE = os.getenv("WRITE", "false").lower() in ("1", "true", "yes")
+APPLY_SECRET = os.getenv("APPLY_SECRET", "true").lower() in ("1", "true", "yes")
 
+# ==========================================================
+# Helpers
+# ==========================================================
 def sha256_str(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def safe_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
-    try:
-        path.chmod(0o644)
-    except Exception:
-        pass
 
 
 def to_yaml(obj: Any) -> str:
@@ -62,26 +64,35 @@ def to_yaml(obj: Any) -> str:
     )
 
 
-def render_namespace(namespace: str) -> dict[str, Any]:
-    return {
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": {
-            "name": namespace,
-            "labels": {
-                "app.kubernetes.io/name": "cloudflared",
-                "app.kubernetes.io/managed-by": "infrastructure-generator",
-            },
-        },
-    }
+def safe_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
 
 
-def render_secret_token(namespace: str, token: str) -> dict[str, Any]:
-    return {
+def run(cmd: list[str], stdin: str | None = None) -> None:
+    subprocess.run(
+        cmd,
+        input=stdin,
+        text=True,
+        check=True,
+    )
+
+
+# ==========================================================
+# Kubernetes Secret (direct apply)
+# ==========================================================
+def apply_secret(namespace: str, name: str, key: str, token: str) -> None:
+    if not token:
+        print("ERROR: CLOUDFLARE_TUNNEL_TOKEN required when APPLY_SECRET=true", file=sys.stderr)
+        sys.exit(2)
+
+    secret = {
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
-            "name": "cloudflared-token",
+            "name": name,
             "namespace": namespace,
             "labels": {
                 "app.kubernetes.io/name": "cloudflared",
@@ -90,7 +101,27 @@ def render_secret_token(namespace: str, token: str) -> dict[str, Any]:
         },
         "type": "Opaque",
         "stringData": {
-            "token": token,
+            key: token,
+        },
+    }
+
+    print(f"INFO: applying secret {namespace}/{name}")
+    run(["kubectl", "apply", "-f", "-"], stdin=to_yaml(secret))
+
+
+# ==========================================================
+# Manifest renderers
+# ==========================================================
+def render_namespace(namespace: str) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": namespace,
+            "labels": {
+                "app.kubernetes.io/name": "cloudflared",
+                "app.kubernetes.io/managed-by": "generator",
+            },
         },
     }
 
@@ -115,6 +146,9 @@ def render_deployment(
     image: str,
     replicas: int,
     metrics_port: int,
+    secret_name: str,
+    secret_key: str,
+    routes_checksum: str,
 ) -> dict[str, Any]:
     return {
         "apiVersion": "apps/v1",
@@ -141,7 +175,9 @@ def render_deployment(
                         "app.kubernetes.io/name": "cloudflared",
                         "app.kubernetes.io/component": "tunnel",
                     },
-                    "annotations": {},
+                    "annotations": {
+                        "cloudflared/routes-checksum": routes_checksum
+                    },
                 },
                 "spec": {
                     "serviceAccountName": "cloudflared-sa",
@@ -166,8 +202,8 @@ def render_deployment(
                                     "name": "TUNNEL_TOKEN",
                                     "valueFrom": {
                                         "secretKeyRef": {
-                                            "name": "cloudflared-token",
-                                            "key": "token",
+                                            "name": secret_name,
+                                            "key": secret_key,
                                         }
                                     },
                                 }
@@ -195,8 +231,6 @@ def render_deployment(
                                 },
                                 "initialDelaySeconds": 10,
                                 "periodSeconds": 10,
-                                "timeoutSeconds": 3,
-                                "failureThreshold": 3,
                             },
                             "livenessProbe": {
                                 "httpGet": {
@@ -205,18 +239,16 @@ def render_deployment(
                                 },
                                 "initialDelaySeconds": 15,
                                 "periodSeconds": 15,
-                                "timeoutSeconds": 3,
-                                "failureThreshold": 3,
                             },
                             "securityContext": {
                                 "allowPrivilegeEscalation": False,
-                                "capabilities": {
-                                    "drop": ["ALL"],
-                                },
                                 "readOnlyRootFilesystem": True,
                                 "runAsNonRoot": True,
                                 "runAsUser": 65532,
                                 "runAsGroup": 65532,
+                                "capabilities": {
+                                    "drop": ["ALL"]
+                                },
                             },
                         }
                     ],
@@ -226,25 +258,22 @@ def render_deployment(
     }
 
 
-def render_routes_reference(
+def render_routes(
     tunnel_name: str,
-    auth_hostname: str,
-    predict_hostname: str,
+    auth_host: str,
+    predict_host: str,
     auth_upstream: str,
     predict_upstream: str,
 ) -> dict[str, Any]:
-    # Reference-only route map.
-    # The runtime tunnel is token-based; this file keeps the host/service
-    # mapping versioned beside the Kubernetes manifests for review and sync.
     return {
         "tunnel": tunnel_name,
         "ingress": [
             {
-                "hostname": auth_hostname,
+                "hostname": auth_host,
                 "service": auth_upstream,
             },
             {
-                "hostname": predict_hostname,
+                "hostname": predict_host,
                 "service": predict_upstream,
             },
             {
@@ -254,79 +283,70 @@ def render_routes_reference(
     }
 
 
+# ==========================================================
+# Main
+# ==========================================================
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate Cloudflared Kubernetes manifests for the tabular MLOps backend."
+    auth_host = f"auth.api.{DOMAIN}"
+    predict_host = f"predict.api.{DOMAIN}"
+
+    routes = render_routes(
+        TUNNEL_NAME,
+        auth_host,
+        predict_host,
+        AUTH_UPSTREAM,
+        PREDICT_UPSTREAM,
     )
-    parser.add_argument("--root", default=str(ROOT))
-    parser.add_argument("--out-dir", default="")
-    parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
-    parser.add_argument("--replicas", type=int, default=DEFAULT_REPLICAS)
-    parser.add_argument("--metrics-port", type=int, default=DEFAULT_METRICS_PORT)
-    parser.add_argument("--domain", default=env("DOMAIN", required=True), help="Root domain, e.g. example.com")
-    parser.add_argument("--tunnel-name", default=env("CLOUDFLARE_TUNNEL_NAME", default=DEFAULT_TUNNEL_NAME))
-    parser.add_argument("--auth-upstream", default=env("AUTH_UPSTREAM", default=DEFAULT_AUTH_UPSTREAM))
-    parser.add_argument("--predict-upstream", default=env("PREDICT_UPSTREAM", default=DEFAULT_PREDICT_UPSTREAM))
-    parser.add_argument("--token", default=env("CLOUDFLARE_TUNNEL_TOKEN", required=True))
-    parser.add_argument("--write", action="store_true", help="Write manifests to disk")
-    args = parser.parse_args()
 
-    root = Path(args.root).resolve()
-    out_dir = Path(args.out_dir).resolve() if args.out_dir else (root / "src" / "manifests" / "cloudflared")
+    routes_yaml = to_yaml(routes)
+    checksum = sha256_str(routes_yaml)
 
-    auth_hostname = f"auth.api.{args.domain}"
-    predict_hostname = f"predict.api.{args.domain}"
+    namespace_doc = render_namespace(NAMESPACE)
+    sa_doc = render_serviceaccount(NAMESPACE)
 
-    namespace_doc = render_namespace(args.namespace)
-    secret_doc = render_secret_token(args.namespace, args.token)
-    sa_doc = render_serviceaccount(args.namespace)
     deploy_doc = render_deployment(
-        namespace=args.namespace,
-        image=args.image,
-        replicas=args.replicas,
-        metrics_port=args.metrics_port,
-    )
-    routes_doc = render_routes_reference(
-        tunnel_name=args.tunnel_name,
-        auth_hostname=auth_hostname,
-        predict_hostname=predict_hostname,
-        auth_upstream=args.auth_upstream,
-        predict_upstream=args.predict_upstream,
+        NAMESPACE,
+        IMAGE,
+        REPLICAS,
+        METRICS_PORT,
+        SECRET_NAME,
+        SECRET_KEY,
+        checksum,
     )
 
     namespace_yaml = to_yaml(namespace_doc)
-    secret_yaml = to_yaml(secret_doc)
     sa_yaml = to_yaml(sa_doc)
-    deploy_doc["spec"]["template"]["metadata"]["annotations"] = {
-        "cloudflared/routes-checksum": sha256_str(to_yaml(routes_doc))
-    }
     deploy_yaml = to_yaml(deploy_doc)
-    routes_yaml = to_yaml(routes_doc)
 
-    if args.write:
-        safe_write(out_dir / "00-namespace.yaml", namespace_yaml)
-        safe_write(out_dir / "01-secret-cloudflared-token.yaml", secret_yaml)
-        safe_write(out_dir / "02-serviceaccount.yaml", sa_yaml)
-        safe_write(out_dir / "03-deployment-cloudflared.yaml", deploy_yaml)
-        safe_write(out_dir / "04-routes-reference.yaml", routes_yaml)
-        info(f"Wrote manifests to {out_dir}")
-        return
+    # ----------------------------------------------
+    # Direct secret apply (no rendered secret file)
+    # ----------------------------------------------
+    if APPLY_SECRET:
+        apply_secret(
+            NAMESPACE,
+            SECRET_NAME,
+            SECRET_KEY,
+            TOKEN or "",
+        )
 
-    print(f"# {out_dir / '00-namespace.yaml'}")
-    print(namespace_yaml)
-    print("---")
-    print(f"# {out_dir / '01-secret-cloudflared-token.yaml'}")
-    print(secret_yaml)
-    print("---")
-    print(f"# {out_dir / '02-serviceaccount.yaml'}")
-    print(sa_yaml)
-    print("---")
-    print(f"# {out_dir / '03-deployment-cloudflared.yaml'}")
-    print(deploy_yaml)
-    print("---")
-    print(f"# {out_dir / '04-routes-reference.yaml'}")
-    print(routes_yaml)
+    # ----------------------------------------------
+    # Output manifests
+    # ----------------------------------------------
+    if WRITE:
+        safe_write(OUT_DIR / "00-namespace.yaml", namespace_yaml)
+        safe_write(OUT_DIR / "01-serviceaccount.yaml", sa_yaml)
+        safe_write(OUT_DIR / "02-deployment.yaml", deploy_yaml)
+        safe_write(OUT_DIR / "03-routes-reference.yaml", routes_yaml)
+        print(f"INFO: wrote manifests to {OUT_DIR}")
+    else:
+        print("---")
+        print(namespace_yaml)
+        print("---")
+        print(sa_yaml)
+        print("---")
+        print(deploy_yaml)
+        print("---")
+        print(routes_yaml)
 
 
 if __name__ == "__main__":

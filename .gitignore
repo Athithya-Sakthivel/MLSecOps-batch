@@ -31,6 +31,13 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+src/terraform/cloudflare/tfplan
+
+src/terraform/cloudflare/terraform.tfstate
+src/terraform/cloudflare/terraform.tfstate.backup
+src/terraform/cloudflare/tfplan
+
+
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
