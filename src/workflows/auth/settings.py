@@ -2,18 +2,33 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from urllib.parse import urlparse
 
+_DEV_ENVIRONMENTS = {"dev", "development", "local", "test"}
+_VALID_SAMESITE = {"strict", "lax", "none"}
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     app_name: str
+    service_name: str
+    service_version: str
     environment: str
+    deployment_environment: str
     dev_mode: bool
+    cluster_name: str
+    instance_id: str
+
     app_base_url: str
+    validate_route_path: str
+    me_route_path: str
+
     postgres_dsn: str
     postgres_min_size: int
     postgres_max_size: int
+
     session_cookie_name: str
     session_ttl_seconds: int
     auth_tx_ttl_seconds: int
@@ -21,6 +36,7 @@ class Settings:
     session_cookie_samesite: str
     session_cookie_path: str
     session_cookie_domain: str | None
+
     google_client_id: str
     google_client_secret: str
     microsoft_client_id: str
@@ -28,84 +44,327 @@ class Settings:
     microsoft_tenant_id: str
     github_client_id: str
     github_client_secret: str
+
     google_allowed_domains: list[str]
     microsoft_allowed_tenant_ids: list[str]
     microsoft_allowed_domains: list[str]
     github_allowed_orgs: list[str]
+
     metrics_enabled: bool
+    otel_endpoint: str
+    otel_traces_sampler: str
+    otel_traces_sampler_arg: float
+    trace_sample_ratio: float
+    otel_timeout_seconds: float
+    otel_metric_export_interval_ms: int
+    otel_metric_export_timeout_ms: int
+    log_level: str
 
 
-def _env(name: str, default: str = '') -> str:
+def _env(name: str, default: str = "") -> str:
     value = os.getenv(name)
     return default if value is None else value
 
 
 def _csv(name: str) -> list[str]:
-    raw = _env(name, '')
-    return [x.strip() for x in raw.split(',') if x.strip()]
+    raw = _env(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def _bool(name: str, default: str = 'false') -> bool:
-    return _env(name, default).lower() in {'1', 'true', 'yes', 'on'}
+def _bool(name: str, default: str = "false") -> bool:
+    return _env(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int(name: str, default: str) -> int:
+    raw = _env(name, default).strip()
+    try:
+        return int(raw)
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"{name} must be an integer") from exc
+
+
+def _float(name: str, default: str) -> float:
+    raw = _env(name, default).strip()
+    try:
+        return float(raw)
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"{name} must be numeric") from exc
+
+
+def _require_absolute_url(name: str, value: str) -> None:
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError(f"{name} must be an absolute URL")
+
+
+def _validate_otlp_grpc_endpoint(name: str, value: str) -> None:
+    raw = value.strip()
+    if not raw:
+        raise RuntimeError(f"{name} is required")
+
+    parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="http")
+    if parsed.scheme not in ("", "http", "https"):
+        raise RuntimeError(f"{name} has unsupported scheme: {parsed.scheme!r}")
+    if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+        raise RuntimeError(f"{name} must point to an OTLP/gRPC endpoint, not OTLP/HTTP")
+    authority = (parsed.netloc or parsed.path).rstrip("/")
+    if not authority:
+        raise RuntimeError(f"{name} is invalid")
+
+
+def _normalize_samesite(raw: str) -> str:
+    value = raw.strip().lower()
+    if value not in _VALID_SAMESITE:
+        raise RuntimeError("SESSION_COOKIE_SAMESITE must be one of: strict, lax, none")
+    return value
+
+
+def _validate_domain_token(name: str, value: str) -> None:
+    token = value.strip()
+    if not token:
+        raise RuntimeError(f"{name} must not be empty")
+    if any(ch.isspace() for ch in token):
+        raise RuntimeError(f"{name} must not contain whitespace")
+    if "://" in token or "/" in token:
+        raise RuntimeError(f"{name} must be a bare host/domain token")
+
+
+def _validate_path(name: str, value: str) -> None:
+    if not value:
+        raise RuntimeError(f"{name} must not be empty")
+    if not value.startswith("/"):
+        raise RuntimeError(f"{name} must start with '/'")
+    if any(ch.isspace() for ch in value):
+        raise RuntimeError(f"{name} must not contain whitespace")
+
+
+def _normalize_log_level(raw: str) -> str:
+    level = raw.strip().upper()
+    if level == "WARN":
+        level = "WARNING"
+    if level not in _VALID_LOG_LEVELS:
+        raise RuntimeError("LOG_LEVEL must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL")
+    return level
 
 
 def load_settings() -> Settings:
-    env = _env('ENVIRONMENT', 'production').lower()
-    return Settings(
-        app_name=_env('APP_NAME', 'auth-service'),
-        environment=env,
-        dev_mode=env in {'dev', 'development', 'local', 'test'},
-        app_base_url=_env('APP_BASE_URL', '').rstrip('/'),
-        postgres_dsn=_env('POSTGRES_DSN', 'postgresql://postgres:postgres@postgres:5432/auth'),
-        postgres_min_size=int(_env('POSTGRES_MIN_SIZE', '1')),
-        postgres_max_size=int(_env('POSTGRES_MAX_SIZE', '10')),
-        session_cookie_name=_env('SESSION_COOKIE_NAME', 'auth_session'),
-        session_ttl_seconds=int(_env('SESSION_TTL_SECONDS', '86400')),
-        auth_tx_ttl_seconds=int(_env('AUTH_TX_TTL_SECONDS', '600')),
-        session_cookie_secure=_bool('SESSION_COOKIE_SECURE', 'true'),
-        session_cookie_samesite=_env('SESSION_COOKIE_SAMESITE', 'strict').lower(),
-        session_cookie_path=_env('SESSION_COOKIE_PATH', '/'),
-        session_cookie_domain=_env('SESSION_COOKIE_DOMAIN') or None,
-        google_client_id=_env('GOOGLE_CLIENT_ID'),
-        google_client_secret=_env('GOOGLE_CLIENT_SECRET'),
-        microsoft_client_id=_env('MS_CLIENT_ID'),
-        microsoft_client_secret=_env('MS_CLIENT_SECRET'),
-        microsoft_tenant_id=_env('MS_TENANT_ID', 'common'),
-        github_client_id=_env('GITHUB_CLIENT_ID'),
-        github_client_secret=_env('GITHUB_CLIENT_SECRET'),
-        google_allowed_domains=_csv('GOOGLE_ALLOWED_DOMAINS'),
-        microsoft_allowed_tenant_ids=_csv('MICROSOFT_ALLOWED_TENANT_IDS'),
-        microsoft_allowed_domains=_csv('MICROSOFT_ALLOWED_DOMAINS'),
-        github_allowed_orgs=_csv('GITHUB_ALLOWED_ORGS'),
-        metrics_enabled=_bool('METRICS_ENABLED', 'true'),
+    environment = _env("ENVIRONMENT", "production").strip().lower()
+    dev_mode = environment in _DEV_ENVIRONMENTS
+
+    app_name = _env("APP_NAME", "auth-service").strip() or "auth-service"
+    service_name = _env("SERVICE_NAME", app_name).strip() or app_name
+    service_version = _env("SERVICE_VERSION", "v1").strip() or "v1"
+    deployment_environment = _env("DEPLOYMENT_ENVIRONMENT", environment).strip().lower() or environment
+    cluster_name = _env("K8S_CLUSTER_NAME", "local-cluster").strip() or "local-cluster"
+    instance_id = _env("POD_NAME", _env("HOSTNAME", "local")).strip() or "local"
+
+    app_base_url = _env("APP_BASE_URL", "").strip().rstrip("/")
+    _require_absolute_url("APP_BASE_URL", app_base_url)
+
+    validate_route_path = _env("AUTH_VALIDATE_ROUTE_PATH", "/validate").strip() or "/validate"
+    me_route_path = _env("AUTH_ME_ROUTE_PATH", "/me").strip() or "/me"
+    _validate_path("AUTH_VALIDATE_ROUTE_PATH", validate_route_path)
+    _validate_path("AUTH_ME_ROUTE_PATH", me_route_path)
+
+    postgres_dsn = _env("POSTGRES_DSN", "postgresql://postgres:postgres@postgres:5432/auth").strip()
+    postgres_min_size = _int("POSTGRES_MIN_SIZE", "1")
+    postgres_max_size = _int("POSTGRES_MAX_SIZE", "10")
+    if postgres_min_size <= 0:
+        raise RuntimeError("POSTGRES_MIN_SIZE must be > 0")
+    if postgres_max_size <= 0:
+        raise RuntimeError("POSTGRES_MAX_SIZE must be > 0")
+    if postgres_max_size < postgres_min_size:
+        raise RuntimeError("POSTGRES_MAX_SIZE must be >= POSTGRES_MIN_SIZE")
+
+    session_cookie_name = _env("SESSION_COOKIE_NAME", "auth_session").strip() or "auth_session"
+    session_ttl_seconds = _int("SESSION_TTL_SECONDS", "86400")
+    auth_tx_ttl_seconds = _int("AUTH_TX_TTL_SECONDS", "600")
+    if session_ttl_seconds <= 0:
+        raise RuntimeError("SESSION_TTL_SECONDS must be > 0")
+    if auth_tx_ttl_seconds <= 0:
+        raise RuntimeError("AUTH_TX_TTL_SECONDS must be > 0")
+
+    session_cookie_secure = _bool(
+        "SESSION_COOKIE_SECURE",
+        "true" if not dev_mode else "false",
     )
+    session_cookie_samesite = _normalize_samesite(_env("SESSION_COOKIE_SAMESITE", "strict"))
+    session_cookie_path = _env("SESSION_COOKIE_PATH", "/").strip() or "/"
+    _validate_path("SESSION_COOKIE_PATH", session_cookie_path)
+    session_cookie_domain = _env("SESSION_COOKIE_DOMAIN", "").strip() or None
+    if session_cookie_domain is not None:
+        _validate_domain_token("SESSION_COOKIE_DOMAIN", session_cookie_domain)
+
+    google_client_id = _env("GOOGLE_CLIENT_ID", "").strip()
+    google_client_secret = _env("GOOGLE_CLIENT_SECRET", "").strip()
+    microsoft_client_id = _env("MS_CLIENT_ID", "").strip()
+    microsoft_client_secret = _env("MS_CLIENT_SECRET", "").strip()
+    microsoft_tenant_id = _env("MS_TENANT_ID", "common").strip() or "common"
+    github_client_id = _env("GITHUB_CLIENT_ID", "").strip()
+    github_client_secret = _env("GITHUB_CLIENT_SECRET", "").strip()
+
+    google_allowed_domains = _csv("GOOGLE_ALLOWED_DOMAINS")
+    microsoft_allowed_tenant_ids = _csv("MICROSOFT_ALLOWED_TENANT_IDS")
+    microsoft_allowed_domains = _csv("MICROSOFT_ALLOWED_DOMAINS")
+    github_allowed_orgs = _csv("GITHUB_ALLOWED_ORGS")
+
+    metrics_enabled = _bool("METRICS_ENABLED", "true")
+
+    otel_endpoint = _env(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "http://signoz-otel-collector.signoz.svc.cluster.local:4317",
+    ).strip()
+    otel_traces_sampler = _env("OTEL_TRACES_SAMPLER", "parentbased_traceidratio").strip().lower() or "parentbased_traceidratio"
+    otel_traces_sampler_arg = _float("OTEL_TRACES_SAMPLER_ARG", "0.1")
+    trace_sample_ratio = otel_traces_sampler_arg
+    otel_timeout_seconds = _float("OTEL_TIMEOUT_SECONDS", "10.0")
+    otel_metric_export_interval_ms = _int("OTEL_METRIC_EXPORT_INTERVAL_MS", "15000")
+    otel_metric_export_timeout_ms = _int("OTEL_METRIC_EXPORT_TIMEOUT_MS", "10000")
+    log_level = _normalize_log_level(_env("LOG_LEVEL", "INFO"))
+
+    settings = Settings(
+        app_name=app_name,
+        service_name=service_name,
+        service_version=service_version,
+        environment=environment,
+        deployment_environment=deployment_environment,
+        dev_mode=dev_mode,
+        cluster_name=cluster_name,
+        instance_id=instance_id,
+        app_base_url=app_base_url,
+        validate_route_path=validate_route_path,
+        me_route_path=me_route_path,
+        postgres_dsn=postgres_dsn,
+        postgres_min_size=postgres_min_size,
+        postgres_max_size=postgres_max_size,
+        session_cookie_name=session_cookie_name,
+        session_ttl_seconds=session_ttl_seconds,
+        auth_tx_ttl_seconds=auth_tx_ttl_seconds,
+        session_cookie_secure=session_cookie_secure,
+        session_cookie_samesite=session_cookie_samesite,
+        session_cookie_path=session_cookie_path,
+        session_cookie_domain=session_cookie_domain,
+        google_client_id=google_client_id,
+        google_client_secret=google_client_secret,
+        microsoft_client_id=microsoft_client_id,
+        microsoft_client_secret=microsoft_client_secret,
+        microsoft_tenant_id=microsoft_tenant_id,
+        github_client_id=github_client_id,
+        github_client_secret=github_client_secret,
+        google_allowed_domains=google_allowed_domains,
+        microsoft_allowed_tenant_ids=microsoft_allowed_tenant_ids,
+        microsoft_allowed_domains=microsoft_allowed_domains,
+        github_allowed_orgs=github_allowed_orgs,
+        metrics_enabled=metrics_enabled,
+        otel_endpoint=otel_endpoint,
+        otel_traces_sampler=otel_traces_sampler,
+        otel_traces_sampler_arg=otel_traces_sampler_arg,
+        trace_sample_ratio=trace_sample_ratio,
+        otel_timeout_seconds=otel_timeout_seconds,
+        otel_metric_export_interval_ms=otel_metric_export_interval_ms,
+        otel_metric_export_timeout_ms=otel_metric_export_timeout_ms,
+        log_level=log_level,
+    )
+
+    validate_runtime_settings(settings)
+    return settings
 
 
 def validate_runtime_settings(settings: Settings) -> None:
-    if not settings.app_base_url:
-        raise RuntimeError('APP_BASE_URL is required')
+    _require_absolute_url("APP_BASE_URL", settings.app_base_url)
+    if not settings.dev_mode and urlparse(settings.app_base_url).scheme != "https":
+        raise RuntimeError("APP_BASE_URL must use https in production")
 
-    parsed = urlparse(settings.app_base_url)
-    if not parsed.scheme or not parsed.netloc:
-        raise RuntimeError('APP_BASE_URL must be an absolute URL')
+    if settings.postgres_min_size <= 0:
+        raise RuntimeError("POSTGRES_MIN_SIZE must be > 0")
+    if settings.postgres_max_size <= 0:
+        raise RuntimeError("POSTGRES_MAX_SIZE must be > 0")
+    if settings.postgres_max_size < settings.postgres_min_size:
+        raise RuntimeError("POSTGRES_MAX_SIZE must be >= POSTGRES_MIN_SIZE")
 
-    if not settings.dev_mode and parsed.scheme != 'https':
-        raise RuntimeError('APP_BASE_URL must use https in production')
+    if settings.session_ttl_seconds <= 0:
+        raise RuntimeError("SESSION_TTL_SECONDS must be > 0")
+    if settings.auth_tx_ttl_seconds <= 0:
+        raise RuntimeError("AUTH_TX_TTL_SECONDS must be > 0")
 
-    if not settings.dev_mode and settings.microsoft_client_id and settings.microsoft_tenant_id.lower() in {'', 'common', 'organizations', 'consumers'}:
-        raise RuntimeError('MS_TENANT_ID must be a concrete tenant id in production')
+    _validate_path("SESSION_COOKIE_PATH", settings.session_cookie_path)
+    if settings.session_cookie_samesite not in _VALID_SAMESITE:
+        raise RuntimeError("SESSION_COOKIE_SAMESITE must be one of: strict, lax, none")
+    if settings.session_cookie_samesite == "none" and not settings.session_cookie_secure:
+        raise RuntimeError("SESSION_COOKIE_SECURE must be true when SESSION_COOKIE_SAMESITE=none")
+
+    if settings.session_cookie_domain is not None:
+        _validate_domain_token("SESSION_COOKIE_DOMAIN", settings.session_cookie_domain)
+
+    if any((settings.google_client_id, settings.google_client_secret)) and not all(
+        (settings.google_client_id, settings.google_client_secret)
+    ):
+        raise RuntimeError("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must both be set")
+    if any((settings.microsoft_client_id, settings.microsoft_client_secret)) and not all(
+        (settings.microsoft_client_id, settings.microsoft_client_secret)
+    ):
+        raise RuntimeError("MS_CLIENT_ID and MS_CLIENT_SECRET must both be set")
+    if any((settings.github_client_id, settings.github_client_secret)) and not all(
+        (settings.github_client_id, settings.github_client_secret)
+    ):
+        raise RuntimeError("GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must both be set")
+
+    if not settings.dev_mode and settings.microsoft_client_id:
+        tenant = settings.microsoft_tenant_id.lower()
+        if tenant in {"", "common", "organizations", "consumers"}:
+            raise RuntimeError("MS_TENANT_ID must be a concrete tenant id in production")
+
+    if not settings.dev_mode and not enabled_providers(settings):
+        raise RuntimeError("At least one OAuth provider must be configured in production")
+
+    _validate_otlp_grpc_endpoint("OTEL_EXPORTER_OTLP_ENDPOINT", settings.otel_endpoint)
+
+    if settings.otel_timeout_seconds <= 0:
+        raise RuntimeError("OTEL_TIMEOUT_SECONDS must be > 0")
+    if settings.otel_metric_export_interval_ms <= 0:
+        raise RuntimeError("OTEL_METRIC_EXPORT_INTERVAL_MS must be > 0")
+    if settings.otel_metric_export_timeout_ms <= 0:
+        raise RuntimeError("OTEL_METRIC_EXPORT_TIMEOUT_MS must be > 0")
+
+    if settings.otel_traces_sampler not in {
+        "always_on",
+        "always_off",
+        "traceidratio",
+        "parentbased_always_on",
+        "parentbased_always_off",
+        "parentbased_traceidratio",
+    }:
+        raise RuntimeError(
+            "OTEL_TRACES_SAMPLER must be one of: "
+            "always_on, always_off, traceidratio, parentbased_always_on, "
+            "parentbased_always_off, parentbased_traceidratio"
+        )
+    if not 0.0 <= settings.trace_sample_ratio <= 1.0:
+        raise RuntimeError("OTEL_TRACES_SAMPLER_ARG / trace_sample_ratio must be between 0.0 and 1.0")
+
+    if settings.log_level not in _VALID_LOG_LEVELS:
+        raise RuntimeError("LOG_LEVEL must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL")
 
 
 def enabled_providers(settings: Settings) -> list[str]:
     providers: list[str] = []
     if settings.google_client_id and settings.google_client_secret:
-        providers.append('google')
+        providers.append("google")
     if settings.microsoft_client_id and settings.microsoft_client_secret:
-        providers.append('microsoft')
+        providers.append("microsoft")
     if settings.github_client_id and settings.github_client_secret:
-        providers.append('github')
+        providers.append("github")
     return providers
 
 
 def callback_url(settings: Settings, provider: str) -> str:
-    return f'{settings.app_base_url}/callback/{provider}'
+    return f"{settings.app_base_url}/callback/{provider.lower()}"
+
+
+def validate_url(settings: Settings) -> str:
+    return f"{settings.app_base_url}{settings.validate_route_path}"
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return load_settings()

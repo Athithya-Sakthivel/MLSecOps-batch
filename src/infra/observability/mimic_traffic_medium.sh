@@ -26,13 +26,14 @@ export MODEL_OUTPUT_NAMES="${MODEL_OUTPUT_NAMES:-variable}"
 export FEATURE_ORDER="${FEATURE_ORDER:-pickup_hour,pickup_dow,pickup_month,pickup_is_weekend,pickup_borough_id,pickup_zone_id,pickup_service_zone_id,dropoff_borough_id,dropoff_zone_id,dropoff_service_zone_id,route_pair_id,avg_duration_7d_zone_hour,avg_fare_30d_zone,trip_count_90d_zone_hour}"
 export ALLOW_EXTRA_FEATURES="${ALLOW_EXTRA_FEATURES:-false}"
 export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-/mlsecops/model-cache}"
-export RAY_IMAGE="${RAY_IMAGE:-ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-15-06-12--b2617e3@sha256:3615562548755e906ad17945518267cfadbac7bdaacc5a76fc6ebd4dfbcfd6f4}"
+export RAY_IMAGE="${RAY_IMAGE:-ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-18-19-10--8b7aa70@sha256:b7f3bc8e5ad7be0e29e683b88e202fdafa3f050ebd262a8c01e3a22fd05d0f84}"
 export USE_IAM="${USE_IAM:-false}"
 export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://signoz-otel-collector.signoz.svc.cluster.local:4317}"
 
 
 # temprory dev override to get adequate telemtry
 export SLOW_REQUEST_MS="${SLOW_REQUEST_MS:-100}"
+export OTEL_TRACES_SAMPLER=parentbased_traceidratio
 export OTEL_TRACES_SAMPLER_ARG=0.7
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 

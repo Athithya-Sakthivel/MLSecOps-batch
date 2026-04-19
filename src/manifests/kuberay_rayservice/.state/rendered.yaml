@@ -35,6 +35,13 @@ spec:
         include-dashboard: 'true'
         num-cpus: '0'
       template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: tabular-inference
+            app.kubernetes.io/managed-by: inference-service
+            app.kubernetes.io/component: inference
+            app.kubernetes.io/part-of: tabular-inference
+            ray.io/group: head
         spec:
           securityContext: &id001
             runAsNonRoot: true
@@ -49,7 +56,7 @@ spec:
             emptyDir: {}
           containers:
           - name: ray-head
-            image: ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-15-06-12--b2617e3@sha256:3615562548755e906ad17945518267cfadbac7bdaacc5a76fc6ebd4dfbcfd6f4
+            image: ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-18-19-10--8b7aa70@sha256:b7f3bc8e5ad7be0e29e683b88e202fdafa3f050ebd262a8c01e3a22fd05d0f84
             imagePullPolicy: IfNotPresent
             securityContext:
               allowPrivilegeEscalation: false
@@ -206,13 +213,20 @@ spec:
       rayStartParams:
         num-cpus: '1'
       template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: tabular-inference
+            app.kubernetes.io/managed-by: inference-service
+            app.kubernetes.io/component: inference
+            app.kubernetes.io/part-of: tabular-inference
+            ray.io/group: worker
         spec:
           securityContext: *id001
           terminationGracePeriodSeconds: 30
           volumes: *id002
           containers:
           - name: ray-worker
-            image: ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-15-06-12--b2617e3@sha256:3615562548755e906ad17945518267cfadbac7bdaacc5a76fc6ebd4dfbcfd6f4
+            image: ghcr.io/athithya-sakthivel/tabular-inference-service:2026-04-18-19-10--8b7aa70@sha256:b7f3bc8e5ad7be0e29e683b88e202fdafa3f050ebd262a8c01e3a22fd05d0f84
             imagePullPolicy: IfNotPresent
             securityContext:
               allowPrivilegeEscalation: false

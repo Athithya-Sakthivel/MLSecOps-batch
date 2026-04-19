@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +8,7 @@ import os
 import sys
 import time
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 from json import JSONDecodeError
 from typing import Any, ClassVar
@@ -52,6 +54,7 @@ BASE_LOG_FIELDS: dict[str, Any] = {
     "model.uri": SETTINGS.model_uri,
 }
 
+
 class JsonFormatter(logging.Formatter):
     _standard_attrs: ClassVar[set[str]] = {
         "name",
@@ -84,17 +87,12 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-
         for key, value in record.__dict__.items():
-            if key in self._standard_attrs or key.startswith("_"):
-                continue
-            if value is None:
+            if key in self._standard_attrs or key.startswith("_") or value is None:
                 continue
             payload[key] = value
-
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
@@ -123,15 +121,11 @@ def configure_logging() -> None:
         root.addHandler(handler)
     else:
         for handler in root.handlers:
-            try:
+            with suppress(Exception):
                 handler.setFormatter(formatter)
-            except Exception:
-                continue
 
-    logging.getLogger("asyncio").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    for name in ("asyncio", "uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 configure_logging()
@@ -209,12 +203,11 @@ def _first_non_empty(*values: Any) -> Any:
 
 def _merge_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, Any] = {}
-    if isinstance(payload, dict):
-        merged.update(payload)
-        for key in ("user", "identity", "session"):
-            nested = payload.get(key)
-            if isinstance(nested, dict):
-                merged.update(nested)
+    merged.update(payload)
+    for key in ("user", "identity", "session"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            merged.update(nested)
     return merged
 
 
@@ -223,7 +216,6 @@ def _coerce_auth_context(payload: Any) -> dict[str, Any]:
         raise ValueError("authentication response must be a JSON object")
 
     merged = _merge_auth_payload(payload)
-
     user_id = _first_non_empty(
         merged.get("user_id"),
         merged.get("id"),
@@ -233,13 +225,12 @@ def _coerce_auth_context(payload: Any) -> dict[str, Any]:
     if not user_id:
         raise ValueError("authentication response is missing a user identifier")
 
-    context = {
+    return {
         "user_id": str(user_id),
         "session_id": _first_non_empty(
             merged.get("session_id"),
             merged.get("sid"),
             merged.get("sessionId"),
-            merged.get("id"),
         ),
         "provider": _first_non_empty(merged.get("provider"), merged.get("auth_provider")),
         "email": _first_non_empty(
@@ -258,7 +249,6 @@ def _coerce_auth_context(payload: Any) -> dict[str, Any]:
         ),
         "raw": merged,
     }
-    return context
 
 
 class AuthValidationError(Exception):
@@ -274,7 +264,16 @@ class InferenceBackend:
         self.logger = logging.getLogger("tabular-inference.backend")
         self.tracer = trace.get_tracer("tabular-inference-backend")
         self.meter = metrics.get_meter("tabular-inference-backend")
-        self._telemetry = initialize_telemetry(self.settings)
+
+        try:
+            self._telemetry = initialize_telemetry(self.settings)
+        except Exception as exc:
+            self._telemetry = None
+            _log_exception(
+                self.logger,
+                "telemetry_initialize_failed",
+                error_type=exc.__class__.__name__,
+            )
 
         self.inference_request_counter = self.meter.create_counter(
             name="inference.requests",
@@ -478,7 +477,16 @@ class TabularInferenceApp:
         self.logger = logger
         self.tracer = trace.get_tracer("tabular-inference-http")
         self.meter = metrics.get_meter("tabular-inference-http")
-        self._telemetry = initialize_telemetry(self.settings)
+        try:
+            self._telemetry = initialize_telemetry(self.settings)
+        except Exception as exc:
+            self._telemetry = None
+            _log_exception(
+                self.logger,
+                "telemetry_initialize_failed",
+                error_type=exc.__class__.__name__,
+            )
+
         self._backend_info_cache: dict[str, Any] | None = None
         self._auth_client = httpx.AsyncClient(
             timeout=httpx.Timeout(AUTH_TIMEOUT_SECONDS),
@@ -509,11 +517,9 @@ class TabularInferenceApp:
     async def _get_backend_info(self, refresh: bool = False) -> dict[str, Any]:
         if self._backend_info_cache is not None and not refresh:
             return self._backend_info_cache
-
         raw = await self.backend.ready_summary.remote()
         if not isinstance(raw, dict):
             raise RuntimeError("backend ready_summary returned an invalid payload")
-
         self._backend_info_cache = raw
         return raw
 
@@ -532,9 +538,7 @@ class TabularInferenceApp:
         return headers
 
     async def _validate_auth(self, request: Request, request_id: str) -> dict[str, Any]:
-        cookie = request.headers.get("cookie")
-        authorization = request.headers.get("authorization")
-        if not cookie and not authorization:
+        if not request.headers.get("cookie") and not request.headers.get("authorization"):
             raise AuthValidationError(401, "Unauthorized")
 
         headers = self._build_auth_headers(request, request_id)
@@ -588,7 +592,7 @@ class TabularInferenceApp:
             span.set_attribute("auth.latency_ms", round(elapsed_ms, 3))
             span.set_attribute("auth.status_code", response.status_code)
 
-            if response.status_code == 401 or response.status_code == 403:
+            if response.status_code in {401, 403}:
                 _span_event(
                     "predict_auth_unauthorized",
                     request_id=request_id,
@@ -668,11 +672,7 @@ class TabularInferenceApp:
         try:
             info = await self._get_backend_info(refresh=True)
         except Exception as exc:
-            return _json_response(
-                {"detail": f"Backend unavailable: {exc}"},
-                503,
-                request_id=request_id,
-            )
+            return _json_response({"detail": f"Backend unavailable: {exc}"}, 503, request_id=request_id)
 
         payload = {
             "status": "ok",
@@ -683,7 +683,7 @@ class TabularInferenceApp:
             "model_version": info["model_version"],
             "schema_version": info["schema_version"],
             "feature_version": info["feature_version"],
-            "model_uri": info["model_uri"],
+            "model_uri": self.settings.model_uri if "model_uri" not in info else info["model_uri"],
             "model_path": info["model_path"],
             "feature_order": info["feature_order"],
             "allow_extra_features": info["allow_extra_features"],
@@ -691,12 +691,7 @@ class TabularInferenceApp:
         }
         return _json_response(payload, 200, request_id=request_id)
 
-    async def _handle_predict(
-        self,
-        request: Request,
-        request_id: str,
-        request_start: float,
-    ) -> JSONResponse:
+    async def _handle_predict(self, request: Request, request_id: str, request_start: float) -> JSONResponse:
         try:
             auth_context = await self._validate_auth(request, request_id)
         except AuthValidationError as exc:
@@ -707,10 +702,12 @@ class TabularInferenceApp:
         except (JSONDecodeError, ValueError) as exc:
             _span_event(
                 "predict_invalid_json",
-                http_route="/predict",
-                request_id=request_id,
-                error_type=exc.__class__.__name__,
-                user_id=auth_context["user_id"],
+                **{
+                    "http.route": "/predict",
+                    "request.id": request_id,
+                    "error.type": exc.__class__.__name__,
+                    "user.id": auth_context["user_id"],
+                },
             )
             _log(
                 self.logger,
@@ -730,25 +727,21 @@ class TabularInferenceApp:
             if n_instances < 1:
                 raise ValueError("At least one instance is required")
             if n_instances > self.settings.max_instances_per_request:
-                raise ValueError(
-                    f"Too many instances: {n_instances} > {self.settings.max_instances_per_request}"
-                )
+                raise ValueError(f"Too many instances: {n_instances} > {self.settings.max_instances_per_request}")
 
             try:
                 backend_info = await self._get_backend_info(refresh=False)
             except Exception as exc:
                 _span_event(
                     "backend_unavailable",
-                    http_route="/predict",
-                    request_id=request_id,
-                    error_type=exc.__class__.__name__,
-                    user_id=auth_context["user_id"],
+                    **{
+                        "http.route": "/predict",
+                        "request.id": request_id,
+                        "error.type": exc.__class__.__name__,
+                        "user.id": auth_context["user_id"],
+                    },
                 )
-                return _json_response(
-                    {"detail": f"Backend unavailable: {exc}"},
-                    503,
-                    request_id=request_id,
-                )
+                return _json_response({"detail": f"Backend unavailable: {exc}"}, 503, request_id=request_id)
 
             with self.tracer.start_as_current_span("prepare_input") as span:
                 span.set_attribute("batch.size", n_instances)
@@ -797,14 +790,14 @@ class TabularInferenceApp:
                 _span_event(
                     "predict_slow_request",
                     **{
-                        "http_route": "/predict",
-                        "request_id": request_id,
-                        "model_name": backend_info["model_name"],
-                        "model_version": backend_info["model_version"],
+                        "http.route": "/predict",
+                        "request.id": request_id,
+                        "model.name": backend_info["model_name"],
+                        "model.version": backend_info["model_version"],
                         "batch.size": n_instances,
                         "latency_ms": round(total_ms, 3),
                         "slow_request_threshold_ms": self.settings.slow_request_ms,
-                        "user_id": auth_context["user_id"],
+                        "user.id": auth_context["user_id"],
                     },
                 )
                 _log(
@@ -833,10 +826,8 @@ class TabularInferenceApp:
 
         except ValueError as exc:
             backend_info: dict[str, Any] | None = None
-            try:
+            with suppress(Exception):
                 backend_info = await self._get_backend_info(refresh=False)
-            except Exception:
-                backend_info = None
 
             model_name = backend_info["model_name"] if backend_info else "model"
             model_version = backend_info["model_version"] if backend_info else self.settings.model_version
@@ -844,13 +835,13 @@ class TabularInferenceApp:
             _span_event(
                 "predict_validation_failed",
                 **{
-                    "http_route": "/predict",
-                    "request_id": request_id,
+                    "http.route": "/predict",
+                    "request.id": request_id,
                     "model.name": model_name,
                     "model.version": model_version,
-                    "error_type": "validation_error",
-                    "error_message": str(exc),
-                    "user_id": auth_context["user_id"],
+                    "error.type": "validation_error",
+                    "error.message": str(exc),
+                    "user.id": auth_context["user_id"],
                 },
             )
             _log(

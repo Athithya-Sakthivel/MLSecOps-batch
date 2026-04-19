@@ -1,8 +1,8 @@
-
 from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -51,6 +51,17 @@ def _clean_str(value: object | None) -> str | None:
     return text or None
 
 
+def _get_setting(settings: Settings, name: str, default: Any = None) -> Any:
+    return getattr(settings, name, default)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _normalize_level_name(raw: str | None, default: str = "INFO") -> str:
     level = (_clean_str(raw) or default).upper()
     aliases = {
@@ -60,7 +71,7 @@ def _normalize_level_name(raw: str | None, default: str = "INFO") -> str:
     level = aliases.get(level, level)
     valid = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
     if level not in valid:
-        raise ValueError(f"invalid LOG_LEVEL: {raw!r}")
+        return default
     return level
 
 
@@ -111,10 +122,10 @@ def _log_exception(event: str, message: str, **fields: Any) -> None:
     logger.exception(message, extra=payload)
 
 
-def _grpc_endpoint(endpoint: str) -> tuple[str, bool]:
-    raw = endpoint.strip()
+def _grpc_endpoint(endpoint: str | None) -> tuple[str | None, bool]:
+    raw = _clean_str(endpoint)
     if not raw:
-        raise ValueError("otel_endpoint must be set")
+        return None, True
 
     parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="http")
 
@@ -136,50 +147,50 @@ def _grpc_endpoint(endpoint: str) -> tuple[str, bool]:
 
 def _resource(settings: Settings) -> Resource:
     attrs = {
-        "service.name": _clean_str(settings.service_name),
-        "service.version": _clean_str(settings.service_version),
-        "deployment.environment": _clean_str(settings.deployment_environment),
-        "k8s.cluster.name": _clean_str(settings.cluster_name),
-        "service.instance.id": _clean_str(settings.instance_id),
+        "service.name": _clean_str(_get_setting(settings, "service_name", None)),
+        "service.version": _clean_str(_get_setting(settings, "service_version", None)),
+        "deployment.environment": _clean_str(_get_setting(settings, "deployment_environment", None)),
+        "k8s.cluster.name": _clean_str(_get_setting(settings, "cluster_name", None)),
+        "service.instance.id": _clean_str(_get_setting(settings, "instance_id", None)),
     }
     clean_attrs = {k: v for k, v in attrs.items() if v is not None}
     if not clean_attrs.get("service.name"):
-        raise ValueError("service_name must be set")
+        clean_attrs["service.name"] = "unknown-service"
     return Resource.create(clean_attrs)
 
 
-def _require_nonnegative_number(name: str, value: object) -> float:
+def _require_nonnegative_number(name: str, value: object | None, default: float) -> float:
+    if value is None:
+        return default
     try:
         num = float(value)
-    except Exception as exc:  # pragma: no cover
-        raise ValueError(f"{name} must be numeric") from exc
+    except Exception:
+        return default
     if num < 0:
-        raise ValueError(f"{name} must be >= 0")
+        return default
     return num
 
 
-def _require_positive_number(name: str, value: object) -> float:
-    num = _require_nonnegative_number(name, value)
-    if num <= 0:
-        raise ValueError(f"{name} must be > 0")
-    return num
+def _require_positive_number(name: str, value: object | None, default: float) -> float:
+    num = _require_nonnegative_number(name, value, default)
+    return num if num > 0 else default
 
 
-def _require_ratio(name: str, value: object) -> float:
-    num = _require_nonnegative_number(name, value)
+def _require_ratio(name: str, value: object | None, default: float) -> float:
+    num = _require_nonnegative_number(name, value, default)
     if not 0.0 <= num <= 1.0:
-        raise ValueError(f"{name} must be between 0.0 and 1.0")
+        return default
     return num
 
 
-def _require_positive_int(name: str, value: object) -> int:
+def _require_positive_int(name: str, value: object | None, default: int) -> int:
+    if value is None:
+        return default
     try:
         num = int(value)
-    except Exception as exc:  # pragma: no cover
-        raise ValueError(f"{name} must be an integer") from exc
-    if num <= 0:
-        raise ValueError(f"{name} must be > 0")
-    return num
+    except Exception:
+        return default
+    return num if num > 0 else default
 
 
 def _normalize_sampler_name(raw: str | None) -> str:
@@ -187,15 +198,14 @@ def _normalize_sampler_name(raw: str | None) -> str:
 
 
 def _trace_sample_ratio(settings: Settings) -> float:
-    if hasattr(settings, "trace_sample_ratio"):
-        return _require_ratio("trace_sample_ratio", settings.trace_sample_ratio)
-    if hasattr(settings, "otel_traces_sampler_arg"):
-        return _require_ratio("otel_traces_sampler_arg", settings.otel_traces_sampler_arg)
-    return 0.1
+    ratio = _get_setting(settings, "trace_sample_ratio", None)
+    if ratio is None:
+        ratio = _get_setting(settings, "otel_traces_sampler_arg", None)
+    return _require_ratio("trace_sample_ratio", ratio, 0.1)
 
 
 def _build_sampler(settings: Settings):
-    sampler = _normalize_sampler_name(getattr(settings, "otel_traces_sampler", None))
+    sampler = _normalize_sampler_name(_get_setting(settings, "otel_traces_sampler", None))
     ratio = _trace_sample_ratio(settings)
 
     if sampler == "always_on":
@@ -211,31 +221,40 @@ def _build_sampler(settings: Settings):
     if sampler == "parentbased_traceidratio":
         return ParentBased(root=TraceIdRatioBased(ratio))
 
-    raise ValueError(
-        "unsupported OTEL_TRACES_SAMPLER value: "
-        f"{getattr(settings, 'otel_traces_sampler', None)!r}. Supported values: "
-        "'always_on', 'always_off', 'traceidratio', "
-        "'parentbased_always_on', 'parentbased_always_off', 'parentbased_traceidratio'"
-    )
+    return ParentBased(root=TraceIdRatioBased(ratio))
 
 
 def _config_key(
     settings: Settings,
-    endpoint: str,
+    endpoint: str | None,
     insecure: bool,
     resource_attrs: dict[str, str],
     log_level_name: str,
+    traces_enabled: bool,
+    metrics_enabled: bool,
+    logs_enabled: bool,
 ) -> tuple[Any, ...]:
     return (
         endpoint,
         insecure,
         tuple(sorted(resource_attrs.items())),
-        _normalize_sampler_name(getattr(settings, "otel_traces_sampler", None)),
+        _normalize_sampler_name(_get_setting(settings, "otel_traces_sampler", None)),
         _trace_sample_ratio(settings),
-        _require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
-        _require_positive_int("otel_metric_export_interval_ms", settings.otel_metric_export_interval_ms),
-        _require_positive_int("otel_metric_export_timeout_ms", settings.otel_metric_export_timeout_ms),
+        _require_positive_number("otel_timeout_seconds", _get_setting(settings, "otel_timeout_seconds", 5.0), 5.0),
+        _require_positive_int(
+            "otel_metric_export_interval_ms",
+            _get_setting(settings, "otel_metric_export_interval_ms", 60000),
+            60000,
+        ),
+        _require_positive_int(
+            "otel_metric_export_timeout_ms",
+            _get_setting(settings, "otel_metric_export_timeout_ms", 30000),
+            30000,
+        ),
         log_level_name,
+        traces_enabled,
+        metrics_enabled,
+        logs_enabled,
     )
 
 
@@ -265,13 +284,16 @@ def _log_record_factory(
 
 @dataclass
 class TelemetryHandle:
-    tracer_provider: TracerProvider
-    meter_provider: MeterProvider
-    logger_provider: LoggerProvider
-    root_handler: logging.Handler
+    tracer_provider: TracerProvider | None
+    meter_provider: MeterProvider | None
+    logger_provider: LoggerProvider | None
+    root_handler: logging.Handler | None
     log_level_name: str
-    endpoint: str
+    endpoint: str | None
     insecure: bool
+    traces_enabled: bool
+    metrics_enabled: bool
+    logs_enabled: bool
     previous_log_record_factory: Callable[..., logging.LogRecord]
     _closed: bool = False
 
@@ -291,28 +313,28 @@ class TelemetryHandle:
             )
 
             root_logger = logging.getLogger()
-            if self.root_handler in root_logger.handlers:
+            if self.root_handler is not None and self.root_handler in root_logger.handlers:
                 root_logger.removeHandler(self.root_handler)
 
-            try:
-                self.root_handler.flush()
-            except Exception:
-                _log_warn(
-                    event="telemetry.shutdown.flush_failed",
-                    message="root handler flush failed",
-                    endpoint=self.endpoint,
-                    insecure=self.insecure,
-                )
-
-            try:
-                self.root_handler.close()
-            except Exception:
-                _log_warn(
-                    event="telemetry.shutdown.close_failed",
-                    message="root handler close failed",
-                    endpoint=self.endpoint,
-                    insecure=self.insecure,
-                )
+            if self.root_handler is not None:
+                try:
+                    self.root_handler.flush()
+                except Exception:
+                    _log_warn(
+                        event="telemetry.shutdown.flush_failed",
+                        message="root handler flush failed",
+                        endpoint=self.endpoint,
+                        insecure=self.insecure,
+                    )
+                try:
+                    self.root_handler.close()
+                except Exception:
+                    _log_warn(
+                        event="telemetry.shutdown.close_failed",
+                        message="root handler close failed",
+                        endpoint=self.endpoint,
+                        insecure=self.insecure,
+                    )
 
             try:
                 logging.setLogRecordFactory(self.previous_log_record_factory)
@@ -329,6 +351,8 @@ class TelemetryHandle:
                 ("meter_provider", self.meter_provider),
                 ("tracer_provider", self.tracer_provider),
             ):
+                if provider is None:
+                    continue
                 try:
                     force_flush = getattr(provider, "force_flush", None)
                     if callable(force_flush):
@@ -362,19 +386,57 @@ class TelemetryHandle:
             )
 
 
+def _safe_set_tracer_provider(provider: TracerProvider) -> None:
+    try:
+        current = trace.get_tracer_provider()
+        if current is provider:
+            return
+        trace.set_tracer_provider(provider)
+    except Exception:
+        return
+
+
+def _safe_set_meter_provider(provider: MeterProvider) -> None:
+    try:
+        metrics.set_meter_provider(provider)
+    except Exception:
+        return
+
+
+def _safe_set_logger_provider(provider: LoggerProvider) -> None:
+    try:
+        set_logger_provider(provider)
+    except Exception:
+        return
+
+
 def initialize_telemetry(settings: Settings) -> TelemetryHandle:
     global _HANDLE, _STATE_KEY, _ATEEXIT_REGISTERED
 
     with _STATE_LOCK:
-        log_level_name = _normalize_level_name(getattr(settings, "log_level", None))
-        endpoint, insecure = _grpc_endpoint(settings.otel_endpoint)
+        log_level_name = _normalize_level_name(_get_setting(settings, "log_level", None))
+        endpoint, insecure = _grpc_endpoint(_get_setting(settings, "otel_endpoint", None))
         resource = _resource(settings)
         resource_attrs = {
             k: v
             for k, v in resource.attributes.items()
             if isinstance(k, str) and isinstance(v, str)
         }
-        config_key = _config_key(settings, endpoint, insecure, resource_attrs, log_level_name)
+
+        traces_enabled = _env_flag("ENABLE_OTEL_TRACES", True)
+        metrics_enabled = _env_flag("ENABLE_OTEL_METRICS", False)
+        logs_enabled = _env_flag("ENABLE_OTEL_LOGS", False)
+
+        config_key = _config_key(
+            settings,
+            endpoint,
+            insecure,
+            resource_attrs,
+            log_level_name,
+            traces_enabled,
+            metrics_enabled,
+            logs_enabled,
+        )
 
         if _HANDLE is not None:
             if _STATE_KEY == config_key:
@@ -386,7 +448,14 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
                     log_level=log_level_name,
                 )
                 return _HANDLE
-            raise RuntimeError("telemetry was already initialized with a different configuration")
+            _log_warn(
+                event="telemetry.initialize.reused",
+                message="telemetry already initialized; reusing existing providers",
+                endpoint=endpoint,
+                insecure=insecure,
+                log_level=log_level_name,
+            )
+            return _HANDLE
 
         previous_factory = logging.getLogRecordFactory()
         logging.setLogRecordFactory(_log_record_factory(previous_factory))
@@ -403,150 +472,188 @@ def initialize_telemetry(settings: Settings) -> TelemetryHandle:
             insecure=insecure,
             log_level=log_level_name,
             trace_sample_ratio=_trace_sample_ratio(settings),
-            otel_timeout_seconds=float(settings.otel_timeout_seconds),
-            otel_metric_export_interval_ms=int(settings.otel_metric_export_interval_ms),
-            otel_metric_export_timeout_ms=int(settings.otel_metric_export_timeout_ms),
+            otel_timeout_seconds=_require_positive_number(
+                "otel_timeout_seconds",
+                _get_setting(settings, "otel_timeout_seconds", None),
+                5.0,
+            ),
+            otel_metric_export_interval_ms=_require_positive_int(
+                "otel_metric_export_interval_ms",
+                _get_setting(settings, "otel_metric_export_interval_ms", None),
+                60000,
+            ),
+            otel_metric_export_timeout_ms=_require_positive_int(
+                "otel_metric_export_timeout_ms",
+                _get_setting(settings, "otel_metric_export_timeout_ms", None),
+                30000,
+            ),
+            traces_enabled=traces_enabled,
+            metrics_enabled=metrics_enabled,
+            logs_enabled=logs_enabled,
         )
 
         tracer_provider: TracerProvider | None = None
         meter_provider: MeterProvider | None = None
         logger_provider: LoggerProvider | None = None
+        root_handler: logging.Handler | None = None
 
-        try:
-            tracer_provider = TracerProvider(resource=resource, sampler=_build_sampler(settings))
-            tracer_provider.add_span_processor(
-                BatchSpanProcessor(
-                    OTLPSpanExporter(
-                        endpoint=endpoint,
-                        insecure=insecure,
-                        timeout=_require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
-                    )
-                )
-            )
-            trace.set_tracer_provider(tracer_provider)
-            _log_info(
-                event="telemetry.traces.configured",
-                message="tracing configured",
-                endpoint=endpoint,
-                insecure=insecure,
-            )
+        timeout_s = _require_positive_number(
+            "otel_timeout_seconds",
+            _get_setting(settings, "otel_timeout_seconds", None),
+            5.0,
+        )
+        metric_export_interval_ms = _require_positive_int(
+            "otel_metric_export_interval_ms",
+            _get_setting(settings, "otel_metric_export_interval_ms", None),
+            60000,
+        )
+        metric_export_timeout_ms = _require_positive_int(
+            "otel_metric_export_timeout_ms",
+            _get_setting(settings, "otel_metric_export_timeout_ms", None),
+            30000,
+        )
 
-            metric_exporter = OTLPMetricExporter(
-                endpoint=endpoint,
-                insecure=insecure,
-                timeout=_require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
-            )
-            meter_provider = MeterProvider(
-                resource=resource,
-                metric_readers=[
-                    PeriodicExportingMetricReader(
-                        metric_exporter,
-                        export_interval_millis=_require_positive_int(
-                            "otel_metric_export_interval_ms", settings.otel_metric_export_interval_ms
-                        ),
-                        export_timeout_millis=_require_positive_int(
-                            "otel_metric_export_timeout_ms", settings.otel_metric_export_timeout_ms
-                        ),
-                    )
-                ],
-            )
-            metrics.set_meter_provider(meter_provider)
-            _log_info(
-                event="telemetry.metrics.configured",
-                message="metrics configured",
-                endpoint=endpoint,
-                insecure=insecure,
-            )
-
-            logger_provider = LoggerProvider(resource=resource)
-            logger_provider.add_log_record_processor(
-                BatchLogRecordProcessor(
-                    OTLPLogExporter(
-                        endpoint=endpoint,
-                        insecure=insecure,
-                        timeout=_require_positive_number("otel_timeout_seconds", settings.otel_timeout_seconds),
-                    )
-                )
-            )
-            set_logger_provider(logger_provider)
-            _log_info(
-                event="telemetry.logs.configured",
-                message="logs provider configured",
-                endpoint=endpoint,
-                insecure=insecure,
-            )
-
-            root_logger = logging.getLogger()
-            root_logger.setLevel(_level_to_int(log_level_name))
-
-            existing_handler = next(
-                (handler for handler in root_logger.handlers if getattr(handler, "_otel_handler", False)),
-                None,
-            )
-            if existing_handler is None:
-                otel_handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
-                otel_handler._otel_handler = True  # sentinel for idempotency
-                otel_handler.addFilter(_DropOpenTelemetryRecords())
-                root_logger.addHandler(otel_handler)
-                root_handler = otel_handler
-                _log_info(
-                    event="telemetry.root_handler.attached",
-                    message="otel log handler attached to root logger",
-                    endpoint=endpoint,
-                    insecure=insecure,
-                )
-            else:
-                root_handler = existing_handler
-                _log_warn(
-                    event="telemetry.root_handler.reused",
-                    message="existing otel log handler found and reused",
-                    endpoint=endpoint,
-                    insecure=insecure,
-                )
-
-            handle = TelemetryHandle(
-                tracer_provider=tracer_provider,
-                meter_provider=meter_provider,
-                logger_provider=logger_provider,
-                root_handler=root_handler,
-                log_level_name=log_level_name,
-                endpoint=endpoint,
-                insecure=insecure,
-                previous_log_record_factory=previous_factory,
-            )
-            _HANDLE = handle
-            _STATE_KEY = config_key
-
-            if not _ATEEXIT_REGISTERED:
-                atexit.register(handle.shutdown)
-                _ATEEXIT_REGISTERED = True
-
-            _log_info(
-                event="telemetry.initialize.complete",
-                message="telemetry initialization complete",
-                endpoint=endpoint,
-                insecure=insecure,
-                log_level=log_level_name,
-            )
-            return handle
-
-        except Exception as exc:
-            _log_exception(
-                event="telemetry.initialize.failed",
-                message="telemetry initialization failed",
-                endpoint=endpoint,
-                insecure=insecure,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-            )
+        if traces_enabled and endpoint:
             try:
-                logging.setLogRecordFactory(previous_factory)
-            except Exception:
-                pass
-            for provider in (logger_provider, meter_provider, tracer_provider):
-                try:
-                    if provider is not None:
-                        provider.shutdown()
-                except Exception:
-                    pass
-            raise
+                tracer_provider = TracerProvider(resource=resource, sampler=_build_sampler(settings))
+                tracer_provider.add_span_processor(
+                    BatchSpanProcessor(
+                        OTLPSpanExporter(
+                            endpoint=endpoint,
+                            insecure=insecure,
+                            timeout=timeout_s,
+                        )
+                    )
+                )
+                _safe_set_tracer_provider(tracer_provider)
+                _log_info(
+                    event="telemetry.traces.configured",
+                    message="tracing configured",
+                    endpoint=endpoint,
+                    insecure=insecure,
+                )
+            except Exception as exc:
+                _log_exception(
+                    event="telemetry.traces.disabled",
+                    message="tracing initialization failed; continuing without OTEL traces",
+                    endpoint=endpoint,
+                    insecure=insecure,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                tracer_provider = None
+
+        if metrics_enabled and endpoint:
+            try:
+                metric_exporter = OTLPMetricExporter(
+                    endpoint=endpoint,
+                    insecure=insecure,
+                    timeout=timeout_s,
+                )
+                meter_provider = MeterProvider(
+                    resource=resource,
+                    metric_readers=[
+                        PeriodicExportingMetricReader(
+                            metric_exporter,
+                            export_interval_millis=metric_export_interval_ms,
+                            export_timeout_millis=metric_export_timeout_ms,
+                        )
+                    ],
+                )
+                _safe_set_meter_provider(meter_provider)
+                _log_info(
+                    event="telemetry.metrics.configured",
+                    message="metrics configured",
+                    endpoint=endpoint,
+                    insecure=insecure,
+                )
+            except Exception as exc:
+                _log_exception(
+                    event="telemetry.metrics.disabled",
+                    message="metrics initialization failed; continuing without OTEL metrics",
+                    endpoint=endpoint,
+                    insecure=insecure,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                meter_provider = None
+
+        if logs_enabled and endpoint:
+            try:
+                logger_provider = LoggerProvider(resource=resource)
+                logger_provider.add_log_record_processor(
+                    BatchLogRecordProcessor(
+                        OTLPLogExporter(
+                            endpoint=endpoint,
+                            insecure=insecure,
+                            timeout=timeout_s,
+                        )
+                    )
+                )
+                _safe_set_logger_provider(logger_provider)
+
+                root_logger = logging.getLogger()
+                root_logger.setLevel(_level_to_int(log_level_name))
+
+                existing_handler = next(
+                    (handler for handler in root_logger.handlers if getattr(handler, "_otel_handler", False)),
+                    None,
+                )
+                if existing_handler is None:
+                    otel_handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
+                    otel_handler._otel_handler = True  # sentinel for idempotency
+                    otel_handler.addFilter(_DropOpenTelemetryRecords())
+                    root_logger.addHandler(otel_handler)
+                    root_handler = otel_handler
+                else:
+                    root_handler = existing_handler
+
+                _log_info(
+                    event="telemetry.logs.configured",
+                    message="logs configured",
+                    endpoint=endpoint,
+                    insecure=insecure,
+                )
+            except Exception as exc:
+                _log_exception(
+                    event="telemetry.logs.disabled",
+                    message="logs initialization failed; continuing without OTEL logs",
+                    endpoint=endpoint,
+                    insecure=insecure,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                logger_provider = None
+                root_handler = None
+
+        handle = TelemetryHandle(
+            tracer_provider=tracer_provider,
+            meter_provider=meter_provider,
+            logger_provider=logger_provider,
+            root_handler=root_handler,
+            log_level_name=log_level_name,
+            endpoint=endpoint,
+            insecure=insecure,
+            traces_enabled=traces_enabled and tracer_provider is not None,
+            metrics_enabled=metrics_enabled and meter_provider is not None,
+            logs_enabled=logs_enabled and logger_provider is not None,
+            previous_log_record_factory=previous_factory,
+        )
+        _HANDLE = handle
+        _STATE_KEY = config_key
+
+        if not _ATEEXIT_REGISTERED:
+            atexit.register(handle.shutdown)
+            _ATEEXIT_REGISTERED = True
+
+        _log_info(
+            event="telemetry.initialize.complete",
+            message="telemetry initialization complete",
+            endpoint=endpoint,
+            insecure=insecure,
+            log_level=log_level_name,
+            traces_enabled=handle.traces_enabled,
+            metrics_enabled=handle.metrics_enabled,
+            logs_enabled=handle.logs_enabled,
+        )
+        return handle
