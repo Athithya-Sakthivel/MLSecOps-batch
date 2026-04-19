@@ -3,5 +3,5 @@ ingress:
 - hostname: auth.athithya.site
   service: http://auth-svc.inference.svc.cluster.local
 - hostname: predict.athithya.site
-  service: http://tabular-inference-serve-svc.inference.svc.cluster.local:8000
+  service: http://tabular-inference-serve-svc.inference.svc.cluster.local
 - service: http_status:404

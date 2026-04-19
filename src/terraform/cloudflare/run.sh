@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Resolves and validates required Cloudflare/GitHub/Tunnel environment variables (zone_id, repo_id, credentials).
+# Chooses authentication method (API token vs global API key) and prepares Cloudflare request helpers.
+# Auto-creates or reuses an existing Cloudflare Tunnel and exports its tunnel ID for Terraform usage.
+# Imports existing Cloudflare resources (Pages project, DNS records, rulesets) into Terraform state if they already exist.
+# Initializes and validates the Terraform/OpenTofu working directory.
+# Runs plan/apply/destroy based on CLI argument, applying Cloudflare DNS, Pages, tunnel, and firewall config.
+# Optionally cleans up the tunnel on destroy and prints final Terraform outputs (URLs, tunnel token, project info).
+
+set -Eeuo pipefail
 IFS=$'\n\t'
 
 STACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,6 +42,9 @@ esac
 export TF_VAR_account_id="${TF_VAR_account_id:-${CLOUDFLARE_ACCOUNT_ID:-}}"
 export TF_VAR_zone_id="${TF_VAR_zone_id:-${CLOUDFLARE_ZONE_ID:-}}"
 export TF_VAR_domain="${TF_VAR_domain:-${CLOUDFLARE_ZONE:-${DOMAIN:-}}}"
+export TF_VAR_tunnel_name="${TF_VAR_tunnel_name:-${CLOUDFLARE_TUNNEL_NAME:-tabular-api-tunnel}}"
+export TF_VAR_auth_upstream="${TF_VAR_auth_upstream:-${AUTH_UPSTREAM:-http://auth-svc.inference.svc.cluster.local:80}}"
+export TF_VAR_predict_upstream="${TF_VAR_predict_upstream:-${PREDICT_UPSTREAM:-http://tabular-inference-serve-svc.inference.svc.cluster.local:8000}}"
 export TF_VAR_pages_repo_owner="${TF_VAR_pages_repo_owner:-${GITHUB_OWNER:-}}"
 export TF_VAR_pages_repo_name="${TF_VAR_pages_repo_name:-${GITHUB_REPO:-}}"
 export TF_VAR_pages_repo_id="${TF_VAR_pages_repo_id:-${GITHUB_REPOSITORY_ID:-}}"
@@ -46,10 +57,11 @@ export TF_VAR_rate_limit_action="${TF_VAR_rate_limit_action:-block}"
 export TF_VAR_rate_limit_requests="${TF_VAR_rate_limit_requests:-60}"
 export TF_VAR_rate_limit_period="${TF_VAR_rate_limit_period:-10}"
 export TF_VAR_rate_limit_mitigation_timeout="${TF_VAR_rate_limit_mitigation_timeout:-10}"
-export TUNNEL_NAME="${TUNNEL_NAME:-tabular-api-tunnel}"
+export TF_IN_AUTOMATION=1
+export TF_INPUT=0
 
 : "${TF_VAR_account_id:?TF_VAR_account_id or CLOUDFLARE_ACCOUNT_ID is required}"
-: "${TF_VAR_domain:?TF_VAR_domain or CLOUDFLARE_ZONE is required}"
+: "${TF_VAR_domain:?TF_VAR_domain or CLOUDFLARE_ZONE or DOMAIN is required}"
 : "${TF_VAR_pages_repo_owner:?TF_VAR_pages_repo_owner or GITHUB_OWNER is required}"
 : "${TF_VAR_pages_repo_name:?TF_VAR_pages_repo_name or GITHUB_REPO is required}"
 
@@ -94,11 +106,6 @@ cf_status() {
     args+=("$line")
   done < <(cf_headers)
   curl -sS -o /dev/null -w '%{http_code}' "${args[@]}" "$1"
-}
-
-state_has() {
-  local addr="$1"
-  "$TF_BIN" -chdir="${STACK_DIR}" state list 2>/dev/null | grep -qx "${addr}"
 }
 
 resolve_zone_id() {
@@ -151,7 +158,7 @@ ensure_cloudflared_login() {
 
 get_tunnel_id() {
   cloudflared tunnel list --output json \
-    | jq -r --arg n "${TUNNEL_NAME}" '.[] | select(.name == $n) | .id' \
+    | jq -r --arg n "${TF_VAR_tunnel_name}" '.[] | select(.name == $n) | .id' \
     | head -n1
 }
 
@@ -162,11 +169,11 @@ ensure_tunnel() {
   tunnel_id="$(get_tunnel_id || true)"
 
   if [[ -z "${tunnel_id}" || "${tunnel_id}" == "null" ]]; then
-    echo "[INFO] creating tunnel ${TUNNEL_NAME}" >&2
-    cloudflared tunnel create "${TUNNEL_NAME}" >&2
+    echo "[INFO] creating tunnel ${TF_VAR_tunnel_name}" >&2
+    cloudflared tunnel create "${TF_VAR_tunnel_name}" >&2
     tunnel_id="$(get_tunnel_id || true)"
   else
-    echo "[INFO] reusing tunnel ${TUNNEL_NAME} (${tunnel_id})" >&2
+    echo "[INFO] reusing tunnel ${TF_VAR_tunnel_name} (${tunnel_id})" >&2
   fi
 
   if [[ -z "${tunnel_id}" || "${tunnel_id}" == "null" ]]; then
@@ -175,52 +182,6 @@ ensure_tunnel() {
   fi
 
   echo "${tunnel_id}"
-}
-
-delete_dns_records_for_host() {
-  local zone_id="$1"
-  local host="$2"
-
-  local record_ids
-  record_ids="$(
-    cf_curl "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${host}&type=CNAME" \
-      | jq -r '.result[]?.id'
-  )"
-
-  if [[ -z "${record_ids}" ]]; then
-    return 0
-  fi
-
-  while IFS= read -r rid; do
-    [[ -z "${rid}" ]] && continue
-    echo "[INFO] deleting existing DNS record ${rid} for ${host}" >&2
-    cf_curl -X DELETE "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${rid}" >/dev/null
-  done <<< "${record_ids}"
-}
-
-bind_tunnel_dns() {
-  local tunnel_id="$1"
-  local expected="${tunnel_id}.cfargotunnel.com"
-
-  for host in "auth.api.${TF_VAR_domain}" "predict.api.${TF_VAR_domain}"; do
-    delete_dns_records_for_host "${TF_VAR_zone_id}" "${host}"
-    echo "[INFO] binding ${host} -> ${expected}" >&2
-    cloudflared tunnel route dns "${tunnel_id}" "${host}" >&2
-  done
-}
-
-cleanup_tunnel() {
-  local tunnel_id
-  tunnel_id="$(get_tunnel_id || true)"
-
-  for host in "auth.api.${TF_VAR_domain}" "predict.api.${TF_VAR_domain}"; do
-    delete_dns_records_for_host "${TF_VAR_zone_id}" "${host}"
-  done
-
-  if [[ -n "${tunnel_id}" && "${tunnel_id}" != "null" ]]; then
-    echo "[INFO] deleting tunnel ${TUNNEL_NAME} (${tunnel_id})" >&2
-    cloudflared tunnel delete -f "${tunnel_id}" >/dev/null || true
-  fi
 }
 
 import_if_exists() {
@@ -252,16 +213,39 @@ import_cloudflare_pages_domain_if_exists() {
   fi
 }
 
-import_frontend_dns_if_exists() {
-  local domain_name="app.${TF_VAR_domain}"
+import_dns_record_if_exists() {
+  local addr="$1"
+  local host="$2"
+
   local record_json record_id
-  record_json="$(cf_curl "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/dns_records?name=${domain_name}&type=CNAME")"
+  record_json="$(cf_curl "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/dns_records?name=${host}&type=CNAME")"
   record_id="$(jq -r '.result[0].id // empty' <<<"${record_json}")"
   if [[ -n "${record_id}" ]]; then
-    import_if_exists "cloudflare_dns_record.frontend_cname" "${TF_VAR_zone_id}/${record_id}"
+    import_if_exists "${addr}" "${TF_VAR_zone_id}/${record_id}"
   fi
 }
 
+warn_legacy_dns_records() {
+  local legacy_auth="auth.api.${TF_VAR_domain}"
+  local legacy_predict="predict.api.${TF_VAR_domain}"
+
+  local legacy_auth_count legacy_predict_count
+  legacy_auth_count="$(
+    cf_curl "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/dns_records?name=${legacy_auth}&type=CNAME" \
+      | jq -r '.result | length'
+  )"
+  legacy_predict_count="$(
+    cf_curl "https://api.cloudflare.com/client/v4/zones/${TF_VAR_zone_id}/dns_records?name=${legacy_predict}&type=CNAME" \
+      | jq -r '.result | length'
+  )"
+
+  if [[ "${legacy_auth_count}" != "0" || "${legacy_predict_count}" != "0" ]]; then
+    echo "[WARN] legacy multi-level DNS records still exist:" >&2
+    [[ "${legacy_auth_count}" != "0" ]] && echo "       - ${legacy_auth}" >&2
+    [[ "${legacy_predict_count}" != "0" ]] && echo "       - ${legacy_predict}" >&2
+    echo "       Remove them once the single-level hostnames are confirmed stable." >&2
+  fi
+}
 
 import_ruleset_if_exists() {
   local addr="$1"
@@ -286,11 +270,18 @@ import_ruleset_if_exists() {
   )"
 
   if [[ -n "${ruleset_id}" && "${ruleset_id}" != "null" ]]; then
-    # Cloudflare provider expects:
-    # zones/<zone_id>/<ruleset_id>
     import_id="zones/${TF_VAR_zone_id}/${ruleset_id}"
-
     import_if_exists "${addr}" "${import_id}"
+  fi
+}
+
+cleanup_tunnel() {
+  local tunnel_id
+  tunnel_id="$(get_tunnel_id || true)"
+
+  if [[ -n "${tunnel_id}" && "${tunnel_id}" != "null" ]]; then
+    echo "[INFO] deleting tunnel ${TF_VAR_tunnel_name} (${tunnel_id})" >&2
+    cloudflared tunnel delete -f "${tunnel_id}" >/dev/null || true
   fi
 }
 
@@ -299,16 +290,19 @@ resolve_repo_id
 
 if [[ "${MODE}" != "--destroy" ]]; then
   TUNNEL_ID="$(ensure_tunnel)"
-  bind_tunnel_dns "${TUNNEL_ID}"
+  export TUNNEL_ID
 fi
 
 "$TF_BIN" -chdir="${STACK_DIR}" init -input=false -upgrade
 "$TF_BIN" -chdir="${STACK_DIR}" validate
 
 if [[ "${MODE}" != "--destroy" ]]; then
+  warn_legacy_dns_records
   import_cloudflare_pages_project_if_exists
   import_cloudflare_pages_domain_if_exists
-  import_frontend_dns_if_exists
+  import_dns_record_if_exists "cloudflare_dns_record.frontend_cname" "app.${TF_VAR_domain}"
+  import_dns_record_if_exists "cloudflare_dns_record.auth_api_cname" "auth.${TF_VAR_domain}"
+  import_dns_record_if_exists "cloudflare_dns_record.predict_api_cname" "predict.${TF_VAR_domain}"
   import_ruleset_if_exists "cloudflare_ruleset.zone_custom_firewall" "zone-custom-firewall" "http_request_firewall_custom"
   import_ruleset_if_exists "cloudflare_ruleset.zone_rate_limit[0]" "zone-rate-limit" "http_ratelimit"
 fi

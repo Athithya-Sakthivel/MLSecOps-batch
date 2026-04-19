@@ -15,31 +15,33 @@ import yaml
 ROOT = Path.cwd()
 OUT_DIR = ROOT / "src" / "manifests" / "cloudflared"
 
-NAMESPACE = os.getenv("NAMESPACE", "inference")
-IMAGE = os.getenv("IMAGE", "cloudflare/cloudflared:2026.3.0")
+NAMESPACE = os.getenv("NAMESPACE", "inference").strip() or "inference"
+IMAGE = os.getenv("IMAGE", "cloudflare/cloudflared:2026.3.0").strip() or "cloudflare/cloudflared:2026.3.0"
 REPLICAS = int(os.getenv("REPLICAS", "2"))
 METRICS_PORT = int(os.getenv("METRICS_PORT", "2000"))
-TUNNEL_PROTOCOL = os.getenv("TUNNEL_PROTOCOL", "http2").strip().lower()
+TUNNEL_PROTOCOL = os.getenv("TUNNEL_PROTOCOL", "http2").strip().lower() or "http2"
+DOMAIN = os.getenv("DOMAIN", "").strip().rstrip(".")
+TUNNEL_NAME = os.getenv("CLOUDFLARE_TUNNEL_NAME", "tabular-api-tunnel").strip() or "tabular-api-tunnel"
+SECRET_NAME = os.getenv("CLOUDFLARE_SECRET_NAME", "cloudflared-token").strip() or "cloudflared-token"
+SECRET_KEY = os.getenv("CLOUDFLARE_SECRET_KEY", "token").strip() or "token"
+TOKEN = os.getenv("CLOUDFLARE_TUNNEL_TOKEN", "").strip()
 
-DOMAIN = os.getenv("DOMAIN")
-if not DOMAIN:
-    print("ERROR: DOMAIN is required", file=sys.stderr)
-    sys.exit(2)
-
-if TUNNEL_PROTOCOL not in {"auto", "http2", "quic"}:
-    print("ERROR: TUNNEL_PROTOCOL must be one of: auto, http2, quic", file=sys.stderr)
-    sys.exit(2)
-
-TUNNEL_NAME = os.getenv("CLOUDFLARE_TUNNEL_NAME", "tabular-api-tunnel")
-SECRET_NAME = os.getenv("CLOUDFLARE_SECRET_NAME", "cloudflared-token")
-SECRET_KEY = os.getenv("CLOUDFLARE_SECRET_KEY", "token")
-TOKEN = os.getenv("CLOUDFLARE_TUNNEL_TOKEN")
-
-AUTH_UPSTREAM = os.getenv("AUTH_UPSTREAM", "http://auth-svc.inference.svc.cluster.local:8000")
+AUTH_UPSTREAM = os.getenv(
+    "AUTH_UPSTREAM",
+    "http://auth-svc.inference.svc.cluster.local",
+).strip()
 PREDICT_UPSTREAM = os.getenv(
     "PREDICT_UPSTREAM",
-    "http://tabular-inference-serve-svc.inference.svc.cluster.local:8000",
-)
+    "http://tabular-inference-serve-svc.inference.svc.cluster.local",
+).strip()
+
+ALLOWED_PROTOCOLS = {"auto", "http2", "quic"}
+STARTUP_FAILURE_THRESHOLD = int(os.getenv("CLOUDFLARED_STARTUP_FAILURE_THRESHOLD", "36"))
+STARTUP_PERIOD_SECONDS = int(os.getenv("CLOUDFLARED_STARTUP_PERIOD_SECONDS", "5"))
+READINESS_INITIAL_DELAY_SECONDS = int(os.getenv("CLOUDFLARED_READINESS_INITIAL_DELAY_SECONDS", "5"))
+READINESS_PERIOD_SECONDS = int(os.getenv("CLOUDFLARED_READINESS_PERIOD_SECONDS", "5"))
+LIVENESS_INITIAL_DELAY_SECONDS = int(os.getenv("CLOUDFLARED_LIVENESS_INITIAL_DELAY_SECONDS", "15"))
+LIVENESS_PERIOD_SECONDS = int(os.getenv("CLOUDFLARED_LIVENESS_PERIOD_SECONDS", "10"))
 
 
 def to_yaml(obj: Any) -> str:
@@ -64,6 +66,29 @@ def safe_write(path: Path, content: str) -> None:
 
 def run(cmd: list[str], stdin: str | None = None) -> None:
     subprocess.run(cmd, input=stdin, text=True, check=True)
+
+
+def normalize_upstream(upstream: str) -> str:
+    value = upstream.strip()
+    if not value:
+        return value
+    if "://" not in value:
+        return f"http://{value}"
+    return value.rstrip("/")
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        print(f"ERROR: {message}", file=sys.stderr)
+        sys.exit(2)
+
+
+def auth_host() -> str:
+    return f"auth.{DOMAIN}"
+
+
+def predict_host() -> str:
+    return f"predict.{DOMAIN}"
 
 
 def render_namespace(namespace: str) -> dict[str, Any]:
@@ -112,18 +137,37 @@ def render_secret(namespace: str, name: str, key: str, token: str) -> dict[str, 
     }
 
 
-def render_routes(
-    tunnel_name: str,
-    auth_host: str,
-    predict_host: str,
-    auth_upstream: str,
-    predict_upstream: str,
-) -> dict[str, Any]:
+def render_configmap(namespace: str) -> dict[str, Any]:
+    config = {
+        "ingress": [
+            {"hostname": auth_host(), "service": normalize_upstream(AUTH_UPSTREAM)},
+            {"hostname": predict_host(), "service": normalize_upstream(PREDICT_UPSTREAM)},
+            {"service": "http_status:404"},
+        ]
+    }
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "cloudflared-config",
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/name": "cloudflared",
+                "app.kubernetes.io/component": "tunnel-config",
+            },
+        },
+        "data": {
+            "config.yaml": to_yaml(config),
+        },
+    }
+
+
+def render_routes_reference(tunnel_name: str) -> dict[str, Any]:
     return {
         "tunnel": tunnel_name,
         "ingress": [
-            {"hostname": auth_host, "service": auth_upstream},
-            {"hostname": predict_host, "service": predict_upstream},
+            {"hostname": auth_host(), "service": normalize_upstream(AUTH_UPSTREAM)},
+            {"hostname": predict_host(), "service": normalize_upstream(PREDICT_UPSTREAM)},
             {"service": "http_status:404"},
         ],
     }
@@ -169,15 +213,21 @@ def render_deployment(
                 },
                 "spec": {
                     "serviceAccountName": "cloudflared-sa",
-                    "terminationGracePeriodSeconds": 30,
+                    "terminationGracePeriodSeconds": 60,
                     "securityContext": {
                         "sysctls": [
-                            {
-                                "name": "net.ipv4.ping_group_range",
-                                "value": "65532 65532",
-                            }
+                            {"name": "net.ipv4.ping_group_range", "value": "65532 65532"}
                         ]
                     },
+                    "volumes": [
+                        {
+                            "name": "cloudflared-config",
+                            "configMap": {
+                                "name": "cloudflared-config",
+                                "items": [{"key": "config.yaml", "path": "config.yaml"}],
+                            },
+                        }
+                    ],
                     "containers": [
                         {
                             "name": "cloudflared",
@@ -193,33 +243,45 @@ def render_deployment(
                                 TUNNEL_PROTOCOL,
                                 "--metrics",
                                 f"0.0.0.0:{metrics_port}",
+                                "--config",
+                                "/etc/cloudflared/config.yaml",
                                 "run",
                             ],
                             "env": [
                                 {
                                     "name": "TUNNEL_TOKEN",
                                     "valueFrom": {
-                                        "secretKeyRef": {
-                                            "name": secret_name,
-                                            "key": secret_key,
-                                        }
+                                        "secretKeyRef": {"name": secret_name, "key": secret_key}
                                     },
                                 }
                             ],
                             "ports": [{"name": "metrics", "containerPort": metrics_port}],
-                            "resources": {
-                                "requests": {"cpu": "50m", "memory": "64Mi"},
-                                "limits": {"cpu": "200m", "memory": "256Mi"},
+                            "volumeMounts": [
+                                {
+                                    "name": "cloudflared-config",
+                                    "mountPath": "/etc/cloudflared",
+                                    "readOnly": True,
+                                }
+                            ],
+                            "startupProbe": {
+                                "httpGet": {"path": "/ready", "port": metrics_port},
+                                "periodSeconds": STARTUP_PERIOD_SECONDS,
+                                "failureThreshold": STARTUP_FAILURE_THRESHOLD,
+                                "timeoutSeconds": 1,
                             },
                             "readinessProbe": {
                                 "httpGet": {"path": "/ready", "port": metrics_port},
-                                "initialDelaySeconds": 10,
-                                "periodSeconds": 10,
+                                "initialDelaySeconds": READINESS_INITIAL_DELAY_SECONDS,
+                                "periodSeconds": READINESS_PERIOD_SECONDS,
+                                "failureThreshold": 3,
+                                "timeoutSeconds": 1,
                             },
                             "livenessProbe": {
                                 "httpGet": {"path": "/ready", "port": metrics_port},
-                                "initialDelaySeconds": 15,
-                                "periodSeconds": 15,
+                                "initialDelaySeconds": LIVENESS_INITIAL_DELAY_SECONDS,
+                                "periodSeconds": LIVENESS_PERIOD_SECONDS,
+                                "failureThreshold": 3,
+                                "timeoutSeconds": 1,
                             },
                             "securityContext": {
                                 "allowPrivilegeEscalation": False,
@@ -238,17 +300,13 @@ def render_deployment(
 
 
 def build() -> tuple[list[dict[str, Any]], str]:
-    auth_host = f"auth.api.{DOMAIN}"
-    predict_host = f"predict.api.{DOMAIN}"
+    require(bool(DOMAIN), "DOMAIN is required")
+    require(TUNNEL_PROTOCOL in ALLOWED_PROTOCOLS, f"TUNNEL_PROTOCOL must be one of: {', '.join(sorted(ALLOWED_PROTOCOLS))}")
+    require(REPLICAS > 0, "REPLICAS must be greater than 0")
+    require(METRICS_PORT > 0, "METRICS_PORT must be greater than 0")
+    require(STARTUP_FAILURE_THRESHOLD > 0, "CLOUDFLARED_STARTUP_FAILURE_THRESHOLD must be greater than 0")
 
-    routes = render_routes(
-        TUNNEL_NAME,
-        auth_host,
-        predict_host,
-        AUTH_UPSTREAM,
-        PREDICT_UPSTREAM,
-    )
-
+    configmap = render_configmap(NAMESPACE)
     checksum_source = {
         "namespace": NAMESPACE,
         "image": IMAGE,
@@ -258,33 +316,22 @@ def build() -> tuple[list[dict[str, Any]], str]:
         "tunnel_name": TUNNEL_NAME,
         "secret_name": SECRET_NAME,
         "secret_key": SECRET_KEY,
-        "token_hash": sha256_text(TOKEN or ""),
+        "token_hash": sha256_text(TOKEN),
         "domain": DOMAIN,
-        "auth_upstream": AUTH_UPSTREAM,
-        "predict_upstream": PREDICT_UPSTREAM,
-        "auth_host": auth_host,
-        "predict_host": predict_host,
-        "routes": routes,
-        "icmp_sysctl": "net.ipv4.ping_group_range=65532 65532",
+        "auth_upstream": normalize_upstream(AUTH_UPSTREAM),
+        "predict_upstream": normalize_upstream(PREDICT_UPSTREAM),
+        "config_yaml": configmap["data"]["config.yaml"],
     }
-
     checksum = sha256_obj(checksum_source)
 
     docs = [
         render_namespace(NAMESPACE),
         render_serviceaccount(NAMESPACE),
-        render_deployment(
-            NAMESPACE,
-            IMAGE,
-            REPLICAS,
-            METRICS_PORT,
-            SECRET_NAME,
-            SECRET_KEY,
-            checksum,
-        ),
-        routes,
+        configmap,
+        render_deployment(NAMESPACE, IMAGE, REPLICAS, METRICS_PORT, SECRET_NAME, SECRET_KEY, checksum),
+        render_routes_reference(TUNNEL_NAME),
     ]
-    rendered = "\n---\n".join(to_yaml(doc).rstrip() for doc in docs) + "\n"
+    rendered = "\n---\n".join(to_yaml(d).rstrip() for d in docs) + "\n"
     return docs, rendered
 
 
@@ -292,15 +339,16 @@ def write_manifests(docs: list[dict[str, Any]]) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     safe_write(OUT_DIR / "00-namespace.yaml", to_yaml(docs[0]))
     safe_write(OUT_DIR / "01-serviceaccount.yaml", to_yaml(docs[1]))
-    safe_write(OUT_DIR / "02-deployment.yaml", to_yaml(docs[2]))
-    safe_write(OUT_DIR / "03-routes-reference.yaml", to_yaml(docs[3]))
+    safe_write(OUT_DIR / "02-configmap.yaml", to_yaml(docs[2]))
+    safe_write(OUT_DIR / "03-deployment.yaml", to_yaml(docs[3]))
+    safe_write(OUT_DIR / "04-routes-reference.yaml", to_yaml(docs[4]))
 
 
 def apply_rollout(docs: list[dict[str, Any]]) -> None:
-    payload_docs = docs[:3]
-    if TOKEN:
-        payload_docs.insert(2, render_secret(NAMESPACE, SECRET_NAME, SECRET_KEY, TOKEN))
-    payload = "\n---\n".join(to_yaml(doc).rstrip() for doc in payload_docs) + "\n"
+    require(bool(TOKEN), "CLOUDFLARE_TUNNEL_TOKEN is required for --rollout")
+
+    payload_docs = [docs[0], docs[1], docs[2], render_secret(NAMESPACE, SECRET_NAME, SECRET_KEY, TOKEN), docs[3]]
+    payload = "\n---\n".join(to_yaml(d).rstrip() for d in payload_docs) + "\n"
     run(["kubectl", "apply", "-f", "-"], stdin=payload)
 
 
@@ -311,23 +359,23 @@ def destroy() -> None:
             "delete",
             "deployment/cloudflared",
             "serviceaccount/cloudflared-sa",
+            "configmap/cloudflared-config",
             "-n",
             NAMESPACE,
             "--ignore-not-found=true",
         ]
     )
-    if TOKEN:
-        run(
-            [
-                "kubectl",
-                "delete",
-                "secret",
-                SECRET_NAME,
-                "-n",
-                NAMESPACE,
-                "--ignore-not-found=true",
-            ]
-        )
+    run(
+        [
+            "kubectl",
+            "delete",
+            "secret",
+            SECRET_NAME,
+            "-n",
+            NAMESPACE,
+            "--ignore-not-found=true",
+        ]
+    )
 
 
 def main() -> None:
@@ -337,14 +385,13 @@ def main() -> None:
     group.add_argument("--destroy", action="store_true")
     args = parser.parse_args()
 
-    docs, rendered = build()
-
-    if not args.rollout and not args.destroy:
-        sys.stdout.write(rendered)
-        return
-
     if args.destroy:
         destroy()
+        return
+
+    docs, rendered = build()
+    if not args.rollout:
+        sys.stdout.write(rendered)
         return
 
     write_manifests(docs)

@@ -22,8 +22,8 @@ After deployment:
 | Service     | URL                                 | Purpose                 |
 | ----------- | ----------------------------------- | ----------------------- |
 | Frontend    | `https://app.athithya.site`         | Static web UI           |
-| Auth API    | `https://auth.api.athithya.site`    | Authentication backend  |
-| Predict API | `https://predict.api.athithya.site` | Inference / API backend |
+| Auth API    | `https://auth.athithya.site`        | Authentication backend  |
+| Predict API | `https://predict.athithya.site`     | Inference / API backend |
 
 ---
 

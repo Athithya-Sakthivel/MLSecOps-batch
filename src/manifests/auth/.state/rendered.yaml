@@ -70,7 +70,7 @@ spec:
         app.kubernetes.io/part-of: auth-svc
         app.kubernetes.io/version: v1
       annotations:
-        auth-service.io/config-checksum: 6bd130f3650b8823849ae151c10219f9f85e01e97378c839ebe73686370e5366
+        auth-service.io/config-checksum: 892382b1f162e447e3825b6748c3adcfc3c34fe1c2cad237582ed9dc56addcae
     spec:
       serviceAccountName: auth-sa
       automountServiceAccountToken: false
@@ -122,7 +122,7 @@ spec:
         - name: K8S_CLUSTER_NAME
           value: production-cluster
         - name: APP_BASE_URL
-          value: https://auth.api.athithya.site
+          value: https://auth.athithya.site
         - name: AUTH_VALIDATE_ROUTE_PATH
           value: /validate
         - name: AUTH_ME_ROUTE_PATH
@@ -145,11 +145,11 @@ spec:
         - name: SESSION_COOKIE_SECURE
           value: 'true'
         - name: SESSION_COOKIE_SAMESITE
-          value: strict
+          value: none
         - name: SESSION_COOKIE_PATH
           value: /
         - name: SESSION_COOKIE_DOMAIN
-          value: ''
+          value: .athithya.site
         - name: GOOGLE_CLIENT_ID
           value: 1055484429496-va3dpg9qpfq36vkh1nfn0hnrvrsfav2k.apps.googleusercontent.com
         - name: GOOGLE_CLIENT_SECRET

@@ -30,6 +30,18 @@ variable "tunnel_name" {
   default     = "tabular-api-tunnel"
 }
 
+variable "auth_upstream" {
+  description = "Internal auth upstream URL used by cloudflared ingress"
+  type        = string
+  default     = "http://auth-svc.inference.svc.cluster.local:80"
+}
+
+variable "predict_upstream" {
+  description = "Internal predict upstream URL used by cloudflared ingress"
+  type        = string
+  default     = "http://tabular-inference-serve-svc.inference.svc.cluster.local:8000"
+}
+
 variable "pages_project_name" {
   type    = string
   default = "tabular-ui"
@@ -109,9 +121,10 @@ variable "rate_limit_mitigation_timeout" {
 }
 
 locals {
-  app_hostname     = "app.${var.domain}"
-  auth_hostname    = "auth.api.${var.domain}"
-  predict_hostname = "predict.api.${var.domain}"
+  app_hostname    = "app.${var.domain}"
+  auth_hostname   = "auth.${var.domain}"
+  predict_hostname = "predict.${var.domain}"
+  tunnel_cname    = "${data.cloudflare_zero_trust_tunnel_cloudflared.api.id}.cfargotunnel.com"
 }
 
 resource "cloudflare_pages_project" "frontend" {
@@ -159,6 +172,38 @@ resource "cloudflare_pages_domain" "frontend_domain" {
   depends_on = [cloudflare_dns_record.frontend_cname]
 }
 
+data "cloudflare_zero_trust_tunnel_cloudflared" "api" {
+  account_id = var.account_id
+
+  filter = {
+    name       = var.tunnel_name
+    is_deleted = false
+  }
+}
+
+data "cloudflare_zero_trust_tunnel_cloudflared_token" "api" {
+  account_id = var.account_id
+  tunnel_id  = data.cloudflare_zero_trust_tunnel_cloudflared.api.id
+}
+
+resource "cloudflare_dns_record" "auth_api_cname" {
+  zone_id = var.zone_id
+  name    = local.auth_hostname
+  type    = "CNAME"
+  content = local.tunnel_cname
+  proxied = true
+  ttl     = 1
+}
+
+resource "cloudflare_dns_record" "predict_api_cname" {
+  zone_id = var.zone_id
+  name    = local.predict_hostname
+  type    = "CNAME"
+  content = local.tunnel_cname
+  proxied = true
+  ttl     = 1
+}
+
 resource "cloudflare_ruleset" "zone_custom_firewall" {
   zone_id     = var.zone_id
   name        = "zone-custom-firewall"
@@ -196,24 +241,10 @@ resource "cloudflare_ruleset" "zone_rate_limit" {
         characteristics     = ["cf.colo.id", "ip.src"]
         period              = var.rate_limit_period
         requests_per_period = var.rate_limit_requests
-        mitigation_timeout  = var.rate_limit_mitigation_timeout
+        mitigation_timeout   = var.rate_limit_mitigation_timeout
       }
     }
   ]
-}
-
-data "cloudflare_zero_trust_tunnel_cloudflared" "api" {
-  account_id = var.account_id
-
-  filter = {
-    name       = var.tunnel_name
-    is_deleted = false
-  }
-}
-
-data "cloudflare_zero_trust_tunnel_cloudflared_token" "api" {
-  account_id = var.account_id
-  tunnel_id  = data.cloudflare_zero_trust_tunnel_cloudflared.api.id
 }
 
 output "frontend_url" {

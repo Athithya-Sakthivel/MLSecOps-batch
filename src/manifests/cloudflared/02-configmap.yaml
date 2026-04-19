@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: cloudflared
+    app.kubernetes.io/component: tunnel-config
+data:
+  config.yaml: "ingress:\n- hostname: auth.athithya.site\n  service: http://auth-svc.inference.svc.cluster.local\n- hostname:\
+    \ predict.athithya.site\n  service: http://tabular-inference-serve-svc.inference.svc.cluster.local\n- service: http_status:404\n"
